@@ -14,6 +14,7 @@ import torch
 import triton
 
 from freetoken.kernel import moe_sum_reduce_triton
+from freetoken.kernel.triton import wna16_decode
 from freetoken.kernel.triton.wna16_fused_moe import (
     _decode_wna16_moe_kernel,
     _decode_wna16_splitk_reduce,
@@ -25,6 +26,9 @@ from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
 
 GROUP = 128
+
+# fused-epilogue decode path (kernel/triton/wna16_decode.py); 0 = the split per-op path below
+_DECODE_V2 = os.getenv("FREETOKEN_WNA16_DECODE_V2", "1") != "0"
 
 
 _DECODE_BLOCK_N = 64
@@ -192,6 +196,14 @@ def fused_experts_decode_wna16(
     act_limit: float = 7.0,
     down_k_off: int = 0,
 ) -> torch.Tensor:
+    if (
+        _DECODE_V2 and activation == "silu" and not apply_router_weight_on_input
+        and wna16_decode.supported(gate_up_qw, down_qw, down_k_off)
+    ):
+        return wna16_decode.wna16_decode_silu(
+            hidden_states, gate_up_qw, gate_up_qz, gate_up_sc, down_qw, down_qz, down_sc,
+            topk_weights, topk_ids, down_k_off=down_k_off,
+        )
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_qw.shape[2]
