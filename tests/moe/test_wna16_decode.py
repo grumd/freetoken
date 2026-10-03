@@ -32,9 +32,13 @@ def _expert_bank(S, N, K, dev):
 
 @pytest.mark.parametrize("M", [1, 4])
 @pytest.mark.parametrize("split", [None, 1])
-def test_decode_matches_dequant_reference(M, split, monkeypatch):
+@pytest.mark.parametrize("v2", [True, False])
+def test_decode_matches_dequant_reference(M, split, v2, monkeypatch):
+    """Both decode paths: the fused-epilogue one (kernel/triton/wna16_decode.py, default)
+    and the per-op split-K one it replaces (FREETOKEN_WNA16_DECODE_V2=0)."""
     from freetoken.moe import fused_wna16
 
+    monkeypatch.setattr(fused_wna16, "_DECODE_V2", v2)
     if split == 1:  # pin the pre-split tiles to cover the SPLIT_K=1 path too
         monkeypatch.setattr(fused_wna16, "_decode_config", lambda r, n, k: dict(
             BLOCK_SIZE_N=64, BLOCK_SIZE_KW=8, num_warps=1, num_stages=2, SPLIT_K=1))
@@ -115,7 +119,8 @@ def test_prefill_expert_map_matches_slot_ids(M):
 
 
 @pytest.mark.parametrize("prefill", [False, True])
-def test_balanced_tp_bands_sum_to_full(prefill, monkeypatch):
+@pytest.mark.parametrize("v2", [True, False])
+def test_balanced_tp_bands_sum_to_full(prefill, v2, monkeypatch):
     """FREETOKEN_WNA16_BALANCED_TP: two mid-group bands (rank 1 starts 64 rows into a
     group) sliced like the HF loader, each run with its own down K offset, sum to the
     unsplit MoE."""
@@ -123,6 +128,7 @@ def test_balanced_tp_bands_sum_to_full(prefill, monkeypatch):
     from freetoken.moe import fused_wna16
 
     monkeypatch.setenv("FREETOKEN_WNA16_BALANCED_TP", "1")
+    monkeypatch.setattr(fused_wna16, "_DECODE_V2", v2)
     torch.manual_seed(0)
     dev = "cuda"
     S, H, I, TOPK, TP = 16, 512, 384, 4, 2  # bands of 192: [0,192) and [192,384)
