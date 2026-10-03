@@ -373,6 +373,14 @@ class Engine:
             n = mark_online_fp8(self.model, skip=frozenset({"gate", "shared_expert_gate"}))
             logger.info_rank0(f"--dense-fp8: {n} bf16 linears quantized to fp8 per row at load")
         finalize_quant(self.model)
+        embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
+        if (
+            embed is not None and hasattr(embed, "move_to_host")
+            and not getattr(config.model_config, "tie_word_embeddings", True)
+            and os.environ.get("FREETOKEN_EMBED_ON_HOST", "1") != "0"
+        ):
+            moved = embed.move_to_host()
+            logger.info_rank0(f"Token embedding resident in pinned host RAM ({mem_GB(moved)} per rank)")
         torch.cuda.empty_cache()  # hand the freed bf16 weights back before the budget below
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
