@@ -43,6 +43,27 @@ def _gemv_kernel(
     _gemv_rows(x_ptr, w_ptr, y_ptr, rows, rows, rows < N, K, stride_wn, BLOCK_N, BLOCK_K, EVEN_K)
 
 
+@triton.jit
+def _gemv3_kernel(
+    x_ptr, w0_ptr, w1_ptr, w2_ptr, y_ptr, N0, N1, N2, K, s0, s1, s2,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
+):
+    # N0 and N1 are multiples of BLOCK_N, so a row block never spans two matrices
+    row0 = tl.program_id(0) * BLOCK_N
+    offs = tl.arange(0, BLOCK_N)
+    if row0 < N0:
+        _gemv_rows(x_ptr, w0_ptr, y_ptr, row0 + offs, row0 + offs, row0 + offs < N0,
+                   K, s0, BLOCK_N, BLOCK_K, EVEN_K)
+    elif row0 < N0 + N1:
+        local = row0 - N0 + offs
+        _gemv_rows(x_ptr, w1_ptr, y_ptr, local, row0 + offs, local < N1,
+                   K, s1, BLOCK_N, BLOCK_K, EVEN_K)
+    else:
+        local = row0 - N0 - N1 + offs
+        _gemv_rows(x_ptr, w2_ptr, y_ptr, local, row0 + offs, local < N2,
+                   K, s2, BLOCK_N, BLOCK_K, EVEN_K)
+
+
 # Tiles swept with kbench/sweep_gemv.py on an RTX 3080 (q38 TP=2 decode shapes): a single
 # warp streaming 512-1024 contiguous K elements per row wins everywhere but the wide-K
 # hyper-connection down-projections, which need a full CTA per row to keep enough bytes
@@ -65,6 +86,21 @@ def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> t
     bn, bk, warps = _config(N, K)
     _gemv_kernel[(triton.cdiv(N, bn),)](
         x, w, out, N, K, w.stride(0),
+        BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps,
+    )
+    return out
+
+
+def gemv3(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """``x @ cat(w0, w1, w2).T`` -> [1, N0 + N1 + N2] in one launch, without the concat."""
+    K = x.shape[1]
+    N0, N1, N2 = w0.shape[0], w1.shape[0], w2.shape[0]
+    bn, bk, warps = _config(N0 + N1 + N2, K)
+    while N0 % bn or N1 % bn:
+        bn //= 2
+    out = torch.empty((1, N0 + N1 + N2), dtype=x.dtype, device=x.device)
+    _gemv3_kernel[(triton.cdiv(N0, bn) + triton.cdiv(N1, bn) + triton.cdiv(N2, bn),)](
+        x, w0, w1, w2, out, N0, N1, N2, K, w0.stride(0), w1.stride(0), w2.stride(0),
         BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps,
     )
     return out

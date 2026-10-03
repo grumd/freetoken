@@ -88,6 +88,8 @@ def _gate_mul_add_kernel(
     HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     launch_pdl: tl.constexpr,
+    GATE_IS_LOGIT: tl.constexpr = False,
+    stride_g: tl.constexpr = 1,
 ) -> None:
     row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1)
@@ -97,7 +99,9 @@ def _gate_mul_add_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
-    gate = tl.load(gate_ptr + row)
+    gate = tl.load(gate_ptr + row * stride_g).to(tl.float32)
+    if GATE_IS_LOGIT:
+        gate = tl.sigmoid(gate)
     routed = tl.load(routed_ptr + row * stride_r + offs, mask=mask, other=0.0).to(tl.float32)
     shared = tl.load(shared_ptr + row * stride_s + offs, mask=mask, other=0.0).to(tl.float32)
 
@@ -108,9 +112,10 @@ def _gate_mul_add_kernel(
 
 
 def shared_gate_mul_add(
-    routed: torch.Tensor, shared: torch.Tensor, gate: torch.Tensor
+    routed: torch.Tensor, shared: torch.Tensor, gate: torch.Tensor, gate_is_logit: bool = False
 ) -> torch.Tensor:
-    """``routed + gate[:, None] * shared`` into a fresh tensor."""
+    """``routed + gate[:, None] * shared`` into a fresh tensor; ``gate_is_logit`` applies
+    the sigmoid here (``gate`` may then be a strided column of a wider GEMM output)."""
     num_tokens, hidden_dim = routed.shape
     assert shared.shape == routed.shape
     assert routed.stride(1) == 1 and shared.stride(1) == 1
@@ -129,6 +134,8 @@ def shared_gate_mul_add(
         HIDDEN=hidden_dim,
         BLOCK_SIZE=block_size,
         launch_pdl=_pdl_supported(),
+        GATE_IS_LOGIT=gate_is_logit,
+        stride_g=gate.stride(0),
         num_warps=4,
     )
     return out

@@ -373,6 +373,10 @@ class Engine:
             n = mark_online_fp8(self.model, skip=frozenset({"gate", "shared_expert_gate"}))
             logger.info_rank0(f"--dense-fp8: {n} bf16 linears quantized to fp8 per row at load")
         finalize_quant(self.model)
+        if os.environ.get("FREETOKEN_DECODE_FRONT_FUSE", "1") != "0":
+            for op in _iter_ops(self.model):
+                if hasattr(op, "fuse_decode_front"):
+                    op.fuse_decode_front()
         embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
         if (
             embed is not None and hasattr(embed, "move_to_host")
@@ -1384,6 +1388,24 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _iter_ops(root):
+    """Every BaseOP under ``root`` once (attributes and OPList members)."""
+    from freetoken.layers.base import BaseOP
+
+    seen, stack = set(), [root]
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        yield op
+        for value in vars(op).values():
+            if isinstance(value, BaseOP):
+                stack.append(value)
+            elif isinstance(value, (list, tuple)):
+                stack.extend(v for v in value if isinstance(v, BaseOP))
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
