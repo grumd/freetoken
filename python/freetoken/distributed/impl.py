@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 import torch.distributed as dist
@@ -68,8 +68,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
     # for every size).
     fp8_reduce: bool = False
     fp8_min_bytes: int = 64 * 1024
+    # small bf16 reductions on a 2-rank group without peer access (see host_allreduce.py)
+    host_ar: Any = None
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.host_ar is not None and self.host_ar.eligible(x):
+            return self.host_ar.all_reduce(x)
         if (
             self.fp8_reduce
             and x.dtype == torch.bfloat16
@@ -170,8 +174,34 @@ def enable_pynccl_distributed(
     )
 
     DistributedCommunicator.plugins.append(
-        PyNCCLDistributedImpl(comm, fp8_reduce=fp8_reduce, fp8_min_bytes=fp8_min_bytes)
+        PyNCCLDistributedImpl(
+            comm, fp8_reduce=fp8_reduce, fp8_min_bytes=fp8_min_bytes,
+            host_ar=_maybe_host_allreduce(tp_info, tp_cpu_group),
+        )
     )
+
+
+def _maybe_host_allreduce(tp_info: DistributedInfo, group: torch.distributed.ProcessGroup):
+    """The shared-host-memory path for small reductions (FREETOKEN_HOST_ALLREDUCE=0 opts
+    out): 2 ranks whose GPUs cannot reach each other directly, so NCCL would stage
+    through host memory anyway. Decided group-wide -- every rank must take the same
+    path for a given tensor or the two mechanisms wait on each other forever."""
+    cur = torch.cuda.current_device()
+    peer_access = any(
+        torch.cuda.can_device_access_peer(cur, d) for d in range(torch.cuda.device_count()) if d != cur
+    )
+    local = int(
+        tp_info.size == 2
+        and os.environ.get("FREETOKEN_HOST_ALLREDUCE", "1").strip() != "0"
+        and not peer_access
+    )
+    t = torch.tensor([local], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
+    if not int(t.item()):
+        return None
+    from .host_allreduce import HostAllReduce
+
+    return HostAllReduce(tp_info.rank, group)
 
 
 def destroy_distributed() -> None:
