@@ -21,6 +21,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # one TP all_reduce for routed + gated shared (see Qwen3_5MoE.forward)
         router_logits = self.gate.forward(hidden_states)
+        self._log_route_lookahead(hidden_states, num_tokens)
         shared = self.shared_expert.forward(hidden_states, reduce=False)
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         routed = self.experts.forward(
@@ -28,6 +29,21 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         )
         out = shared_gate_mul_add(routed, shared, gate)
         return self.experts._maybe_all_reduce(out).view(num_tokens, hidden_dim)
+
+
+    def _log_route_lookahead(self, hidden_states: torch.Tensor, num_tokens: int) -> None:
+        """FREETOKEN_ROUTE_LOG diagnostics: the next layer's router scored on this layer's MoE
+        input, logged beside the real routing (lookahead-prefetch analysis)."""
+        next_gate = getattr(self, "_next_gate", None)
+        if next_gate is None or num_tokens != 1:
+            return
+        from freetoken.core import get_global_ctx
+        from freetoken.moe import route_log
+
+        gate, num_layers, layer_id = next_gate
+        log = route_log.get(num_layers, self.experts.top_k, hidden_states.device)
+        if log is not None and get_global_ctx().batch.is_decode:
+            log.record_pred(layer_id, gate.forward(hidden_states))
 
 
 __all__ = ["Qwen4ExpMoE"]

@@ -1192,6 +1192,14 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         prof = self._maybe_start_prefill_profile(batch)
+        self._step_decode_profile(batch)
+        if batch.is_decode and os.environ.get("FREETOKEN_ROUTE_LOG"):
+            self._route_log_n = getattr(self, "_route_log_n", 0) + 1
+            if self._route_log_n % 256 == 0:
+                from freetoken.moe import route_log
+
+                if (log := route_log.current()) is not None:
+                    log.flush(self.config.tp_info.rank)
         dump_path = os.environ.get("FREETOKEN_DUMP_PREFILL_LOGITS")
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             if dump_path and batch.is_prefill and not use_graph:
@@ -1209,6 +1217,12 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        if batch.is_decode and (dump := os.environ.get("FREETOKEN_DUMP_DECODE_LOGITS")):
+            # diagnostics: rank 0 appends each decode step's fp32 logits row for cross-build
+            # KLD, while <dump>.on exists (toggle without a restart)
+            if self.config.tp_info.is_primary() and os.path.exists(dump + ".on"):
+                with open(dump, "ab") as f:
+                    f.write(batch_logits[0].float().cpu().numpy().tobytes())
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -1253,6 +1267,31 @@ class Engine:
         )
         prof.__enter__()
         return prof
+
+    def _step_decode_profile(self, batch: Batch) -> None:
+        # FREETOKEN_PROFILE_DECODE_DIR=<dir>: torch-profile decode steps
+        # [SKIP, SKIP + STEPS) of the run on each rank (one-shot, diagnostics). The window
+        # spans whole scheduler iterations, so host gaps between graph replays show up.
+        out_dir = os.environ.get("FREETOKEN_PROFILE_DECODE_DIR")
+        if not out_dir or not batch.is_decode or getattr(self, "_decode_profiled", False):
+            return
+        n = getattr(self, "_decode_profile_n", 0)
+        self._decode_profile_n = n + 1
+        skip = int(os.environ.get("FREETOKEN_PROFILE_DECODE_SKIP", "64"))
+        steps = int(os.environ.get("FREETOKEN_PROFILE_DECODE_STEPS", "16"))
+        if n == skip:
+            self._decode_prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+            )
+            self._decode_prof.__enter__()
+        elif n == skip + steps:
+            torch.cuda.synchronize()
+            self._decode_prof.__exit__(None, None, None)
+            self._decode_profiled = True
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"decode_rank{self.config.tp_info.rank}.json")
+            self._decode_prof.export_chrome_trace(path)
+            logger.info(f"decode profile ({steps} steps) written to {path}")
 
     def _finish_prefill_profile(self, prof, batch: Batch) -> None:
         torch.cuda.synchronize()

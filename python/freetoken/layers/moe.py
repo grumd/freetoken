@@ -332,6 +332,10 @@ class OffloadMoELayer(MoELayer):
         if (hidden_states.size(0) * self.top_k >= self.num_experts
                 and get_global_ctx().batch.is_prefill):
             return self._prefill_fetch_routed(cache, hidden_states, topk_weights, topk_ids)
+        from freetoken.moe import route_log
+
+        if (log := route_log.current()) is not None:
+            log.record_actual(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(

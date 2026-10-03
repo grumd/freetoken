@@ -98,6 +98,11 @@ class Qwen4ExpModel(BaseOP):
             ]
         )
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        # diagnostics (FREETOKEN_ROUTE_LOG): each MoE sees the next layer's router
+        layers = self.layers.op_list
+        for i, layer in enumerate(layers):
+            nxt = layers[i + 1].mlp.gate if i + 1 < len(layers) else layers[i].mlp.gate
+            layer.mlp._next_gate = (nxt, len(layers), i)
         # image_token_id positions are replaced by the vision tower's soft tokens (see forward)
         self._image_token_id = config.image_token_id
         # plain tuple (not an OP child), so it never shows up in the state dict
