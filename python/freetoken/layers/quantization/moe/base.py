@@ -136,6 +136,10 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # apply(is_prefill=True) also accepts a slot-cache view (``view.slots`` set, ids are
+    # slot ids): the routed-only prefill path then runs the grouped GEMM instead of
+    # one GEMV per (token, expert).
+    slot_prefill: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None
@@ -189,6 +193,10 @@ class MoEMethod(QuantMethod):
     @property
     def cpu_format(self) -> str | None:
         return self.kernel.cpu_format
+
+    @property
+    def slot_prefill(self) -> bool:
+        return self.kernel.slot_prefill
 
     @abstractmethod
     def create_weights(self, layer: Any) -> None: ...

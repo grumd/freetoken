@@ -51,9 +51,8 @@ class LLM(Scheduler):
         model = self.engine.model
         if not hasattr(model, "encode_images"):
             raise RuntimeError(f"{type(model).__name__} does not support image inputs")
-        return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
-        )
+        # device placement (and the host-resident --vision-on-cpu tower) is Engine's call
+        return self.engine.encode_images(pixel_values, image_position_ids)
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):

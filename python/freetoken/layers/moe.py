@@ -25,6 +25,16 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Prefill chunks of at most this many tokens fetch only their routed experts through the
+# slot cache (hits stay on the GPU, misses cross PCIe) instead of streaming every expert
+# of every layer. 0 = only the built-in ``tokens * top_k < num_experts`` rule. Worth it
+# where a full-bank stream is a fixed multi-second cost (a PCIe-bound offload box).
+_ROUTED_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_ROUTED_PREFILL_TOKENS", "0") or 0)
+# The LRU ensure kernel dedups its queries pairwise inside one Triton block (BLOCK_K**2 <=
+# 2**20), so one call takes at most 1024 ids; a routed-only prefill passes it the layer's
+# unique routed experts, which is bounded by num_experts.
+_LRU_MAX_QUERIES = 1024
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -210,7 +220,23 @@ class OffloadMoELayer(MoELayer):
         extend -- a DSpark verify over k+1 tokens, the draft block, a short prompt --
         must not pay a full-bank copy per layer. Large prompts keep the streaming path.
         """
-        return hidden_states.size(0) * self.top_k < self.num_experts
+        tokens = hidden_states.size(0)
+        if tokens * self.top_k < self.num_experts:
+            return True
+        return tokens <= _ROUTED_PREFILL_TOKENS and self._routed_prefill_ok()
+
+    def _routed_prefill_ok(self) -> bool:
+        """Whether a ``FREETOKEN_MOE_ROUTED_PREFILL_TOKENS`` chunk can take the routed
+        fetch: plain GPU decode target (the CPU / hybrid executors keep their own
+        paths) and a unique routed set the LRU kernel can take in one call."""
+        cache = self.offload_cache
+        return (
+            cache is not None
+            and cache.decode_target == "gpu"
+            and not cache.verify_cpu
+            and not cache.is_cpu_layer(self.layer_id)
+            and self.num_experts <= _LRU_MAX_QUERIES
+        )
 
     def routed_forward(
         self,
@@ -301,6 +327,11 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        # Only a knob-extended prefill chunk gets here at this size; a big decode batch
+        # keeps the capturable path below (torch.unique syncs).
+        if (hidden_states.size(0) * self.top_k >= self.num_experts
+                and get_global_ctx().batch.is_prefill):
+            return self._prefill_fetch_routed(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -312,6 +343,32 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+        )
+
+    def _prefill_fetch_routed(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Routed-only prefill chunk (``FREETOKEN_MOE_ROUTED_PREFILL_TOKENS``): make each
+        routed expert resident once -- the LRU kernel gets the unique routed set, not
+        every (token, expert) route -- then run the grouped GEMM over the slot cache
+        (the per-route GEMV when the format has no slot-cache prefill kernel)."""
+        routed, inverse = torch.unique(topk_ids, return_inverse=True)
+        slots = routed.to(torch.int32).view(1, -1)
+        cache.ensure_experts(self.layer_id, slots)  # expert ids -> slot ids, in place
+        cache.copy_missing()
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            slots.view(-1)[inverse].to(torch.int32),
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=bool(getattr(self.quant_method, "slot_prefill", False)),
         )
 
     def _decode_hybrid(

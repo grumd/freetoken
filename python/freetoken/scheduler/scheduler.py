@@ -722,6 +722,44 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Vision soft tokens for an incoming image request, on this rank's GPU.
+
+        With a host-resident tower (``--vision-on-cpu``) only the primary rank owns the
+        weights: it encodes on the CPU and hands the result to the sibling ranks over the
+        CPU group. One host copy instead of one per rank, one ViT run instead of one per
+        rank, and -- the reason it is not just an optimisation -- every rank scatters
+        bit-identical features, which two independent host GEMM runs need not produce.
+        A rank that skipped the hand-off would schedule a batch its siblings never see.
+        bf16 -> fp32 is exact and keeps the collective on a dtype gloo knows."""
+        engine = self.engine
+        if engine.vision_device.type != "cpu" or self.config.tp_info.size == 1:
+            return engine.encode_images(pixel_values, image_grid_thw)
+        group = self.tp_cpu_group
+        payload = None
+        if self.config.tp_info.is_primary():
+            try:
+                emb = engine.encode_images(pixel_values, image_grid_thw)
+            except Exception:
+                # the siblings are parked on this broadcast; tell them to abort the request
+                # too, then let it surface as the usual request error
+                group.broadcast(torch.zeros(3, dtype=torch.int64), root=0).wait()
+                raise
+            payload = emb.detach().to(dtype=torch.float32, device="cpu").contiguous()
+            shape = torch.tensor([payload.shape[0], payload.shape[1], 1], dtype=torch.int64)
+        else:
+            shape = torch.zeros(3, dtype=torch.int64)
+        group.broadcast(shape, root=0).wait()
+        rows, cols, ok = (int(v) for v in shape.tolist())
+        if not ok:
+            raise RuntimeError("vision encoding failed on the primary rank")
+        if payload is None:
+            payload = torch.empty((rows, cols), dtype=torch.float32)
+        group.broadcast(payload, root=0).wait()
+        return payload.to(dtype=engine.dtype, device=engine.device)
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -772,10 +810,7 @@ class Scheduler(SchedulerIOMixin):
             # and hand the scheduler the soft-token embeddings.
             if getattr(msg, "pixel_values", None) is not None:
                 try:
-                    device = torch.device("cuda", torch.cuda.current_device())
-                    msg.mm_embeds = self.engine.model.encode_images(
-                        msg.pixel_values.to(device), msg.image_grid_thw.to(device)
-                    )
+                    msg.mm_embeds = self._encode_images(msg.pixel_values, msg.image_grid_thw)
                 except Exception as exc:  # noqa: BLE001 — surface as a request error, never crash
                     logger.warning_rank0(f"image encoding failed for request {msg.uid}: {exc!r}")
                     self.send_result(

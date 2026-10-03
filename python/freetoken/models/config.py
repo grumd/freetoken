@@ -11,11 +11,37 @@ VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in _VISION_TRUE
+
+
+def vision_on_cpu_enabled() -> bool:
+    """Keep the vision tower in host RAM (``--vision-on-cpu`` / ``FREETOKEN_VISION_CPU=1``).
+
+    The tower is built and loaded onto the CPU and runs there, so its ~1 GiB of bf16 weights
+    cost no VRAM at all and never shrink the KV / expert pools: llama.cpp's
+    ``--no-mmproj-offload`` for the whole tower. Only the soft tokens it produces cross PCIe,
+    and a host ViT is an order of magnitude slower than a GPU one. Implies
+    :func:`vision_load_enabled`; see ``Engine.encode_images``."""
+    return _env_true("FREETOKEN_VISION_CPU")
+
+
 def vision_load_enabled() -> bool:
     """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
     resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
-    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
-    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set. Asking for a
+    host-resident tower (``--vision-on-cpu``) turns vision on by itself."""
+    return _env_true("FREETOKEN_LOAD_VISION") or vision_on_cpu_enabled()
+
+
+def vision_threads() -> int:
+    """Intra-op threads a host vision tower may use (``FREETOKEN_VISION_THREADS``, 0 = leave
+    torch's default). Expert streaming and the CPU MoE backend share these cores, so a ViT
+    that grabs every thread is not free for decode throughput."""
+    try:
+        return max(0, int(os.getenv("FREETOKEN_VISION_THREADS", "0")))
+    except ValueError:
+        return 0
 
 
 def detect_expert_quant(hf_config: Any) -> str:

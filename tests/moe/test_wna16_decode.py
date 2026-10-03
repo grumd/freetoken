@@ -89,6 +89,31 @@ def test_prefill_matches_dequant_reference(M, legacy, monkeypatch):
     assert rel.item() < 2e-2, rel.item()
 
 
+@pytest.mark.parametrize("M", [32, 300])
+def test_prefill_expert_map_matches_slot_ids(M):
+    """Routed-only prefill over the slot cache aligns on compact ids and maps blocks back
+    to their slot rows; the result equals aligning on the raw slot ids directly."""
+    from freetoken.moe import fused_wna16
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    S, H, I, TOPK = 48, 512, 384, 4
+    gu_qw, gu_qz, gu_sc, _ = _expert_bank(S, 2 * I, H, dev)
+    dn_qw, dn_qz, dn_sc, _ = _expert_bank(S, H, I, dev)
+    banks = (gu_qw, gu_qz, gu_sc, dn_qw, dn_qz, dn_sc)
+    x = torch.randn(M, H, device=dev, dtype=torch.bfloat16)
+    resident = torch.randperm(S, device=dev)[:12]  # the slots this layer's experts occupy
+    ids = torch.stack([resident[torch.randperm(12, device=dev)[:TOPK]] for _ in range(M)]).to(torch.int32)
+    tw = torch.softmax(torch.randn(M, TOPK, device=dev), dim=-1)
+
+    direct = fused_wna16.fused_experts_wna16(x.clone(), *banks, tw, ids, S)
+    expert_map, compact = torch.unique(ids, return_inverse=True)
+    mapped = fused_wna16.fused_experts_wna16(
+        x.clone(), *banks, tw, compact.to(torch.int32), expert_map.numel(), expert_map=expert_map
+    )
+    torch.testing.assert_close(mapped, direct, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("prefill", [False, True])
 def test_balanced_tp_bands_sum_to_full(prefill, monkeypatch):
     """FREETOKEN_WNA16_BALANCED_TP: two mid-group bands (rank 1 starts 64 rows into a

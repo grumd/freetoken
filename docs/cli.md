@@ -107,6 +107,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--moe-routed-prefill-tokens` | 0 | Prefill chunks up to N tokens load only their routed experts via the expert cache instead of streaming whole layers (`FREETOKEN_MOE_ROUTED_PREFILL_TOKENS`) |
 | `--moe-collect-stats` | off | Decode: count expert-cache misses; the status line shows the miss rate |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--expert-load` | auto | How expert banks are read into host RAM: `auto` (parallel for scattered experts, serial when RAM is tight), `serial`, `parallel` |
@@ -162,6 +163,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--mamba-ssm-dtype` | float32 | GDN/SSM recurrent-state dtype (`float32`/`bfloat16`/`float16`) |
 | `--pin-budget-gb` | host default | Host pinned-memory budget in GiB (WSL auto budget, else none) |
 | `--load-vision` | off | Build/load the model's vision tower |
+| `--vision-on-cpu` | off | Keep the vision tower in host RAM and run it on the CPU (no VRAM for it; implies `--load-vision`) |
+| `--vision-threads` | torch default | Intra-op threads a host vision tower may use |
 | `--pynccl-max-buffer-size` | 1 GiB | PyNCCL reduce buffer, e.g. `1G` |
 | `--hybrid-fetch-policy` | recency | Hybrid MoE fetch order (`recency`/`lowest_id`) |
 | `--tp-reduce-fp8` | off | Use fp8 for the TP all-reduce |

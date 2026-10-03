@@ -228,7 +228,12 @@ def fused_experts_wna16(
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
     down_k_off: int = 0,
+    expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Grouped prefill GEMM. ``expert_map`` (routed-only prefill over the slot cache):
+    ``topk_ids`` are compact ids ``[0, num_experts)`` and ``expert_map[id]`` is the
+    bank row each one reads, so the block alignment stays sized by the routed set
+    instead of the whole slot cache."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_qw.shape[2]
@@ -241,6 +246,13 @@ def fused_experts_wna16(
     align_gu = moe_align_block_size(topk_ids, cfg_gu["BLOCK_SIZE_M"], num_experts)
     align_dn = (align_gu if cfg_dn["BLOCK_SIZE_M"] == cfg_gu["BLOCK_SIZE_M"]
                 else moe_align_block_size(topk_ids, cfg_dn["BLOCK_SIZE_M"], num_experts))
+    if expert_map is not None:
+        # Padding blocks past num_tokens_post_padded exit before reading their id, so
+        # the clamp only keeps the gather in bounds.
+        remap = lambda a: (a[0], expert_map[a[1].clamp(0, num_experts - 1)].to(torch.int32), a[2])  # noqa: E731
+        align_dn = remap(align_dn) if align_dn is not align_gu else None
+        align_gu = remap(align_gu)
+        align_dn = align_dn or align_gu
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 

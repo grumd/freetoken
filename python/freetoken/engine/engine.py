@@ -15,6 +15,7 @@ from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.models import create_model, load_weight
+from freetoken.models.config import VISION_KEY_PREFIXES, vision_on_cpu_enabled, vision_threads
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
@@ -282,14 +283,20 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    vision_device: torch.device | None = None,
+    keep_vision: bool = True,
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
+        is_vision = key.startswith(VISION_KEY_PREFIXES)
+        if is_vision and not keep_vision:
+            continue  # --vision-on-cpu sibling rank: the primary rank owns the tower
+        target = vision_device if (is_vision and vision_device is not None) else device
         expected = model_state.get(key)
         if expected is None:
-            state_dict[key] = weight.to(device=device)
+            state_dict[key] = weight.to(device=target)
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            state_dict[key] = weight.to(device=target, dtype=expected.dtype)
     return state_dict
 
 
@@ -340,7 +347,23 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        # --vision-on-cpu (llama.cpp's --no-mmproj-offload): the tower lands in host RAM and
+        # runs on the CPU, so it costs no VRAM. Only the primary rank needs a copy: it
+        # encodes the soft tokens and ships them to the sibling ranks over the CPU group
+        # (see Scheduler._encode_images), which keeps one host copy and makes the ranks
+        # scatter bit-identical features (independent host GEMMs need not round the same).
+        self.vision_device = torch.device("cpu") if vision_on_cpu_enabled() else self.device
+        if self.vision_device.type == "cpu" and not config.tp_info.is_primary():
+            self.model.vision_tower = None
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        if getattr(self.model, "vision_tower", None) is not None and self.vision_device.type == "cpu":
+            host_bytes = sum(
+                t.numel() * t.element_size() for t in self.model.vision_tower.state_dict().values()
+            )
+            logger.info_rank0(
+                f"Vision tower resident in HOST RAM ({mem_GB(host_bytes)}, rank 0 only): "
+                f"images encode on the CPU, no VRAM is spent on it"
+            )
         from freetoken.env import ENV
 
         if ENV.DENSE_FP8:
@@ -597,8 +620,17 @@ class Engine:
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
+        # --vision-on-cpu: the tower goes to the host, and a non-primary rank drops it whole
+        # (it never runs the ViT there). Both the dummy and the checkpoint stream obey it.
+        vision_on_host = self.vision_device.type == "cpu"
+        keep_vision = config.tp_info.is_primary() or not vision_on_host
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device)
+            state = _make_dummy_weight_state_dict(model_state, device=self.device)
+            return {
+                k: v.to(self.vision_device)
+                for k, v in state.items()
+                if keep_vision or not k.startswith(VISION_KEY_PREFIXES)
+            }
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
@@ -611,6 +643,8 @@ class Engine:
                 mtp_path=config.mtp_path,
             ),
             device=self.device,
+            vision_device=self.vision_device if vision_on_host else None,
+            keep_vision=keep_vision,
         )
 
 
@@ -1124,11 +1158,48 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
 
+    @torch.inference_mode()
+    def encode_images(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Vision soft tokens for image-processor outputs, always returned on ``self.device``.
+
+        The inputs are placed on the device the tower's weights live on, so a host-resident
+        tower (--vision-on-cpu) runs the ViT on the CPU and only the ``[n_tokens, hidden]``
+        result crosses PCIe. A host ViT is bandwidth/ALU work the token pipeline does not
+        get back, so its thread count is capped when FREETOKEN_VISION_THREADS is set: the
+        expert banks and the CPU MoE backend share those cores.
+        """
+        encode = getattr(self.model, "encode_images", None)
+        if encode is None:
+            raise RuntimeError(f"{type(self.model).__name__} does not support image inputs")
+        if getattr(self.model, "vision_tower", None) is None:
+            # the encoder exists but the checkpoint's tower was never loaded (--no-load-vision)
+            raise RuntimeError("no vision tower loaded: serve with --load-vision (VRAM) or "
+                               "--vision-on-cpu (host RAM)")
+        dev = self.vision_device
+        args = [t.to(dev) if isinstance(t, torch.Tensor) and t.device != dev else t for t in inputs]
+        n_threads = vision_threads() if dev.type == "cpu" else 0
+        previous = torch.get_num_threads()
+        if n_threads:
+            torch.set_num_threads(n_threads)
+        try:
+            out = encode(*args)
+        finally:
+            if n_threads:
+                torch.set_num_threads(previous)
+        return out.to(self.device) if out.device != self.device else out
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        prof = self._maybe_start_prefill_profile(batch)
+        dump_path = os.environ.get("FREETOKEN_DUMP_PREFILL_LOGITS")
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            if dump_path and batch.is_prefill and not use_graph:
+                logits = self._forward_dumping_logits(batch, dump_path)
+            else:
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if prof is not None:
+            self._finish_prefill_profile(prof, batch)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1148,6 +1219,51 @@ class Engine:
             else getattr(batch, "mtp_streams", None)
         )
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, streams)
+
+    def _forward_dumping_logits(self, batch: Batch, path: str) -> torch.Tensor:
+        # FREETOKEN_DUMP_PREFILL_LOGITS=<file>: rank 0 appends every prefilled position's bf16
+        # logits [T, vocab] to <file>, for KLD scoring against reference logits. Diagnostics only:
+        # run one request at a time with --cache-type naive so no prompt token is skipped.
+        hidden = self.model.model.forward(batch.input_ids, batch)
+        head = self.model.lm_head
+        primary = self.config.tp_info.is_primary()
+        # row slices: a full [T, vocab] gather is ~T * 1 MB per copy and every rank holds several
+        rows = []
+        for start in range(0, hidden.shape[0], 512):
+            part = head.forward_all(hidden[start : start + 512])
+            if primary:
+                rows.append(part.to(torch.bfloat16).cpu())
+        if primary:
+            with open(path, "ab") as f:
+                f.write(torch.cat(rows).view(torch.int16).numpy().tobytes())
+        return head.forward(hidden)
+
+    def _maybe_start_prefill_profile(self, batch: Batch):
+        # FREETOKEN_PROFILE_PREFILL_DIR=<dir>: torch-profile the first prefill forward of
+        # at least FREETOKEN_PROFILE_PREFILL_MIN tokens on each rank (one-shot, diagnostics).
+        out_dir = os.environ.get("FREETOKEN_PROFILE_PREFILL_DIR")
+        if not out_dir or getattr(self, "_prefill_profiled", False) or not batch.is_prefill:
+            return None
+        if batch.input_ids.numel() < int(os.environ.get("FREETOKEN_PROFILE_PREFILL_MIN", "4096")):
+            return None
+        self._prefill_profiled = True
+        torch.cuda.synchronize()
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        )
+        prof.__enter__()
+        return prof
+
+    def _finish_prefill_profile(self, prof, batch: Batch) -> None:
+        torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        out_dir = os.environ["FREETOKEN_PROFILE_PREFILL_DIR"]
+        os.makedirs(out_dir, exist_ok=True)
+        rank = self.config.tp_info.rank
+        prof.export_chrome_trace(os.path.join(out_dir, f"prefill_rank{rank}.json"))
+        logger.info(
+            f"prefill profile ({batch.input_ids.numel()} tokens) written to {out_dir}/prefill_rank{rank}.json"
+        )
 
     def extend_forward(self, batch: Batch) -> tuple[torch.Tensor, "torch.Tensor | None"]:
         """Eager full-model forward over a prefill-phase batch WITHOUT per-request

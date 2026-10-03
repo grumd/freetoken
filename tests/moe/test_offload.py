@@ -893,3 +893,54 @@ def test_small_chunks_fetch_routed_only_instead_of_whole_layers():
     assert routed_only(10)     # 60 < 64
     assert not routed_only(11)  # 66 >= 64 -> whole-bank prefill
     assert not routed_only(2508)  # long prompt -> whole-bank prefill
+
+
+def test_routed_prefill_tokens_knob_extends_the_on_demand_path(monkeypatch):
+    """FREETOKEN_MOE_ROUTED_PREFILL_TOKENS keeps chunks up to that size on the routed
+    fetch (a PCIe-bound box pays a fixed whole-bank stream otherwise); longer chunks
+    still stream whole layers, and the CPU / hybrid decode targets never take it."""
+    import freetoken.layers.moe as moe_mod
+
+    layer, cache = _make_layer_and_cache()  # E=4, top_k=2
+    monkeypatch.setattr(moe_mod, "_ROUTED_PREFILL_TOKENS", 512)
+
+    def routed_only(tokens: int) -> bool:
+        return layer._fetch_routed_only(torch.empty(tokens, 8))
+
+    assert routed_only(1)       # built-in rule: 2 < 4
+    assert routed_only(2)       # knob
+    assert routed_only(512)
+    assert not routed_only(513)
+    monkeypatch.setattr(cache, "decode_target", "hybrid")
+    assert not routed_only(2)
+
+
+def test_routed_prefill_loads_each_routed_expert_once(monkeypatch):
+    """The LRU kernel dedups its queries in one block (<= 1024 ids), so a routed-only
+    prefill chunk hands it the unique routed set and maps every route to its slot."""
+    layer, cache = _make_layer_and_cache()
+    topk_ids = torch.tensor([[2, 1], [3, 2], [1, 2]], dtype=torch.int32)
+    topk_weights = torch.full((3, 2), 0.5)
+    hidden_states = torch.randn(3, 8)
+    calls = {}
+
+    def fake_ensure(layer_id, expert_ids):
+        calls["ensure_expert_ids"] = expert_ids.clone()
+        expert_ids.copy_(expert_ids + 2)  # expert e -> slot e + 2
+
+    monkeypatch.setattr(cache, "ensure_experts", fake_ensure)
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+
+    def fake_fused_decode(hidden_states, w1, w2, got_topk_weights, got_topk_ids, *args, **kwargs):
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_decode_impl", fake_fused_decode)
+
+    out = layer._prefill_fetch_routed(cache, hidden_states, topk_weights, topk_ids)
+
+    assert out is hidden_states
+    assert calls["copied"] is True
+    assert calls["ensure_expert_ids"].tolist() == [[1, 2, 3]]
+    assert calls["topk_ids"].dtype == torch.int32
+    assert calls["topk_ids"].tolist() == [[4, 3], [5, 4], [3, 4]]

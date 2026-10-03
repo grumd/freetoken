@@ -36,6 +36,7 @@ class TritonWna16MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = None
+    slot_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=False)
@@ -79,10 +80,16 @@ class TritonWna16MoEKernel(MoEKernel):
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         k_off = wna16_down_k_off(t["down"].shape[-2] * 8)
         if is_prefill:
+            n, expert_map = view.n, None
+            if view.slots is not None:
+                # Routed-only prefill: topk_ids hold slot-cache ids. Align on the compact
+                # routed set (a few hundred ids) rather than every cache slot.
+                expert_map, compact = torch.unique(topk_ids, return_inverse=True)
+                topk_ids, n = compact.to(torch.int32), expert_map.numel()
             return fused_experts_wna16(
-                x, *banks, topk_weights, topk_ids, view.n,
+                x, *banks, topk_weights, topk_ids, n,
                 layer.activation, layer.apply_router_weight_on_input, alpha, limit,
-                down_k_off=k_off,
+                down_k_off=k_off, expert_map=expert_map,
             )
         return fused_experts_decode_wna16(
             x, *banks, topk_weights, topk_ids,

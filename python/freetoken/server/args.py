@@ -56,6 +56,7 @@ _ENV_FLAG_DISABLE = {
 }
 _ENV_FLAG_BOOL = {
     "load_vision": "FREETOKEN_LOAD_VISION",
+    "vision_on_cpu": "FREETOKEN_VISION_CPU",
     "ple_io_uring": "FREETOKEN_PLE_IO_URING",
     "tp_reduce_fp8": "FREETOKEN_TP_REDUCE_FP8",
     "forward_unknown_tools": "FREETOKEN_FORWARD_UNKNOWN_TOOLS",
@@ -70,6 +71,7 @@ _ENV_FLAG_BOOL = {
 }
 _ENV_FLAG_VALUE = {
     "mtp_draft_tokens": "FREETOKEN_MTP_DRAFT_TOKENS",
+    "vision_threads": "FREETOKEN_VISION_THREADS",
     "mtp_ngram_size": "FREETOKEN_MTP_NGRAM_SIZE",
     "mtp_draft_vocab": "FREETOKEN_MTP_DRAFT_VOCAB",
     "dspark_k": "FREETOKEN_DSPARK_K",
@@ -87,6 +89,7 @@ _ENV_FLAG_VALUE = {
     "glm_dsa_max_layers": "FREETOKEN_GLM_DSA_MAX_LAYERS",
     "glm5_max_layers": "FREETOKEN_GLM5_MAX_LAYERS",
     "engram_backend": "FREETOKEN_ENGRAM_BACKEND",
+    "moe_routed_prefill_tokens": "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS",
 }
 
 
@@ -755,6 +758,15 @@ def parse_args(
                         help="Host pinned-memory budget in GiB (default: WSL auto budget, else none).")
     parser.add_argument("--load-vision", action=argparse.BooleanOptionalAction, default=None,
                         dest="load_vision", help="Build/load the model's vision tower (default off).")
+    parser.add_argument("--vision-on-cpu", action=argparse.BooleanOptionalAction, default=None,
+                        dest="vision_on_cpu",
+                        help="Keep the vision tower in host RAM and run it on the CPU: the tower "
+                             "costs no VRAM (so no KV / expert-cache VRAM is lost to it) at the "
+                             "cost of slow image encoding, with only its soft tokens crossing "
+                             "PCIe. Implies --load-vision (default off).")
+    parser.add_argument("--vision-threads", type=int, default=None, dest="vision_threads",
+                        help="Intra-op threads a host vision tower may use (default: torch's "
+                             "default). The expert banks and the CPU MoE backend share these cores.")
     parser.add_argument("--pynccl-max-buffer-size", default=None, dest="pynccl_max_buffer_size",
                         help="pynccl max buffer size, e.g. 1G (default 1 GiB).")
     parser.add_argument("--hybrid-fetch-policy", choices=["recency", "lowest_id"], default=None,
@@ -1003,6 +1015,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-routed-prefill-tokens",
+        type=int,
+        default=None,
+        dest="moe_routed_prefill_tokens",
+        help=(
+            "Offload prefill chunks of at most this many tokens load only their routed "
+            "experts through the GPU expert cache instead of streaming every expert of "
+            "every layer over PCIe. Cuts the fixed per-chunk stream on PCIe-bound boxes; "
+            "past ~1-1.5k tokens nearly every expert is routed and the overlapped stream "
+            "wins again. Default 0 (only extends under tokens * top_k < num_experts)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-collect-stats",
         action="store_true",
         dest="moe_collect_stats",
@@ -1054,6 +1080,9 @@ def parse_args(
 
     # env-backed runtime knobs (--mtp-draft-tokens, --load-vision, --dspark-debug, …)
     _apply_env_overrides(kwargs)
+    if os.environ.get("FREETOKEN_VISION_CPU") == "1" and os.environ.get("FREETOKEN_LOAD_VISION") == "0":
+        logger.warning("--no-load-vision is ignored with --vision-on-cpu: a host-resident "
+                       "vision tower is still a loaded vision tower")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
