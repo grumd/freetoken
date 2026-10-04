@@ -63,7 +63,8 @@ _DEFAULT_CHUNK = 8 << 20
 # transient whole-entry buffer for the whole load, so this bounds the extra host RAM to
 # ~_DOWN_READ_CONCURRENCY * entry_bytes PER RANK (4 x 0.8 GiB x 2 ranks on Flash-Next;
 # 8 pushed a 78 GiB box past its memory guard); 4 per rank already saturates an NVMe.
-_DOWN_READ_CONCURRENCY = 4
+# FREETOKEN_FTW_READ_CONCURRENCY lowers it when the host is short of RAM (1: ~4.8 GiB less).
+_DOWN_READ_CONCURRENCY = int(os.environ.get("FREETOKEN_FTW_READ_CONCURRENCY", "4"))
 _ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
