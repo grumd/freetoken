@@ -1186,10 +1186,16 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
-        if self.toolcall_anchor_id is not None and not batch.is_prefill:
-            self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
+        if not batch.is_prefill:
+            # Speculative rounds advance cached_len by several tokens and roll back; only
+            # plain decode steps take the periodic boundary snapshots.
+            self.cache_manager.snapshot_decode_states(
+                batch.reqs,
+                anchors=self.toolcall_anchor_id is not None,
+                boundaries=batch.is_decode and not mtp.enabled,
+            )
+        forward_output = self.engine.forward_batch(batch, sample_args)
         if batch.is_decode and mtp.enabled and getattr(mtp, "uses_streams", False):
             # Per-request draft input for the next MTP round: the last position's
             # residual streams. None (CUDA-graph replay) makes the request MTP-

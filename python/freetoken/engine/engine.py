@@ -823,6 +823,7 @@ class Engine:
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid") or verify_cpu:
             self._init_cpu_moe_executor(config, cache, layers)
+        self._maybe_init_wna16_cpu_prefill(cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         logger.info_rank0(
@@ -906,6 +907,49 @@ class Engine:
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
         )
+
+    def _maybe_init_wna16_cpu_prefill(self, cache, layers) -> None:
+        """FREETOKEN_WNA16_CPU_PREFILL=1: routed prefill chunks compute part of their W4A16
+        expert misses on this rank's share of the CPU cores (moe/wna16_cpu_prefill.py)."""
+        if os.environ.get("FREETOKEN_WNA16_CPU_PREFILL", "") != "1":
+            return
+        from freetoken.layers.moe import _ROUTED_PREFILL_TOKENS
+        from freetoken.models.wna16_banks import wna16_down_k_off
+        from freetoken.moe import wna16_cpu_prefill as wcp
+
+        roles = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
+        reason = None
+        if set(cache.bank_sources) != set(roles):
+            reason = f"expert banks {sorted(cache.bank_sources)} are not W4A16"
+        elif cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
+            reason = "it needs the plain GPU decode target"
+        elif not wcp.cpu_supported():
+            reason = "the CPU lacks AVX-512 BF16"
+        if reason:
+            logger.warning_rank0(f"FREETOKEN_WNA16_CPU_PREFILL ignored: {reason}")
+            return
+        gate_up = cache.bank_sources["gate_up"][0]
+        hidden, inter = gate_up.shape[1] * 8, gate_up.shape[2] // 2
+        tp = self.config.tp_info
+        from freetoken.moe.cpu_executor import physical_core_cpus
+
+        threads = wcp.threads_from_env(max(1, len(physical_core_cpus()) // tp.size))
+        try:
+            executor = wcp.Wna16CpuPrefill(
+                hidden=hidden, inter=inter, down_groups=cache.bank_sources["down_zero"][0].shape[1],
+                k_off=wna16_down_k_off(inter), num_experts=cache.num_experts, top_k=layers[0].top_k,
+                max_tokens=max(_ROUTED_PREFILL_TOKENS, layers[0].num_experts // layers[0].top_k + 1),
+                threads=threads, cpus=wcp.rank_cpus(threads, tp.rank, tp.size),
+            )
+        except Exception as exc:  # the JIT build needs a host C++ toolchain
+            logger.warning(f"FREETOKEN_WNA16_CPU_PREFILL disabled: {exc}")
+            return
+        for layer_id in range(cache.num_layers):
+            executor.set_layer(layer_id, {r: cache.bank_sources[r][layer_id] for r in roles})
+        cache.cpu_prefill = executor
+        fetch = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_FETCH", "")
+        if fetch.strip():
+            cache.cpu_prefill_fetch = float(fetch)
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).

@@ -170,6 +170,11 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # Hybrid routed prefill (W4A16, FREETOKEN_WNA16_CPU_PREFILL=1): the CPU executor that
+    # computes the misses a prefill chunk does not fetch, and the share of misses fetched
+    # over PCIe instead (see OffloadMoELayer._prefill_cpu_hybrid).
+    cpu_prefill: object | None = None
+    cpu_prefill_fetch: float = 0.35
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -899,6 +904,25 @@ class OffloadMoeCache:
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
+
+    def ensure_experts_capped(self, layer_id: int, expert_ids: torch.Tensor, fetch_fraction: float,
+                              counts: torch.Tensor | None = None) -> None:
+        """``ensure_experts_hybrid`` with an explicit fetch share (hybrid routed prefill):
+        ~``fetch_fraction`` of the misses get a slot and a copy, the rest become ``-1``.
+        ``counts`` (tokens per entry of ``expert_ids``) makes the fetched misses the ones
+        serving the most tokens, leaving the CPU the light ones."""
+        from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        max_fetch = self.num_experts if fetch_fraction > 0 else 0
+        priority = None
+        if counts is not None:
+            if getattr(self, "_fetch_priority", None) is None:
+                self._fetch_priority = torch.zeros_like(self.expert_recency)
+            priority = self._fetch_priority
+            priority[layer_id].zero_().index_copy_(0, expert_ids.view(-1).long(), counts.view(-1).long())
+        ensure_experts_hybrid(self, layer_id, expert_ids, max_fetch, fetch_fraction, priority)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

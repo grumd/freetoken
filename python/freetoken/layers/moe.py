@@ -1,4 +1,5 @@
 import os
+import time
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -327,6 +328,9 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if (cache.cpu_prefill is not None and hidden_states.size(0) <= cache.cpu_prefill.max_tokens
+                and get_global_ctx().batch.is_prefill):
+            return self._prefill_cpu_hybrid(cache, hidden_states, topk_weights, topk_ids)
         # Only a knob-extended prefill chunk gets here at this size; a big decode batch
         # keeps the capturable path below (torch.unique syncs).
         if (hidden_states.size(0) * self.top_k >= self.num_experts
@@ -374,6 +378,64 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=bool(getattr(self.quant_method, "slot_prefill", False)),
         )
+
+    def _prefill_cpu_hybrid(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Routed prefill with CPU help (W4A16, ``cache.cpu_prefill``): the GPU computes the
+        cache hits plus ~``cpu_prefill_fetch`` of the misses (the most-routed ones), fetched over
+        PCIe; meanwhile the CPU computes the other misses from the host banks at RAM bandwidth;
+        the partial sums add up. Each route is computed once: CPU routes get weight 0 on the GPU
+        side and point at a resident slot (the GEMM leaves no route row unwritten)."""
+        cpu = cache.cpu_prefill
+        T = hidden_states.size(0)
+        routed, inverse, counts = torch.unique(topk_ids, return_inverse=True, return_counts=True)
+        slots = routed.to(torch.int32).view(1, -1)
+        cache.ensure_experts_capped(self.layer_id, slots, cache.cpu_prefill_fetch, counts)  # -> slot / -1
+        route_slot = slots.view(-1)[inverse]
+        on_cpu = route_slot < 0
+        cpu.x[:T].copy_(hidden_states, non_blocking=True)
+        cpu.ids[:T].copy_(torch.where(on_cpu, topk_ids.to(torch.int32), -1), non_blocking=True)
+        cpu.w[:T].copy_(topk_weights, non_blocking=True)
+        cpu.meta.copy_(torch.stack([route_slot.max().long(), on_cpu.logical_not().sum(),
+                                    cache.num_indices[0], routed.new_tensor(routed.numel()).long()]),
+                       non_blocking=True)
+        staged = torch.cuda.Event()
+        staged.record()
+        staged.synchronize()
+        resident, n_gpu, n_fetch, n_routed = cpu.meta.tolist()
+        cache.copy_missing()
+        gpu_out = None
+        if n_gpu:
+            # Called directly, not through the method's apply: that derives the compact routed
+            # set with another torch.unique, whose host sync would hold the CPU work back until
+            # the PCIe fetch above lands. CPU experts read a resident slot at weight 0.
+            from freetoken.layers.quantization.moe.base import limit_or_inf
+            from freetoken.models.wna16_banks import wna16_down_k_off
+            from freetoken.moe.fused_wna16 import fused_experts_wna16
+            from freetoken.moe.legacy_format import canonical_role
+
+            t = {canonical_role(n): v for n, v in zip(cache.bank_schema, cache.bank_views())}
+            expert_map = slots.view(-1).masked_fill(slots.view(-1) < 0, resident)
+            gpu_out = fused_experts_wna16(
+                hidden_states, t["gate_up"], t["gate_up_zero"], t["gate_up_scale"],
+                t["down"], t["down_zero"], t["down_scale"],
+                topk_weights.masked_fill(on_cpu, 0), inverse.to(torch.int32), expert_map.numel(),
+                self.activation, self.apply_router_weight_on_input, float(self.alpha),
+                limit_or_inf(self), down_k_off=wna16_down_k_off(t["down"].shape[-2] * 8),
+                expert_map=expert_map,
+            )
+        t0 = time.perf_counter()
+        n_cpu = cpu.forward(self.layer_id, cpu.x[:T], cpu.ids[:T], cpu.w[:T], cpu.y[:T])
+        if cpu.stats is not None:
+            gpu_busy = gpu_out is not None and not torch.cuda.current_stream().query()
+            cpu.record(self.layer_id, T, n_routed, n_fetch, n_cpu, time.perf_counter() - t0, gpu_busy)
+        cpu_out = cpu.y[:T].to(hidden_states.device, non_blocking=True)
+        return cpu_out if gpu_out is None else gpu_out.add_(cpu_out)
 
     def _decode_hybrid(
         self,

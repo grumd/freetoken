@@ -126,3 +126,32 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_prefill_capped_fetch_takes_the_heaviest_misses():
+    """Hybrid routed prefill: given per-expert token counts, the fetched share of the misses is
+    the experts serving the most tokens (the CPU keeps the light ones); GPU kernel == reference."""
+    torch.manual_seed(0)
+    num_experts, cache_size = 64, 80
+
+    def make(device):
+        return OffloadMoeCache(num_layers=2, num_experts=num_experts, cache_size=cache_size,
+                               device=torch.device(device), quant_format="bf16")
+
+    gpu, ref = make("cuda"), make("cpu")
+    for step in range(8):
+        routed = torch.randperm(num_experts)[:40].sort().values.to(torch.int32).view(1, -1)
+        counts = torch.randperm(200)[:40] + 1          # distinct, so the ranking is unambiguous
+        g, c = routed.clone().cuda(), routed.clone()
+        gpu.ensure_experts_capped(1, g, 0.3, counts.cuda())
+        ref.ensure_experts_capped(1, c, 0.3, counts)
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
+        missing, fetched = int(gpu.num_missing_full.item()), int(gpu.num_indices.item())
+        assert fetched == _balanced_fetch(missing, round(0.3 * Q))
+        src = gpu.src_indices[:fetched].cpu().tolist()
+        slot = dict(zip(routed.view(-1).tolist(), c.view(-1).tolist()))
+        tokens = dict(zip(routed.view(-1).tolist(), counts.tolist()))
+        misses = [e for e in slot if e in src or slot[e] < 0]
+        assert sorted(src) == sorted(sorted(misses, key=lambda e: -tokens[e])[:fetched])

@@ -60,9 +60,14 @@ class Req:
     # length just after that token (its index + 1). A client-side rewrite of the echoed tool
     # call diverges strictly after this point, so it is the deepest reuse boundary that
     # survives such a rewrite. GDN: the state is frozen into a ping-pong slot when cached_len
-    # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
+    # reaches it (snapshot_decode_states) and donated at finish. SWA: caps the proactive
     # out-of-window eviction so the window ending here stays resumable.
     toolcall_anchor_len: int | None = None
+    # Decode-time GDN snapshots awaiting donation at finish: ping-pong index -> state length
+    # (see CacheManager.snapshot_decode_states). ``mamba_pinned_track`` is the index holding
+    # the tool-call anchor snapshot, which later boundary snapshots must not overwrite.
+    mamba_decode_tracks: dict[int, int] = field(default_factory=dict)
+    mamba_pinned_track: int | None = None
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).

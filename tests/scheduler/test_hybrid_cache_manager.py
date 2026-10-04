@@ -163,6 +163,94 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def _decoding_req(cm, pool, prompt, total, table_idx=0):
+    """A request mid-decode: `total` tokens of ids, KV pages staged for all of them."""
+    ids = list(prompt) + [1000 + i for i in range(total - len(prompt))]
+    mr = cm.match_req(_pend(ids[: len(prompt)]))
+    cm.page_table[table_idx, :total] = torch.arange(5000, 5000 + total, dtype=torch.int32)
+    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=table_idx,
+              cached_len=len(prompt), output_len=1, uid=table_idx,
+              sampling_params=SamplingParams(), cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    cm.lock(mr.cuda_handle)
+    return req, ids
+
+
+def _step_to(cm, pool, req, n, **kw):
+    """Advance the request to cached_len == n with a recognizable live state, then run the
+    pre-step snapshot hook."""
+    req.cached_len = n
+    pool.recurrent_states[:, req.linear_slot_idx] = float(n)
+    cm.snapshot_decode_states([req], **kw)
+
+
+def test_decode_boundary_snapshots_become_reuse_points():
+    """The next turn echoes the previous output: decode-time boundary snapshots, donated at
+    finish, let it resume at the last boundary instead of the end of the previous prompt."""
+    pool = _pool()
+    cm = CacheManager(64, 1, torch.zeros(4, 64, dtype=torch.int32), "hybrid_radix",
+                      linear_state_pool=pool)
+    cm.decode_snapshot_interval = 4
+    base = pool.num_free_slots
+    req, ids = _decoding_req(cm, pool, prompt=[1, 2, 3, 4, 5, 6], total=19)
+    for n in range(6, 19):
+        _step_to(cm, pool, req, n, anchors=False, boundaries=True)
+    # boundaries 8, 12, 16 crossed; the ping-pong pair keeps the latest two
+    assert sorted(req.mamba_decode_tracks.values()) == [12, 16]
+    req.cached_len = 17
+    cm.cache_req(req, finished=True)
+    assert pool.num_free_slots == base - 3       # both snapshots + the live slot tree-owned
+
+    assert cm.match_req(_pend(ids[:17] + [7, 7])).cuda_handle.cached_len == 17
+    hit = cm.match_req(_pend(ids[:16] + [7, 7]))
+    assert hit.cuda_handle.cached_len == 16
+    assert float(pool.recurrent_states[0, hit.mamba_value].max()) == 16.0
+    assert hit.cuda_handle.get_matched_indices().tolist() == list(range(5000, 5016))
+    early = cm.match_req(_pend(ids[:14] + [7, 7]))  # diverges inside the last interval
+    assert early.cuda_handle.cached_len == 12
+    assert float(pool.recurrent_states[0, early.mamba_value].max()) == 12.0
+
+
+def test_decode_boundary_snapshots_off_and_anchor_pinned():
+    pool = _pool()
+    cm = CacheManager(64, 1, torch.zeros(4, 64, dtype=torch.int32), "hybrid_radix",
+                      linear_state_pool=pool)
+    cm.decode_snapshot_interval = 4
+    req, _ = _decoding_req(cm, pool, prompt=[1, 2, 3, 4, 5, 6], total=30)
+    for n in range(6, 12):
+        _step_to(cm, pool, req, n, anchors=False, boundaries=False)
+    assert req.mamba_decode_tracks == {}         # speculative decoding: no periodic copies
+
+    req.toolcall_anchor_len = 13
+    for n in range(12, 26):
+        _step_to(cm, pool, req, n, anchors=True, boundaries=True)
+    # the anchor snapshot survives later boundaries; the other slot holds the latest one
+    assert req.mamba_pinned_track is not None
+    assert req.mamba_decode_tracks[req.mamba_pinned_track] == 13
+    assert req.mamba_decode_tracks[1 - req.mamba_pinned_track] == 24
+    slot = req.mamba_ping_pong[req.mamba_pinned_track]
+    assert float(pool.recurrent_states[0, slot].max()) == 13.0
+
+
+def test_decode_snapshots_at_page_size_64():
+    """qsa_sparse runs hybrid models at page_size 64: the finish state is almost never
+    page-aligned, so the last decode boundary is the deepest reuse point of the turn."""
+    pool = _pool()
+    cm = CacheManager(16, 64, torch.zeros(2, 1024, dtype=torch.int32), "hybrid_radix",
+                      linear_state_pool=pool)
+    assert cm.decode_snapshot_interval == 64
+    base = pool.num_free_slots
+    req, ids = _decoding_req(cm, pool, prompt=list(range(1, 71)), total=200)
+    for n in range(70, 200):
+        _step_to(cm, pool, req, n, anchors=False, boundaries=True)
+    assert sorted(req.mamba_decode_tracks.values()) == [128, 192]
+    cm.cache_req(req, finished=True)
+    assert pool.num_free_slots == base - 2       # snapshots tree-owned, unaligned live freed
+    hit = cm.match_req(_pend(ids[:199] + [7] * 40))
+    assert hit.cuda_handle.cached_len == 192
+    assert float(pool.recurrent_states[0, hit.mamba_value].max()) == 192.0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

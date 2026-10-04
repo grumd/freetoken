@@ -30,6 +30,23 @@ def _resolve_swa_eviction_interval(override: int | None) -> int:
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+# Debug: FREETOKEN_PREFIX_DEBUG=<path> appends, per admitted request, where its prompt first
+# diverges from the previous finished request's full sequence (prompt + output) as JSON lines.
+_PREFIX_DEBUG = os.environ.get("FREETOKEN_PREFIX_DEBUG") or None
+
+
+def _resolve_decode_snapshot_interval(page_size: int) -> int:
+    """Decode tokens between GDN state snapshots (FREETOKEN_DECODE_SNAPSHOT_INTERVAL, default 64,
+    rounded up to a page multiple; 0 disables). Each snapshot is a reuse point for the next turn
+    of a conversation, whose prompt echoes this output: without one, everything generated since
+    the last prefill boundary is prefilled again."""
+    raw = os.environ.get("FREETOKEN_DECODE_SNAPSHOT_INTERVAL", "64")
+    try:
+        interval = int(raw)
+    except ValueError:
+        raise ValueError(f"FREETOKEN_DECODE_SNAPSHOT_INTERVAL must be an integer, got {raw!r}")
+    return div_ceil(interval, page_size) * page_size if interval > 0 else 0
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
@@ -66,6 +83,7 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        self.decode_snapshot_interval = _resolve_decode_snapshot_interval(page_size)
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -109,9 +127,26 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            if _PREFIX_DEBUG:
+                self._debug_divergence(req.input_ids[:input_len], m.cached_len)
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
+
+    def _debug_divergence(self, ids: torch.Tensor, cached_len: int) -> None:
+        import json
+        prev = getattr(self, "_dbg_prev", None)
+        rec = {"input_len": int(ids.numel()), "cached_len": int(cached_len)}
+        if prev is not None:
+            prev_ids, prev_prompt_len = prev
+            n = min(len(prev_ids), len(ids))
+            neq = (prev_ids[:n] != ids[:n]).nonzero()
+            div = int(neq[0]) if neq.numel() else n
+            rec.update(prev_len=int(len(prev_ids)), prev_prompt_len=int(prev_prompt_len),
+                       diverge_at=div, prev_tail=prev_ids[max(0, div - 24):div + 24].tolist(),
+                       new_tail=ids[max(0, div - 24):div + 24].tolist())
+        with open(f"{_PREFIX_DEBUG}.{os.getpid()}", "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     @property
     def available_size(self) -> int:
@@ -153,32 +188,38 @@ class CacheManager:
             self.linear_state_pool.free(er.mamba_slots)
             self._free(er.kv_indices)
 
-    def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
-        """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
-        slot that is idle during decode (the kernel-side ×CHUNK track only runs on prefill
-        extends). Must run on the engine stream before the current step's kernels: cached_len
-        equals the anchor exactly when every enqueued step up to the anchor-consuming one has
-        been issued and the next (current) one has not, so the copy lands between them in
-        stream order. Reuses ``mamba_last_track_seqlen`` as the pending-donate mark -- the
-        prefill track's own pending freeze was consumed by the prefill-commit ``cache_req``
-        before any decode drain could set an anchor."""
+    def snapshot_decode_states(self, reqs: List[Req], *, anchors: bool, boundaries: bool) -> None:
+        """Freeze each decoding request's GDN state into an idle ping-pong slot when its
+        cached_len sits on a reuse point: every ``decode_snapshot_interval`` tokens
+        (``boundaries``) and at the tool-call anchor (``anchors``). The kernel-side x64 track
+        only runs on prefill extends, so decode needs this copy. Must run on the engine stream
+        before the current step's kernels: the live slot then holds exactly cached_len tokens
+        of state, every step up to here having been issued and the current one not yet.
+
+        Holds up to two snapshots per request (the latest two, or the anchor plus the latest);
+        finish donates them to the tree. An anchor snapshot is pinned so later boundaries
+        cannot overwrite it."""
         if not self.is_hybrid:
             return
         pool = self.linear_state_pool
+        interval = self.decode_snapshot_interval if boundaries else 0
         for r in reqs:
-            a = r.toolcall_anchor_len
-            if (
-                a is None
-                or r.mamba_ping_pong is None
-                or r.mamba_last_track_seqlen is not None
-                or r.cached_len != a
-                or align_down(a, self.page_size) != a
-            ):
+            n = r.cached_len
+            if (r.mamba_ping_pong is None or r.mm_embeds is not None or n <= 0
+                    or align_down(n, self.page_size) != n):
                 continue
-            dst = r.mamba_ping_pong[r.mamba_next_track_idx]
-            pool.copy_from(r.linear_slot_idx, dst)
-            r.mamba_last_track_seqlen = a
-            r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+            is_anchor = anchors and r.toolcall_anchor_len == n
+            if not is_anchor and not (interval and n % interval == 0):
+                continue
+            if n in r.mamba_decode_tracks.values():
+                continue
+            pinned = r.mamba_pinned_track
+            dst = r.mamba_next_track_idx if pinned is None else 1 - pinned
+            pool.copy_from(r.linear_slot_idx, r.mamba_ping_pong[dst])
+            r.mamba_decode_tracks[dst] = n
+            r.mamba_next_track_idx = 1 - dst
+            if is_anchor:
+                r.mamba_pinned_track = dst
 
     def maybe_free_swa_out_of_window(self, reqs: List[Req], *, forward_iter: int) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
@@ -382,30 +423,37 @@ class CacheManager:
                 self._free_req_slots(req)
             return
 
+        if finished and _PREFIX_DEBUG:
+            self._dbg_prev = (req.input_ids.clone(), req.max_device_len - req.output_len)
         if finished:
-            # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
-            # finished too early to chunk-commit) is a strictly shorter prefix than the live
-            # donate below: insert it first and advance the dedup-free floor to its boundary
-            # -- [prefix_len, L) is now tree-owned by the donated node, so only [old, prefix_len)
-            # is this request's dup to free. The frozen slot is consumed either way (taken by
-            # the tree or freed here) and both ping-pong refs are dropped before
+            # Pending freezes -- a prefill x64 track the request finished too early to
+            # chunk-commit, and the decode-time snapshots -- are strictly shorter prefixes than
+            # the live donate below. Insert them shallowest first, advancing the dedup-free floor
+            # to each boundary: [prefix_len, L) is now tree-owned by the donated node, so only
+            # [floor, prefix_len) is this request's dup to free. Every ping-pong slot is
+            # consumed here (taken by the tree or freed), and the refs are dropped before
             # _free_req_slots so nothing double-frees.
             free_upto = old_handle.cached_len
-            L = req.mamba_last_track_seqlen
-            if (
-                L is not None
-                and 0 < L <= req.cached_len
-                and align_down(L, self.page_size) == L
-                and req.mamba_ping_pong is not None
-            ):
-                frozen_idx = 1 - req.mamba_next_track_idx
-                frozen = req.mamba_ping_pong[frozen_idx]
-                prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
-                pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
+            if req.mamba_ping_pong is not None:
+                pending = []
+                L = req.mamba_last_track_seqlen
+                if L is not None:
+                    pending.append((L, req.mamba_ping_pong[1 - req.mamba_next_track_idx]))
+                pending += [(n, req.mamba_ping_pong[i]) for i, n in req.mamba_decode_tracks.items()]
+                donated = set()
+                for L, slot in sorted(pending):
+                    if (slot in donated or not 0 < L <= req.cached_len
+                            or align_down(L, self.page_size) != L):
+                        continue
+                    prefix_len, mamba_exist = self.prefix_cache.insert(
+                        req.input_ids[:L], page_indices[:L], slot)
+                    if not mamba_exist:
+                        donated.add(slot)
+                    self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                    free_upto = max(free_upto, L)
+                pool.free([s for s in req.mamba_ping_pong if s not in donated])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                free_upto = max(free_upto, L)
+                req.mamba_decode_tracks = {}
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
