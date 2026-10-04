@@ -299,7 +299,8 @@ class Pool {
       CPU_SET(cpu, &set);
       pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     }
-    uint64_t seen = gen_.load();
+    // 0, not gen_: a worker that starts after the first run() bumped gen_ must still take that job
+    uint64_t seen = 0;
     while (true) {
       int spins = 0;
       while (gen_.load(std::memory_order_acquire) == seen && spins < 200000) {

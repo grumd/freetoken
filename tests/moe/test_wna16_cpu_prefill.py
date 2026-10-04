@@ -189,3 +189,30 @@ def test_hybrid_merge_rounds_once():
     twice = gpu_part.to(torch.bfloat16) + cpu_part.cuda().to(torch.bfloat16)
     assert not torch.equal(once, twice)  # the case discriminates
     assert torch.equal(out, once)
+
+def test_pool_takes_a_job_queued_before_its_workers_start():
+    """A forward right after construction can bump the worker pool's job generation before every
+    thread has started; a worker that latched the bumped generation as already seen never ran
+    that job, and the caller spun forever. In a subprocess, so a hang fails instead of stalling."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent("""
+        import torch
+        from freetoken.moe.wna16_cpu_prefill import Wna16CpuPrefill
+        H, I, E = 512, 192, 6
+        ints = lambda *s: torch.randint(-2**31, 2**31 - 1, s, dtype=torch.int64).to(torch.int32)
+        banks = {"gate_up": ints(E, H // 8, 2 * I), "gate_up_zero": ints(E, H // 128, 2 * I // 8),
+                 "gate_up_scale": torch.rand(E, H // 128, 2 * I).half(), "down": ints(E, I // 8, H),
+                 "down_zero": ints(E, 2, H // 8), "down_scale": torch.rand(E, 2, H).half()}
+        x, w = torch.randn(4, H).to(torch.bfloat16), torch.rand(4, 2)
+        ids, y = torch.randint(0, E, (4, 2), dtype=torch.int32), torch.empty(4, H, dtype=torch.bfloat16)
+        for _ in range(200):
+            ex = Wna16CpuPrefill(hidden=H, inter=I, down_groups=2, k_off=0, num_experts=E, top_k=2,
+                                 max_tokens=4, threads=8, cpus=[])
+            ex.set_layer(0, banks)
+            ex.forward(0, x, ids, w, y)
+            del ex
+    """)
+    subprocess.run([sys.executable, "-c", code], timeout=300, check=True)
