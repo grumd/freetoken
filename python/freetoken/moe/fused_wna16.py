@@ -18,6 +18,7 @@ from freetoken.kernel.triton import wna16_decode
 from freetoken.kernel.triton.wna16_fused_moe import (
     _decode_wna16_moe_kernel,
     _decode_wna16_splitk_reduce,
+    _prefill_wna16_gate_up_silu_kernel,
     _prefill_wna16_moe_kernel,
     _prefill_wna16_moe_tile_kernel,
     _tl_dtype,
@@ -135,6 +136,23 @@ def _legacy_prefill() -> bool:
     return os.environ.get("FREETOKEN_WNA16_PREFILL_LEGACY", "") == "1"
 
 
+def prefill_precise() -> bool:
+    """FREETOKEN_WNA16_PREFILL_PRECISE=1: the tile prefill kernels apply the group scale to
+    the fp32 partial instead of rounding each dequantized weight to bf16, and the gate/up GEMM
+    fuses SiLU-and-mul so gate/up stay fp32 (the CPU prefill executor follows suit). Against
+    exact W4 math on real Qwen3.8 activations: GPU 4.11e-3 -> 2.75e-3 rel-RMS per MoE layer,
+    CPU 3.54e-3 -> 2.28e-3. End-to-end KLD vs the bf16 reference cannot resolve this (W4
+    quantization dominates and single runs scatter): 0.144 -> 0.141 averaged over five
+    chunk sizes, run-to-run sd 0.002-0.010."""
+    return os.environ.get("FREETOKEN_WNA16_PREFILL_PRECISE", "") == "1"
+
+
+# Fused gate/up + SiLU (two fp32 accumulators per program). RTX 3080, Flash-Next rank band
+# (gate_up 2560x640): 1.4 ms at M=1024, 7.0 ms at M=8192 -- small tiles, no pipelining.
+_TILE_GATE_UP_SILU = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=16, BLOCK_SIZE_K=64,
+                          GROUP_SIZE_M=8, num_warps=2, num_stages=1)
+
+
 def _prefill_gemm(
     a: torch.Tensor,
     qw: torch.Tensor,
@@ -150,6 +168,7 @@ def _prefill_gemm(
     mul_routed_weight: bool,
     cfg: Dict[str, Any],
     k_off: int = 0,
+    exact: bool = False,
 ) -> None:
     N = qw.shape[2]
     K = qw.shape[1] * 8
@@ -157,7 +176,9 @@ def _prefill_gemm(
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    kernel = _prefill_wna16_moe_tile_kernel if "BLOCK_SIZE_K" in cfg else _prefill_wna16_moe_kernel
+    tile = "BLOCK_SIZE_K" in cfg
+    kernel = _prefill_wna16_moe_tile_kernel if tile else _prefill_wna16_moe_kernel
+    extra = dict(EXACT_DEQUANT=exact) if tile else {}
     kernel[grid](
         a, qw, qz, sc, c, topk_weights_flat, sorted_ids, expert_ids,
         num_tokens_post_padded,
@@ -170,6 +191,38 @@ def _prefill_gemm(
         topk_weights_flat.stride(0),
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
+        compute_type=_tl_dtype(c.dtype),
+        **cfg,
+        **extra,
+    )
+
+
+def _prefill_gate_up_silu(
+    a: torch.Tensor,
+    qw: torch.Tensor,
+    qz: torch.Tensor,
+    sc: torch.Tensor,
+    c: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_valid_tokens: int,
+    top_k: int,
+) -> None:
+    inter = qw.shape[2] // 2
+    K = qw.shape[1] * 8
+    EM = sorted_ids.shape[0]
+    cfg = _TILE_GATE_UP_SILU
+    grid = (triton.cdiv(EM, cfg["BLOCK_SIZE_M"]) * triton.cdiv(inter, cfg["BLOCK_SIZE_N"]),)
+    _prefill_wna16_gate_up_silu_kernel[grid](
+        a, qw, qz, sc, c, sorted_ids, expert_ids, num_tokens_post_padded,
+        inter, K, EM, num_valid_tokens, GROUP,
+        a.stride(0), a.stride(1),
+        qw.stride(0), qw.stride(1), qw.stride(2),
+        qz.stride(0), qz.stride(1), qz.stride(2),
+        sc.stride(0), sc.stride(1), sc.stride(2),
+        c.stride(0), c.stride(1),
+        top_k=top_k,
         compute_type=_tl_dtype(c.dtype),
         **cfg,
     )
@@ -257,30 +310,37 @@ def fused_experts_wna16(
     cfg_gu, cfg_dn = _TILE_GATE_UP, _tile_down_config(M)
     if _legacy_prefill() or not (_tile_ok(H, cfg_gu) and _tile_ok(inter, cfg_dn, down_k_off)):
         cfg_gu = cfg_dn = _prefill_config(M)
+    precise = prefill_precise() and "BLOCK_SIZE_K" in cfg_gu
+    fuse_act = precise and activation == "silu" and not apply_router_weight_on_input and H % GROUP == 0
 
-    align_gu = moe_align_block_size(topk_ids, cfg_gu["BLOCK_SIZE_M"], num_experts)
-    align_dn = (align_gu if cfg_dn["BLOCK_SIZE_M"] == cfg_gu["BLOCK_SIZE_M"]
-                else moe_align_block_size(topk_ids, cfg_dn["BLOCK_SIZE_M"], num_experts))
-    if expert_map is not None:
-        # Padding blocks past num_tokens_post_padded exit before reading their id, so
-        # the clamp only keeps the gather in bounds.
-        remap = lambda a: (a[0], expert_map[a[1].clamp(0, num_experts - 1)].to(torch.int32), a[2])  # noqa: E731
-        align_dn = remap(align_dn) if align_dn is not align_gu else None
-        align_gu = remap(align_gu)
-        align_dn = align_dn or align_gu
+    aligned: Dict[int, Any] = {}
+
+    def align(block_m: int):
+        if block_m not in aligned:
+            a = moe_align_block_size(topk_ids, block_m, num_experts)
+            if expert_map is not None:
+                # Padding blocks past num_tokens_post_padded exit before reading their id, so
+                # the clamp only keeps the gather in bounds.
+                a = (a[0], expert_map[a[1].clamp(0, num_experts - 1)].to(torch.int32), a[2])
+            aligned[block_m] = a
+        return aligned[block_m]
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
-    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(hidden_states, gate_up_qw, gate_up_qz, gate_up_sc, ic1,
-                  tw, *align_gu, num_valid, top_k,
-                  apply_router_weight_on_input, cfg_gu)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+    if fuse_act:
+        _prefill_gate_up_silu(hidden_states, gate_up_qw, gate_up_qz, gate_up_sc, ic2,
+                              *align(_TILE_GATE_UP_SILU["BLOCK_SIZE_M"]), num_valid, top_k)
+    else:
+        ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+        _prefill_gemm(hidden_states, gate_up_qw, gate_up_qz, gate_up_sc, ic1,
+                      tw, *align(cfg_gu["BLOCK_SIZE_M"]), num_valid, top_k,
+                      apply_router_weight_on_input, cfg_gu, exact=precise)
+        gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(ic2, down_qw, down_qz, down_sc, ic3,
-                  tw, *align_dn, num_valid, 1,
-                  not apply_router_weight_on_input, cfg_dn, k_off=down_k_off)
+                  tw, *align(cfg_dn["BLOCK_SIZE_M"]), num_valid, 1,
+                  not apply_router_weight_on_input, cfg_dn, k_off=down_k_off, exact=precise)
     if not reduce:
         return ic3
     out = torch.empty_like(hidden_states)
@@ -288,4 +348,4 @@ def fused_experts_wna16(
     return out
 
 
-__all__ = ["fused_experts_decode_wna16", "fused_experts_wna16"]
+__all__ = ["fused_experts_decode_wna16", "fused_experts_wna16", "prefill_precise"]

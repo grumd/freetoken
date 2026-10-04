@@ -49,8 +49,11 @@ def _dequant(qw, qz, sc, k_off):
     return (codes - zeros) * sc.float()[g]
 
 
-def _reference(banks, x, ids, w, k_off):
+def _reference(banks, x, ids, w, k_off, precise=False):
+    """Rounds to bf16 where the executor does: gate/up, activation and per-route output (only the
+    activation when ``precise``)."""
     bf = lambda t: t.to(torch.bfloat16).float()  # noqa: E731
+    mid = (lambda t: t) if precise else bf  # noqa: E731
     y = torch.zeros(x.shape[0], H)
     for t in range(x.shape[0]):
         for k in range(ids.shape[1]):
@@ -59,17 +62,20 @@ def _reference(banks, x, ids, w, k_off):
                 continue
             wgu = _dequant(banks["gate_up"][e], banks["gate_up_zero"][e], banks["gate_up_scale"][e], 0)
             wdn = _dequant(banks["down"][e], banks["down_zero"][e], banks["down_scale"][e], k_off)
-            gu = bf(x[t].float() @ wgu)
+            gu = mid(x[t].float() @ wgu)
             inter = gu.shape[0] // 2
             gate, up = gu[:inter], gu[inter:]
             h = bf(gate / (1 + torch.exp(-gate)) * up)
-            y[t] += bf(float(w[t, k]) * (h @ wdn))
+            y[t] += mid(float(w[t, k]) * (h @ wdn))
     return y.to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("inter,down_groups,k_off", [(I, 2, 0), (I, 2, 64)])
-def test_matches_reference(inter, down_groups, k_off):
+@pytest.mark.parametrize("precise", [False, True])
+def test_matches_reference(inter, down_groups, k_off, precise, monkeypatch):
     from freetoken.moe.wna16_cpu_prefill import Wna16CpuPrefill
+
+    monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
 
     g = torch.Generator().manual_seed(0)
     banks = _banks(g, inter, down_groups)
@@ -86,10 +92,10 @@ def test_matches_reference(inter, down_groups, k_off):
     y = torch.empty(T, H, dtype=torch.bfloat16)
     n = ex.forward(0, x, ids, w, y)
     assert n == len(set(ids[ids >= 0].tolist()))
-    ref = _reference(banks, x, ids, w, k_off)
+    ref = _reference(banks, x, ids, w, k_off, precise)
     assert torch.all(y[3] == 0)
-    err = (y.float() - ref.float()).abs().max() / ref.float().abs().max()
-    assert err < 2e-2, err
+    err = (y.float() - ref.float()).norm() / ref.float().norm()  # ~0 here; slack for BLAS order
+    assert err < 2e-3, err
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -189,6 +195,7 @@ def test_hybrid_merge_rounds_once():
     twice = gpu_part.to(torch.bfloat16) + cpu_part.cuda().to(torch.bfloat16)
     assert not torch.equal(once, twice)  # the case discriminates
     assert torch.equal(out, once)
+
 
 def test_pool_takes_a_job_queued_before_its_workers_start():
     """A forward right after construction can bump the worker pool's job generation before every

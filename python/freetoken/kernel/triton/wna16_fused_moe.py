@@ -271,12 +271,16 @@ def _prefill_wna16_moe_tile_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    EXACT_DEQUANT: tl.constexpr = False,
 ):
     """Same contract and dequant arithmetic as ``_prefill_wna16_moe_kernel``, but each
     K step dequantizes a whole [BLOCK_K, BLOCK_N] tile (word k // 8, nibble k % 8) and
     issues one dot against a contiguous A tile, instead of eight K=BLOCK_KW dots over
     stride-8 A columns. K and K_OFF must be multiples of BLOCK_K and BLOCK_K must divide
-    GROUP, so a K step never straddles a quantization group."""
+    GROUP, so a K step never straddles a quantization group.
+
+    ``EXACT_DEQUANT``: dot the integer ``code - zero`` (exact in bf16) and apply the group
+    scale to the fp32 partial, instead of rounding every dequantized weight to bf16."""
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -315,8 +319,11 @@ def _prefill_wna16_moe_tile_kernel(
         zero = ((tl.load(qz_ptrs + g * stride_zg) >> z_shift) & 0xF) + 1  # GPTQ stores zero-point - 1
         scale = tl.load(sc_ptrs + g * stride_sg).to(tl.float32)
         code = (word >> k_shift) & 0xF
-        b = ((code - zero[None, :]).to(tl.float32) * scale[None, :]).to(a.dtype)
-        accumulator += tl.dot(a, b)
+        if EXACT_DEQUANT:
+            accumulator += tl.dot(a, (code - zero[None, :]).to(a.dtype)) * scale[None, :]
+        else:
+            b = ((code - zero[None, :]).to(tl.float32) * scale[None, :]).to(a.dtype)
+            accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         qw_ptrs += (BLOCK_SIZE_K // 8) * stride_qkw
 
@@ -331,9 +338,97 @@ def _prefill_wna16_moe_tile_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.jit
+def _prefill_wna16_gate_up_silu_kernel(
+    a_ptr,
+    qw_ptr,
+    qz_ptr,
+    sc_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    INTER,
+    K,
+    EM,
+    num_valid_tokens,
+    GROUP: tl.constexpr,
+    stride_am, stride_ak,
+    stride_qe, stride_qkw, stride_qn,
+    stride_ze, stride_zg, stride_zn,
+    stride_se, stride_sg, stride_sn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """Gate/up GEMM with the SiLU-and-mul epilogue (``_prefill_wna16_moe_tile_kernel``'s
+    contract, exact dequant): each program accumulates gate columns [n, n + BLOCK_N) and the
+    matching up columns [INTER + n, ...) in fp32 and stores ``silu(gate) * up`` once, so the
+    gate/up outputs are never rounded to bf16 (nor stored). Writes [routes, INTER]."""
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(INTER, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_gn = offs_n % INTER
+    offs_un = offs_gn + INTER
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :] * stride_ak
+    qw_base = qw_ptr + slot * stride_qe + (offs_k[:, None] // 8) * stride_qkw
+    qg_ptrs = qw_base + offs_gn[None, :] * stride_qn
+    qu_ptrs = qw_base + offs_un[None, :] * stride_qn
+    zg_ptrs = qz_ptr + slot * stride_ze + (offs_gn // 8) * stride_zn
+    zu_ptrs = qz_ptr + slot * stride_ze + (offs_un // 8) * stride_zn
+    sg_ptrs = sc_ptr + slot * stride_se + offs_gn * stride_sn
+    su_ptrs = sc_ptr + slot * stride_se + offs_un * stride_sn
+    k_shift = (offs_k[:, None] % 8) * 4
+    zg_shift = (offs_gn % 8) * 4
+    zu_shift = (offs_un % 8) * 4
+
+    gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k0 in range(0, K // BLOCK_SIZE_K):
+        g = (k0 * BLOCK_SIZE_K) // GROUP
+        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        zg = ((tl.load(zg_ptrs + g * stride_zg) >> zg_shift) & 0xF) + 1  # GPTQ stores zero-point - 1
+        zu = ((tl.load(zu_ptrs + g * stride_zg) >> zu_shift) & 0xF) + 1
+        cg = ((tl.load(qg_ptrs) >> k_shift) & 0xF) - zg[None, :]
+        cu = ((tl.load(qu_ptrs) >> k_shift) & 0xF) - zu[None, :]
+        gate += tl.dot(a, cg.to(a.dtype)) * tl.load(sg_ptrs + g * stride_sg).to(tl.float32)[None, :]
+        up += tl.dot(a, cu.to(a.dtype)) * tl.load(su_ptrs + g * stride_sg).to(tl.float32)[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        qg_ptrs += (BLOCK_SIZE_K // 8) * stride_qkw
+        qu_ptrs += (BLOCK_SIZE_K // 8) * stride_qkw
+
+    h = (gate * tl.sigmoid(gate) * up).to(compute_type)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_n[None, :]
+    tl.store(c_ptrs, h, mask=token_mask[:, None] & (offs_n[None, :] < INTER))
+
+
 __all__ = [
     "_decode_wna16_moe_kernel",
     "_decode_wna16_splitk_reduce",
+    "_prefill_wna16_gate_up_silu_kernel",
     "_prefill_wna16_moe_kernel",
     "_prefill_wna16_moe_tile_kernel",
 ]

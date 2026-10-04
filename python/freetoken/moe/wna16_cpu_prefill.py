@@ -105,7 +105,9 @@ class Wna16CpuPrefill:
 
     def forward(self, layer_id: int, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor,
                 y: torch.Tensor) -> int:
-        return self.impl.forward(layer_id, x, ids, w, y)
+        from freetoken.moe.fused_wna16 import prefill_precise
+
+        return self.impl.forward(layer_id, x, ids, w, y, prefill_precise())
 
 
 def threads_from_env(default: int) -> int:

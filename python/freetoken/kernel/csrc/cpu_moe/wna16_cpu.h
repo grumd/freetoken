@@ -174,9 +174,11 @@ struct Route {
 };
 
 // One expert over `n` routes (n <= MT): y[token] += round_bf16(w * expert(x[token])).
+// `precise` (FREETOKEN_WNA16_PREFILL_PRECISE) keeps gate/up and the per-route output in fp32;
+// only the activation is rounded, as the bf16 dot needs it.
 template <int M>
 void expert_tile(const Layer& L, const Dims& d, int e, const Route* rt, const uint16_t* x_bf16,
-                 float* y, Scratch& s) {
+                 float* y, Scratch& s, bool precise) {
   const int H = d.H, I = d.I, N1 = 2 * I, G1 = H / 128;
   const int32_t* gqw = L.gu_qw + e * d.gu_qw_s;
   const int32_t* gqz = L.gu_qz + e * d.gu_qz_s;
@@ -214,8 +216,8 @@ void expert_tile(const Layer& L, const Dims& d, int e, const Route* rt, const ui
   uint32_t* h = s.h.data();
   for (int m = 0; m < M; ++m) {
     for (int i = 0; i < I; ++i) {
-      const float gt = round_bf16(gu[m * N1 + i]);
-      const float up = round_bf16(gu[m * N1 + I + i]);
+      const float gt = precise ? gu[m * N1 + i] : round_bf16(gu[m * N1 + i]);
+      const float up = precise ? gu[m * N1 + I + i] : round_bf16(gu[m * N1 + I + i]);
       hb[m * I + i] = f32_to_bf16(gt / (1.0f + std::exp(-gt)) * up);
     }
     pack_pairs(hb + m * I, I, h + m * (I / 2));
@@ -241,20 +243,21 @@ void expert_tile(const Layer& L, const Dims& d, int e, const Route* rt, const ui
     float* yr = y + int64_t(rt[m].token) * H;
     const __m512 w = _mm512_set1_ps(rt[m].weight);
     const float* dr = dn + m * H;
-    for (int n = 0; n < H; n += 16)
-      _mm512_storeu_ps(yr + n, _mm512_add_ps(_mm512_loadu_ps(yr + n),
-                                             round_bf16_16(_mm512_mul_ps(w, _mm512_loadu_ps(dr + n)))));
+    for (int n = 0; n < H; n += 16) {
+      const __m512 v = _mm512_mul_ps(w, _mm512_loadu_ps(dr + n));
+      _mm512_storeu_ps(yr + n, _mm512_add_ps(_mm512_loadu_ps(yr + n), precise ? v : round_bf16_16(v)));
+    }
   }
 }
 
 inline void expert_routes(const Layer& L, const Dims& d, int e, const Route* rt, int n,
-                          const uint16_t* x_bf16, float* y, Scratch& s) {
+                          const uint16_t* x_bf16, float* y, Scratch& s, bool precise) {
   for (int i = 0; i < n; i += MT) {
     switch (std::min(MT, n - i)) {
-      case 1: expert_tile<1>(L, d, e, rt + i, x_bf16, y, s); break;
-      case 2: expert_tile<2>(L, d, e, rt + i, x_bf16, y, s); break;
-      case 3: expert_tile<3>(L, d, e, rt + i, x_bf16, y, s); break;
-      default: expert_tile<4>(L, d, e, rt + i, x_bf16, y, s); break;
+      case 1: expert_tile<1>(L, d, e, rt + i, x_bf16, y, s, precise); break;
+      case 2: expert_tile<2>(L, d, e, rt + i, x_bf16, y, s, precise); break;
+      case 3: expert_tile<3>(L, d, e, rt + i, x_bf16, y, s, precise); break;
+      default: expert_tile<4>(L, d, e, rt + i, x_bf16, y, s, precise); break;
     }
   }
 }
@@ -345,7 +348,7 @@ class Executor {
 
   // returns the number of distinct experts computed
   int forward(int layer, const uint16_t* x, int T, const int32_t* ids, const float* w, int topk,
-              uint16_t* y, float* y32) {
+              uint16_t* y, float* y32, bool precise = false) {
     const Layer& L = layers_.at(layer);
     const int H = d_.H, nt = pool_.size();
     count_.assign(E_ + 1, 0);
@@ -380,7 +383,7 @@ class Executor {
             a.touched[rt[r].token] = 1;
             std::memset(a.rows.data() + int64_t(rt[r].token) * H, 0, sizeof(float) * H);
           }
-        expert_routes(L, d_, e, rt, n, x, a.rows.data(), s);
+        expert_routes(L, d_, e, rt, n, x, a.rows.data(), s, precise);
       }
     };
     pool_.run(work);

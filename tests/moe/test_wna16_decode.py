@@ -67,11 +67,12 @@ def test_decode_matches_dequant_reference(M, split, v2, monkeypatch):
 
 
 @pytest.mark.parametrize("M", [32, 300, 4096])
-@pytest.mark.parametrize("legacy", [False, True])
-def test_prefill_matches_dequant_reference(M, legacy, monkeypatch):
+@pytest.mark.parametrize("legacy,precise", [(False, False), (True, False), (False, True)])
+def test_prefill_matches_dequant_reference(M, legacy, precise, monkeypatch):
     from freetoken.moe import fused_wna16
 
     monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_LEGACY", "1" if legacy else "")
+    monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
     torch.manual_seed(0)
     dev = "cuda"
     S, H, I, TOPK = 16, 512, 384, 4  # I=384: the rank-1 band of Flash-Next at TP=2
@@ -118,9 +119,9 @@ def test_prefill_expert_map_matches_slot_ids(M):
     torch.testing.assert_close(mapped, direct, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("prefill,precise", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("v2", [True, False])
-def test_balanced_tp_bands_sum_to_full(prefill, v2, monkeypatch):
+def test_balanced_tp_bands_sum_to_full(prefill, precise, v2, monkeypatch):
     """FREETOKEN_WNA16_BALANCED_TP: two mid-group bands (rank 1 starts 64 rows into a
     group) sliced like the HF loader, each run with its own down K offset, sum to the
     unsplit MoE."""
@@ -128,6 +129,7 @@ def test_balanced_tp_bands_sum_to_full(prefill, v2, monkeypatch):
     from freetoken.moe import fused_wna16
 
     monkeypatch.setenv("FREETOKEN_WNA16_BALANCED_TP", "1")
+    monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
     monkeypatch.setattr(fused_wna16, "_DECODE_V2", v2)
     torch.manual_seed(0)
     dev = "cuda"
@@ -164,3 +166,37 @@ def test_balanced_tp_bands_sum_to_full(prefill, v2, monkeypatch):
     ref = (y.gather(1, ids.long()[..., None].expand(-1, -1, H)) * tw[..., None]).sum(1)
     rel = (out - ref).abs().max() / ref.abs().max()
     assert rel.item() < 2e-2, rel.item()
+
+
+@pytest.mark.parametrize("M", [32, 300, 4096])
+def test_prefill_precise_rounds_only_the_activation_and_outputs(M, monkeypatch):
+    """FREETOKEN_WNA16_PREFILL_PRECISE (exact dequant, fused fp32 gate/up + SiLU) equals a reference
+    that rounds to bf16 only where that path still stores bf16 -- the activation, each route's
+    output and the sum -- and lands well below the default path's error against exact W4 math."""
+    from freetoken.moe import fused_wna16
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    S, H, I, TOPK = 16, 512, 384, 4
+    gu_qw, gu_qz, gu_sc, gu_w = _expert_bank(S, 2 * I, H, dev)
+    dn_qw, dn_qz, dn_sc, dn_w = _expert_bank(S, H, I, dev)
+    banks = (gu_qw, gu_qz, gu_sc, dn_qw, dn_qz, dn_sc)
+    x = torch.randn(M, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(S, device=dev)[:TOPK] for _ in range(M)]).to(torch.int32)
+    tw = torch.softmax(torch.randn(M, TOPK, device=dev), dim=-1)
+
+    def run(precise):
+        monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
+        return fused_wna16.fused_experts_wna16(x.clone(), *banks, tw, ids, S).double()
+
+    bf = lambda t: t.to(torch.bfloat16).double()  # noqa: E731
+    gu = torch.einsum("snk,mk->msn", gu_w.double(), x.double())
+    act = torch.nn.functional.silu(gu[..., :I]) * gu[..., I:]
+    pick = ids.long()[..., None].expand(-1, -1, H)
+    w = tw.double()[..., None]
+    exact = (torch.einsum("snk,msk->msn", dn_w.double(), act).gather(1, pick) * w).sum(1)
+    stored = bf((bf(torch.einsum("snk,msk->msn", dn_w.double(), bf(act)).gather(1, pick) * w)).sum(1))
+    rel = lambda a, b: ((a - b).norm() / b.norm()).item()  # noqa: E731
+    default, precise = run(False), run(True)
+    assert rel(precise, stored) < 5e-4, rel(precise, stored)
+    assert rel(precise, exact) < 0.7 * rel(default, exact), (rel(precise, exact), rel(default, exact))

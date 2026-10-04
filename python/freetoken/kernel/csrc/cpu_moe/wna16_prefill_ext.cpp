@@ -53,7 +53,7 @@ struct Wna16CpuPrefill {
 
   // y[T, H] (bf16, or fp32 unrounded) = sum over routes with ids >= 0 of weight * expert(x); returns
   // #experts computed.
-  int64_t forward(int layer, torch::Tensor x, torch::Tensor ids, torch::Tensor w, torch::Tensor y) {
+  int64_t forward(int layer, torch::Tensor x, torch::Tensor ids, torch::Tensor w, torch::Tensor y, bool precise) {
     TORCH_CHECK(x.device().is_cpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2 &&
                     x.size(1) == d.H,
                 "x must be a contiguous host bf16 [T, hidden]");
@@ -75,7 +75,7 @@ struct Wna16CpuPrefill {
     uint16_t* yb = y32 ? nullptr : reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
     float* yf = y32 ? y.data_ptr<float>() : nullptr;
     return ex->forward(layer, reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()), int(T), idp,
-                       w.data_ptr<float>(), topk, yb, yf);
+                       w.data_ptr<float>(), topk, yb, yf, precise);
   }
 
   int threads() const { return ex->threads(); }
@@ -88,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init<int, std::vector<int>, int, int, int, int, int>(), py::arg("threads"), py::arg("cpus"),
            py::arg("hidden"), py::arg("inter"), py::arg("down_groups"), py::arg("k_off"), py::arg("num_experts"))
       .def("set_layer", &Wna16CpuPrefill::set_layer)
-      .def("forward", &Wna16CpuPrefill::forward)
+      .def("forward", &Wna16CpuPrefill::forward, py::arg("layer"), py::arg("x"), py::arg("ids"), py::arg("w"),
+           py::arg("y"), py::arg("precise") = false)
       .def_property_readonly("threads", &Wna16CpuPrefill::threads);
 }
