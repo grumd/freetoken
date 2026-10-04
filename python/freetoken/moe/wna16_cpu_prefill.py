@@ -69,7 +69,8 @@ class Wna16CpuPrefill:
         self.hidden, self.top_k, self.max_tokens = hidden, top_k, max_tokens
         pin = torch.cuda.is_available()
         self.x = torch.empty((max_tokens, hidden), dtype=torch.bfloat16, pin_memory=pin)
-        self.y = torch.empty((max_tokens, hidden), dtype=torch.bfloat16, pin_memory=pin)
+        # fp32: the caller adds this partial to the GPU routes before rounding once
+        self.y = torch.empty((max_tokens, hidden), dtype=torch.float32, pin_memory=pin)
         self.ids = torch.empty((max_tokens, top_k), dtype=torch.int32, pin_memory=pin)
         self.w = torch.empty((max_tokens, top_k), dtype=torch.float32, pin_memory=pin)
         self.meta = torch.empty((4,), dtype=torch.int64, pin_memory=pin)

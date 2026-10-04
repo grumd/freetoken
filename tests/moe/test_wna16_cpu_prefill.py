@@ -135,3 +135,57 @@ def test_hybrid_routed_prefill_matches_full_gpu_moe():
         ref = fused_experts_wna16(x, *full, w, ids, E, "silu", False, 1.0, float("inf"))
         err = (out.float() - ref.float()).abs().max() / ref.float().abs().max()
         assert err < 2e-2, (step, err)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hybrid_merge_rounds_once():
+    """The hybrid path rounds the routed sum to bf16 once: GPU routes summed in fp32 plus the CPU's
+    fp32 partial. Rounding each partial to bf16 first measurably raised the error on real
+    activations (the GPU half dominates there). Experts 0-9 are pre-loaded and nothing is fetched,
+    so the split is known: their routes on the GPU, the rest on one deterministic CPU thread."""
+    from types import SimpleNamespace
+
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization.moe.base import BankSpec
+    from freetoken.moe.fused_wna16 import fused_experts_wna16
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.wna16_cpu_prefill import Wna16CpuPrefill
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    E, top_k, inter, T, resident = 16, 4, 128, 64, 10
+    g = torch.Generator().manual_seed(1)
+    banks = _banks(g, inter, 1, E)
+    layout = {role: BankSpec(tuple(t.shape[1:]), t.dtype) for role, t in banks.items()}
+    cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=torch.device("cuda"),
+                            layout=layout)
+    cache.set_bank_sources({role: [t.pin_memory()] for role, t in banks.items()})
+    cache.ensure_experts_capped(0, torch.arange(resident, dtype=torch.int32, device="cuda").view(1, -1), 1.0,
+                                torch.ones(resident, dtype=torch.int64, device="cuda"))
+    cache.copy_missing()
+    cpu = Wna16CpuPrefill(hidden=H, inter=inter, down_groups=1, k_off=0, num_experts=E, top_k=top_k,
+                          max_tokens=T, threads=1, cpus=[])
+    cpu.set_layer(0, {role: cache.bank_sources[role][0] for role in layout})
+    cache.cpu_prefill, cache.cpu_prefill_fetch = cpu, 0.0
+
+    stub = SimpleNamespace(layer_id=0, activation="silu", apply_router_weight_on_input=False, alpha=1.0,
+                           limit=None)
+    x = torch.randn(T, H, generator=g).to(torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, generator=g)[:top_k] for _ in range(T)]).to(torch.int32)
+    w = torch.softmax(torch.randn(T, top_k, generator=g), -1)
+    out = OffloadMoELayer._prefill_cpu_hybrid(stub, cache, x.cuda(), w.cuda(), ids.cuda())
+
+    on_cpu = ids >= resident
+    assert on_cpu.any() and not on_cpu.all()
+    full = [banks[role].cuda() for role in layout]
+    routes = fused_experts_wna16(x.cuda(), *full, w.masked_fill(on_cpu, 0).cuda(), ids.cuda(), E, "silu", False,
+                                 1.0, float("inf"), reduce=False)
+    gpu_part = torch.sum(routes, dim=1, dtype=torch.float32)
+    cpu_part = torch.empty(T, H, dtype=torch.float32)
+    cpu.forward(0, x, torch.where(on_cpu, ids, -1), w, cpu_part)
+    once = (gpu_part + cpu_part.cuda()).to(torch.bfloat16)
+    twice = gpu_part.to(torch.bfloat16) + cpu_part.cuda().to(torch.bfloat16)
+    assert not torch.equal(once, twice)  # the case discriminates
+    assert torch.equal(out, once)

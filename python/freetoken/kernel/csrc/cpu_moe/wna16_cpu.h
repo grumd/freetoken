@@ -326,8 +326,9 @@ class Pool {
   bool stop_ = false;
 };
 
-// Routed-expert sum for one layer: y[T, H] (bf16) = sum over routes with id >= 0 of
-// w * expert_id(x). Experts are bucketed and handed out largest-first; each worker
+// Routed-expert sum for one layer: y[T, H] = sum over routes with id >= 0 of w * expert_id(x),
+// written as bf16 (y) or unrounded fp32 (y32, for a caller that adds it to another partial
+// before rounding once). Experts are bucketed and handed out largest-first; each worker
 // accumulates into its own fp32 rows, then the rows are reduced in parallel.
 class Executor {
  public:
@@ -343,7 +344,7 @@ class Executor {
 
   // returns the number of distinct experts computed
   int forward(int layer, const uint16_t* x, int T, const int32_t* ids, const float* w, int topk,
-              uint16_t* y) {
+              uint16_t* y, float* y32) {
     const Layer& L = layers_.at(layer);
     const int H = d_.H, nt = pool_.size();
     count_.assign(E_ + 1, 0);
@@ -384,19 +385,27 @@ class Executor {
     pool_.run(work);
     std::function<void(int)> reduce = [&](int tid) {
       for (int t = tid; t < T; t += nt) {
-        uint16_t* yr = y + int64_t(t) * H;
+        uint16_t* yr = y32 ? nullptr : y + int64_t(t) * H;
+        float* yr32 = y32 ? y32 + int64_t(t) * H : nullptr;
         bool any = false;
         for (int k = 0; k < nt; ++k) any |= acc_[k].touched[t] != 0;
         if (!any) {
-          std::memset(yr, 0, sizeof(uint16_t) * H);
+          if (yr32)
+            std::memset(yr32, 0, sizeof(float) * H);
+          else
+            std::memset(yr, 0, sizeof(uint16_t) * H);
           continue;
         }
         for (int n = 0; n < H; n += 16) {
           __m512 sum = _mm512_setzero_ps();
           for (int k = 0; k < nt; ++k)
             if (acc_[k].touched[t]) sum = _mm512_add_ps(sum, _mm512_loadu_ps(acc_[k].rows.data() + int64_t(t) * H + n));
-          const __m512i u = _mm512_srli_epi32(bf16_bits_16(sum), 16);
-          _mm256_storeu_si256(reinterpret_cast<__m256i*>(yr + n), _mm512_cvtepi32_epi16(u));
+          if (yr32) {
+            _mm512_storeu_ps(yr32 + n, sum);
+          } else {
+            const __m512i u = _mm512_srli_epi32(bf16_bits_16(sum), 16);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(yr + n), _mm512_cvtepi32_epi16(u));
+          }
         }
       }
     };

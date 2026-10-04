@@ -389,8 +389,10 @@ class OffloadMoELayer(MoELayer):
         """Routed prefill with CPU help (W4A16, ``cache.cpu_prefill``): the GPU computes the
         cache hits plus ~``cpu_prefill_fetch`` of the misses (the most-routed ones), fetched over
         PCIe; meanwhile the CPU computes the other misses from the host banks at RAM bandwidth;
-        the partial sums add up. Each route is computed once: CPU routes get weight 0 on the GPU
-        side and point at a resident slot (the GEMM leaves no route row unwritten)."""
+        the partial sums add up in fp32 and round to bf16 once, like the GPU-only reduction
+        (rounding each partial first measurably raised the error). Each route is computed once:
+        CPU routes get weight 0 on the GPU side and point at a resident slot (the GEMM leaves no
+        route row unwritten)."""
         cpu = cache.cpu_prefill
         T = hidden_states.size(0)
         routed, inverse, counts = torch.unique(topk_ids, return_inverse=True, return_counts=True)
@@ -409,7 +411,7 @@ class OffloadMoELayer(MoELayer):
         staged.synchronize()
         resident, n_gpu, n_fetch, n_routed = cpu.meta.tolist()
         cache.copy_missing()
-        gpu_out = None
+        gpu_routes = None
         if n_gpu:
             # Called directly, not through the method's apply: that derives the compact routed
             # set with another torch.unique, whose host sync would hold the CPU work back until
@@ -421,21 +423,23 @@ class OffloadMoELayer(MoELayer):
 
             t = {canonical_role(n): v for n, v in zip(cache.bank_schema, cache.bank_views())}
             expert_map = slots.view(-1).masked_fill(slots.view(-1) < 0, resident)
-            gpu_out = fused_experts_wna16(
+            gpu_routes = fused_experts_wna16(
                 hidden_states, t["gate_up"], t["gate_up_zero"], t["gate_up_scale"],
                 t["down"], t["down_zero"], t["down_scale"],
                 topk_weights.masked_fill(on_cpu, 0), inverse.to(torch.int32), expert_map.numel(),
                 self.activation, self.apply_router_weight_on_input, float(self.alpha),
                 limit_or_inf(self), down_k_off=wna16_down_k_off(t["down"].shape[-2] * 8),
-                expert_map=expert_map,
+                expert_map=expert_map, reduce=False,
             )
         t0 = time.perf_counter()
         n_cpu = cpu.forward(self.layer_id, cpu.x[:T], cpu.ids[:T], cpu.w[:T], cpu.y[:T])
         if cpu.stats is not None:
-            gpu_busy = gpu_out is not None and not torch.cuda.current_stream().query()
+            gpu_busy = gpu_routes is not None and not torch.cuda.current_stream().query()
             cpu.record(self.layer_id, T, n_routed, n_fetch, n_cpu, time.perf_counter() - t0, gpu_busy)
-        cpu_out = cpu.y[:T].to(hidden_states.device, non_blocking=True)
-        return cpu_out if gpu_out is None else gpu_out.add_(cpu_out)
+        out = cpu.y[:T].to(hidden_states.device, non_blocking=True)
+        if gpu_routes is not None:
+            out = torch.sum(gpu_routes, dim=1, dtype=torch.float32).add_(out)
+        return out.to(hidden_states.dtype)
 
     def _decode_hybrid(
         self,

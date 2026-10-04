@@ -241,11 +241,14 @@ def fused_experts_wna16(
     act_limit: float = 7.0,
     down_k_off: int = 0,
     expert_map: torch.Tensor | None = None,
+    reduce: bool = True,
 ) -> torch.Tensor:
     """Grouped prefill GEMM. ``expert_map`` (routed-only prefill over the slot cache):
     ``topk_ids`` are compact ids ``[0, num_experts)`` and ``expert_map[id]`` is the
     bank row each one reads, so the block alignment stays sized by the routed set
-    instead of the whole slot cache."""
+    instead of the whole slot cache. ``reduce=False`` returns the per-route outputs
+    ``[M, top_k, H]`` (router weights applied) for a caller that adds another partial
+    before the single rounding of the sum."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_qw.shape[2]
@@ -278,6 +281,8 @@ def fused_experts_wna16(
     _prefill_gemm(ic2, down_qw, down_qz, down_sc, ic3,
                   tw, *align_dn, num_valid, 1,
                   not apply_router_weight_on_input, cfg_dn, k_off=down_k_off)
+    if not reduce:
+        return ic3
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out
