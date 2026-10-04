@@ -78,7 +78,7 @@ _BALANCED_ALIGN = 64
 
 
 def wna16_balanced_tp(intermediate: int, tp_size: int) -> bool:
-    """Even intermediate split across ranks, ``FREETOKEN_WNA16_BALANCED_TP=1`` (HF loader only).
+    """Even intermediate split across ranks, ``FREETOKEN_WNA16_BALANCED_TP=1`` (HF and FTW loaders).
 
     The group-aligned split gives Flash-Next's rank 1 1.5x rank 0's expert bytes, so
     rank 1 bounds both the prefill copy and the decode step. Balanced bands may start

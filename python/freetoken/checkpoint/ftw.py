@@ -59,10 +59,11 @@ ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)
 DEFAULT_SHARD_LIMIT = 8 << 30  # 8 GiB; must be a multiple of ALIGN
 _SHARD_FMT = "freetoken-{:05d}.ftw"
 _DEFAULT_CHUNK = 8 << 20
-# Concurrent down-family full-entry reads during the TP band load. Each holds one
-# transient whole-entry buffer, so this bounds the extra host RAM to
-# ~_DOWN_READ_CONCURRENCY * entry_bytes; going wider oversubscribes the cores.
-_DOWN_READ_CONCURRENCY = 8
+# Concurrent full-entry band reads during the TP band load. Each holds one pooled
+# transient whole-entry buffer for the whole load, so this bounds the extra host RAM to
+# ~_DOWN_READ_CONCURRENCY * entry_bytes PER RANK (4 x 0.8 GiB x 2 ranks on Flash-Next;
+# 8 pushed a 78 GiB box past its memory guard); 4 per rank already saturates an NVMe.
+_DOWN_READ_CONCURRENCY = 4
 _ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
@@ -604,6 +605,95 @@ def _band_axis(base: str, shape: tuple[int, ...], expert_quant: str | None) -> i
     return None
 
 
+def _wna16_band_cols(base: str, shape: tuple[int, ...], lo: int, hi: int, I_full: int) -> tuple[int, int, int]:
+    """``(axis, a0, a1)``: the index range of the rank's ``[lo, hi)`` intermediate band on one
+    WNA16 bank's intermediate axis.
+
+    One index of that axis covers ``I_full / extent`` intermediate elements (1 for a
+    qweight or scale column, 8 for a packed qzeros column, 128 for a down-proj group
+    row), and the band is widened to whole indices: a balanced band that starts
+    mid-group keeps the straddled group's scales and zeros, exactly like the HF reader
+    (``wna16_banks._tp_slice_piece``). For gate_up banks the bounds are within ONE
+    half; the caller takes the same range from the gate and the up half.
+    """
+    axis = 2 if base.startswith("gate_up") else 1
+    extent = shape[axis] // 2 if axis == 2 else shape[axis]
+    unit = I_full // extent
+    return axis, lo // unit, -(-hi // unit)
+
+
+def _slice_band_into(dst, arr, base: str, shape: tuple[int, ...], tp_band, mem_axis: int, expert_quant: str | None) -> None:
+    """Write the rank's band of a fully-read bank entry ``arr`` (a NumPy view) into ``dst``
+    (the NumPy view of the sliced bank): one strided copy, no temporaries."""
+    I_full, _I_loc, lo, hi = tp_band
+    if expert_quant == "w4a16":
+        axis, a0, a1 = _wna16_band_cols(base, shape, lo, hi, I_full)
+        if axis == 2:
+            # fused gate_up [E, pk, 2I]: the band sits in BOTH halves, adjacent on the last axis
+            half, w = shape[2] // 2, a1 - a0
+            dst[:, :, :w] = arr[:, :, a0:a1]
+            dst[:, :, w:] = arr[:, :, half + a0 : half + a1]
+        else:
+            dst[...] = arr[:, a0:a1]
+        return
+    idx = [slice(None)] * arr.ndim
+    idx[mem_axis] = slice(shape[mem_axis] * lo // I_full, shape[mem_axis] * hi // I_full)
+    dst[...] = arr[tuple(idx)]
+
+
+def _slice_band(arr, base: str, shape: tuple[int, ...], tp_band, mem_axis: int, expert_quant: str | None):
+    """The rank's band of ``arr`` as a new contiguous array (tests / tooling; the loader
+    writes straight into the bank with :func:`_slice_band_into`)."""
+    sliced, _, _ = _tp_band_plan(base, shape, tp_band[2], tp_band[3], tp_band[0], tp_band[1],
+                                 axis=_band_axis(base, shape, expert_quant))
+    out = np.empty(sliced, dtype=arr.dtype)
+    _slice_band_into(out, arr, base, shape, tp_band, mem_axis, expert_quant)
+    return out
+
+
+class _TransientPool:
+    """Reusable page-aligned read buffers for the full-entry band reads.
+
+    A fresh anonymous mmap per entry costs a page-fault storm per 800 MiB read (and
+    its teardown); the pool hands the same few buffers around for the whole load. The
+    caller bounds the live set (``_DOWN_READ_CONCURRENCY``), so RAM stays at that many
+    entries' worth; ``close`` returns it all at the end of the load.
+    """
+
+    def __init__(self) -> None:
+        self._free: list[mmap.mmap] = []
+        self._all: list[mmap.mmap] = []
+        self._lock = threading.Lock()
+
+    def acquire(self, nbytes: int) -> mmap.mmap:
+        with self._lock:
+            for i, buf in enumerate(self._free):
+                if len(buf) >= nbytes:
+                    return self._free.pop(i)
+            # no fitting buffer: drop the smallest idle one so the pool does not accumulate
+            # one buffer per size class (bank families differ by ~30x)
+            if self._free:
+                small = min(self._free, key=len)
+                self._free.remove(small)
+                self._all.remove(small)
+                small.close()
+        buf = _transient_buffer(nbytes)
+        with self._lock:
+            self._all.append(buf)
+        return buf
+
+    def release(self, buf: mmap.mmap) -> None:
+        with self._lock:
+            self._free.append(buf)
+
+    def close(self) -> None:
+        with self._lock:
+            for buf in self._all:
+                buf.close()
+            self._all.clear()
+            self._free.clear()
+
+
 def _tp_band_plan(base: str, shape: tuple[int, ...], lo: int, hi: int, I_full: int,
                   I_loc: int, elsize: int = 1, *, axis: int | None = None):
     """TP-band plan for one per-layer FTW bank entry.
@@ -621,9 +711,11 @@ def _tp_band_plan(base: str, shape: tuple[int, ...], lo: int, hi: int, I_full: i
         # WNA16 / output-last layout: [E, packed, out]. The intermediate axis is the last
         # for gate_up (out == 2I) and the packed first for down (packed == I/8); neither is
         # contiguous per expert across all of the other axis, so read the entry fully and
-        # slice in memory.
+        # slice in memory. The extent comes from the band's whole-index widening, not
+        # I_loc / I_full: a balanced band keeps one more down group than its share.
+        _, a0, a1 = _wna16_band_cols(base, shape, lo, hi, I_full)
         sliced = list(shape)
-        sliced[axis] = shape[axis] * I_loc // I_full
+        sliced[axis] = (a1 - a0) * (2 if axis == 2 else 1)
         return tuple(sliced), None, axis
     if base.startswith("gate_up"):
         E, two_i, *rest = shape
@@ -766,24 +858,20 @@ def load_ftw_banks(
     # with per-segment preads. The post-load _tp_slice_ftw_sources pass is then
     # unnecessary (the caller checks banks.tp_sliced).
     tp_loc = None
+    expert_quant = getattr(model_config, "expert_quant", None)
     if model_config is not None:
         from freetoken.distributed import get_tp_info
 
         tp = get_tp_info()
         if tp.size > 1:
-            if getattr(model_config, "expert_quant", None) == "w4a16":
-                # WNA16 group scales live on K and cannot split mid-group; the rank band
-                # is group-aligned (may differ by one group across ranks) and gate_up's
-                # output slice uses the SAME extent so it matches down's input.
-                from freetoken.models.wna16_banks import wna16_balanced_tp, wna16_tp_geometry
+            if expert_quant == "w4a16":
+                # The rank band is group-aligned, or (FREETOKEN_WNA16_BALANCED_TP) an even
+                # split that may start mid-group; _wna16_band_cols widens the down scale /
+                # zero rows to the groups the band overlaps, like the HF reader does.
+                from freetoken.models.wna16_banks import wna16_tp_bands
 
                 I_full = int(model_config.moe_intermediate_size)
-                if wna16_balanced_tp(I_full, tp.size):
-                    raise NotImplementedError(
-                        "FREETOKEN_WNA16_BALANCED_TP is implemented for HF checkpoints only; "
-                        "unset it to serve an FTW"
-                    )
-                lo, hi = wna16_tp_geometry(I_full, tp.size, tp.rank)
+                lo, hi, _, _ = wna16_tp_bands(I_full, tp.size, tp.rank)
                 tp_loc = (I_full, hi - lo, lo, hi)
             else:
                 from freetoken.models.nvfp4_banks import _tp_expert_geometry
@@ -886,7 +974,7 @@ def load_ftw_banks(
             # per-expert segments straight from the shard into it
             I_full, I_loc, lo, hi = tp_loc
             shape = tuple(e["shape"])
-            axis = _band_axis(base, shape, getattr(model_config, "expert_quant", None))
+            axis = _band_axis(base, shape, expert_quant)
             sliced, segs, mem_axis = _tp_band_plan(base, shape, lo, hi, I_full, I_loc, _elsize(_dtype_of(e["dtype"])), axis=axis)
             bank = HostBank(sliced, _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)
@@ -899,6 +987,7 @@ def load_ftw_banks(
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
     n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs)
+    transients = _TransientPool()
     try:
         with PinPipeline() as pins:
 
@@ -939,10 +1028,11 @@ def load_ftw_banks(
                         with down_sem:
                             # The intermediate axis is not the leading per-expert axis (the
                             # NVFP4 down-family, and every WNA16 bank): read the full entry
-                            # transiently and slice ``mem_axis`` in memory. The transient is
-                            # a page-aligned mmap (O_DIRECT rejects a bytearray base).
-                            tmp = _transient_buffer(entry["nbytes"])
-                            arr = None
+                            # transiently and slice ``mem_axis`` in memory, straight into the
+                            # bank. The transient is a pooled page-aligned mmap (O_DIRECT
+                            # rejects a bytearray base).
+                            tmp = transients.acquire(entry["nbytes"])
+                            arr = dst = None
                             try:
                                 reader.read_into(memoryview(tmp),
                                                  {"global_off": entry["global_off"], "nbytes": entry["nbytes"]},
@@ -950,31 +1040,14 @@ def load_ftw_banks(
                                 shape = tuple(entry["shape"])
                                 dt = _dtype_of(entry["dtype"])
                                 arr = np.frombuffer(tmp, dtype=_np_dtype(dt), count=entry["nbytes"] // _elsize(dt)).reshape(shape)
-                                I_full, I_loc, lo, hi = tp_band
-                                if mem_axis == 2 and base.startswith("gate_up"):
-                                    # WNA16 fused gate_up [E, pk, 2I]: the rank's slice is
-                                    # [lo, hi) within BOTH the gate and up halves, which sit
-                                    # adjacent on the last axis.
-                                    half = shape[2] // 2
-                                    a0, a1 = half * lo // I_full, half * hi // I_full
-                                    band = np.concatenate(
-                                        [arr[:, :, a0:a1], arr[:, :, half + a0 : half + a1]], axis=2
-                                    ).copy()
-                                else:
-                                    idx = [slice(None)] * arr.ndim
-                                    idx[mem_axis] = slice(shape[mem_axis] * lo // I_full, shape[mem_axis] * hi // I_full)
-                                    band = arr[tuple(idx)].copy()
-                                data = band.ravel().tobytes()
-                                mv = memoryview(bank._buf)
-                                mv[: len(data)] = data
-                                mv.release()
+                                dst = np.frombuffer(bank.memoryview(), dtype=_np_dtype(dt), count=bank.nbytes // _elsize(dt)).reshape(bank.tensor.shape)
+                                _slice_band_into(dst, arr, base, shape, tp_band, mem_axis, expert_quant)
                             finally:
-                                # np.frombuffer(tmp) exports a buffer on the mmap; closing
-                                # it while the array lives raises "cannot close exported
-                                # pointers exist", so drop the array (and its view base) first.
-                                if arr is not None:
-                                    del arr
-                                tmp.close()
+                                # np.frombuffer(tmp) exports a buffer on the mmap; releasing
+                                # it to the pool while the array lives would let a later
+                                # close fail ("exported pointers exist"), so drop the views first.
+                                del arr, dst
+                                transients.release(tmp)
                     else:
                         _read_band_segments(reader, bank, entry, segs, chunk)
                     pins.submit(bank, residency[layer_id])
@@ -994,6 +1067,7 @@ def load_ftw_banks(
     finally:
         bar.close()
         reader.close()
+        transients.close()
 
     sources: dict[str, list] = {}
     for name, banks in row_hb.items():

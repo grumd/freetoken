@@ -56,11 +56,13 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--include-dspark", action="store_true",
                    help="also export the DSpark MTP draft head (mtp.* weights + draft expert banks) "
                         "into the FTW; otherwise the draft head is skipped at conversion")
-    p.add_argument("--ple", choices=["auto", "fp8", "bf16"], default="bf16",
+    p.add_argument("--ple", choices=["auto", "fp8", "bf16", "none"], default="bf16",
                    help="stored dtype of the PLE n-gram table side tables (qwen4_exp): 'bf16' "
                         "(default) keeps the table unquantized, 'fp8' quantizes it (half the disk/RAM), "
                         "'auto' preserves the source dtype. A table already in the requested dtype "
-                        "rides verbatim")
+                        "rides verbatim. 'none' copies nothing: the server reads the table from the "
+                        "source checkpoint (recorded in the FTW index), saving ~95 GiB of disk for "
+                        "Qwen3.8-Flash-Next; the source must stay where it is")
     p.add_argument("--vision", choices=["on", "off"], default="on",
                    help="include the vision tower's bf16 tensors in the FTW (default on; only when "
                         "the checkpoint carries a vision_config). Serving it still requires "

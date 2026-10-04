@@ -262,6 +262,7 @@ without re-reading the HF shards. See the FTW caveats in
 | `--shard-gib` | 8 | Max FTW shard size in GiB |
 | `--include-engram` | off | Also export the Engram n-gram tables into the FTW (~189 GiB extra disk); otherwise they are read in place at serve time |
 | `--include-dspark` | off | Also export the DSpark MTP draft head (mtp.* weights + draft expert banks); otherwise the draft head is skipped |
+| `--ple` | bf16 | Stored dtype of the PLE n-gram table side tables (qwen4_exp): `bf16`, `fp8`, `auto` (keep the source dtype), or `none` to copy nothing and read the table from the source checkpoint at serve time (the source must stay in place) |
 | `--gpu` | first visible GPU | GPU for the repack: a UUID from `nvidia-smi -L` or an index |
 
 ## ft bench bw

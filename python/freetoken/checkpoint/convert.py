@@ -548,7 +548,10 @@ def convert_checkpoint(
     import struct as _struct
 
     ple_stored = None
-    for src in side_table_files(model_path):
+    # --ple none: no copy; the serve-time loader reads the table from source_model_path
+    # (qwen4_exp.weight.ple_source_folder), which the index below records.
+    side_tables = [] if ple_mode == "none" else side_table_files(model_path)
+    for src in side_tables:
         src_abs = os.path.abspath(src)
         if not os.path.isfile(src_abs):
             continue
@@ -603,7 +606,8 @@ def convert_checkpoint(
             "dspark": bool(include_dspark),
             "mtp_mode": mtp_mode,
             "mtp_header": os.path.abspath(mtp_header) if mtp_mode == "file" else None,
-            # Stored PLE n-gram table dtype ("fp8"/"bf16"); None when the model has no table.
+            # Stored PLE n-gram table dtype ("fp8"/"bf16"); None when the model has no table
+            # or --ple none left it in the source checkpoint.
             "ple": ple_stored,
             # Whether the vision tower's bf16 tensors ride the FTW dense stream (only when
             # the checkpoint has a vision_config and --vision on).
