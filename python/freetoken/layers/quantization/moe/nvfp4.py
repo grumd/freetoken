@@ -17,6 +17,7 @@ experts into a GPU slot cache. Rules every kernel here follows:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -34,11 +35,18 @@ MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
 
 
+def _tile_kernels() -> bool:
+    """FREETOKEN_NVFP4_TILE (default on): exact tile-dequant prefill + fused-epilogue decode
+    (moe/fused_nvfp4_tile.py); 0 = the original inline-dequant kernels (moe/fused_nvfp4.py)."""
+    return os.environ.get("FREETOKEN_NVFP4_TILE", "1") != "0"
+
+
 class TritonNvfp4MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native ModelOpt rows."""
 
     name = "triton"
     cpu_format = "nvfp4"
+    slot_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
@@ -71,14 +79,34 @@ class TritonNvfp4MoEKernel(MoEKernel):
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        from freetoken.moe import fused_nvfp4_tile as tile
         from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        act, on_input = layer.activation, layer.apply_router_weight_on_input
+        use_tile = _tile_kernels()
         if is_prefill:
-            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            n, expert_map = view.n, None
+            if view.slots is not None:
+                # Routed-only prefill: topk_ids hold slot-cache ids. Align on the compact
+                # routed set (a few hundred ids) rather than every cache slot.
+                expert_map, compact = torch.unique(topk_ids, return_inverse=True)
+                topk_ids, n = compact.to(torch.int32), expert_map.numel()
+            if use_tile and tile.tile_ok(x.shape[1], tile._TILE_GATE_UP) and tile.tile_ok(
+                t["down"].shape[-1] * 2, tile._tile_down_config(x.shape[0])
+            ):
+                return tile.fused_experts_nvfp4_tile(
+                    x, *banks, topk_weights, topk_ids, n, act, on_input, alpha, limit,
+                    expert_map=expert_map,
+                )
+            if expert_map is not None:
+                topk_ids, n = expert_map[topk_ids.long()].to(torch.int32), t["gate_up"].shape[0]
+            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, n, act, on_input, alpha, limit)
+        if use_tile and act == "silu" and not on_input and tile.decode_supported(t["gate_up"], t["down"]):
+            return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids)
+        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, act, on_input, alpha, limit)
 
 
 # ---------------------------------------------------------------------------
