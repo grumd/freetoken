@@ -18,6 +18,8 @@ from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
 
 from .weight import (
+    _PLE_GLOBAL_SUFFIX,
+    _PLE_NVFP4_ROWS_RE,
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
     _PLE_SRC_DTYPES,
@@ -42,8 +44,10 @@ def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
 class PleRowSource:
     """On-disk row layout: equal extents, row i of an extent at ``base + i * row_stride`` (a repacked flat file is one extent with its own stride).
 
-    Rows are fp8-e4m3 (one byte/element, with a scalar ``scale``) or unquantized bf16/f32
-    (``scale == 1.0``); ``row_bytes`` is the byte width of a row, ``elem_bytes`` its element size."""
+    Rows are fp8-e4m3 (one byte/element, with a scalar ``scale``), unquantized bf16/f32
+    (``scale == 1.0``) or interleaved NVFP4 (``src_dtype == "NVFP4_ROWS"``: e2m1 codes then
+    e4m3 per-16 block scales, ``scale`` the fp32 global); ``row_bytes`` is the byte width of a
+    row, ``elem_bytes`` its element size (0 for NVFP4)."""
 
     paths: list[str]
     extent_file: list[int]
@@ -58,6 +62,11 @@ class PleRowSource:
     @property
     def total_rows(self) -> int:
         return len(self.extent_base) * self.rows_per_extent
+
+    @property
+    def head_dim(self) -> int:
+        # an NVFP4 row of D values is D/2 code bytes + D/16 scale bytes
+        return self.row_bytes * 16 // 9 if self.src_dtype == "NVFP4_ROWS" else self.row_bytes // self.elem_bytes
 
 
 def source_from_safetensors(folder: str) -> PleRowSource:
@@ -74,14 +83,26 @@ def source_from_safetensors(folder: str) -> PleRowSource:
         for key, meta in header.items():
             if key == "__metadata__":
                 continue
-            if key.endswith(_PLE_SCALE_SUFFIX):
+            if key.endswith((_PLE_SCALE_SUFFIX, _PLE_GLOBAL_SUFFIX)):
                 with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                     scale = f.get_tensor(key).reshape(())
                 continue
-            match = _PLE_SHARD_RE.search(key)
+            match = _PLE_NVFP4_ROWS_RE.search(key)
+            if match is not None:
+                meta = dict(meta, dtype="NVFP4_ROWS")
+            else:
+                match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] not in _PLE_SRC_DTYPES:
+            if meta["dtype"] == "U8":
+                raise ValueError(
+                    "the NVFP4 PLE table must be repacked into interleaved rows for the disk "
+                    "backend: convert the checkpoint with `ft checkpoint` and serve the FTW"
+                )
+            if meta["dtype"] == "NVFP4_ROWS":
+                if src_dtype is None:
+                    src_dtype, elem_bytes = "NVFP4_ROWS", 0
+            elif meta["dtype"] not in _PLE_SRC_DTYPES:
                 raise ValueError(
                     f"PLE shard {key} has dtype {meta['dtype']}, expected one of "
                     f"{sorted(_PLE_SRC_DTYPES)}"
@@ -108,11 +129,11 @@ def source_from_safetensors(folder: str) -> PleRowSource:
         raise ValueError("PLE table has no shard tensors")
     if scale is None:
         # Unquantized (bf16/f32) tables carry no scale; fp8 tables must.
-        if src_dtype == "F8_E4M3":
+        if src_dtype in ("F8_E4M3", "NVFP4_ROWS"):
             raise ValueError("PLE table has no weight_scale")
         scale = torch.tensor(1.0)
     order = [shards[i] for i in range(len(shards))]
-    row_bytes = cols * elem_bytes
+    row_bytes = cols * elem_bytes if elem_bytes else cols
     return PleRowSource(
         paths, [f for f, _ in order], [b for _, b in order], rows, row_bytes, row_bytes,
         float(scale), src_dtype, elem_bytes,
@@ -141,7 +162,7 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes // source.elem_bytes  # elements, not bytes
+        self.head_dim = source.head_dim  # elements, not bytes
         self._src_dtype = source.src_dtype
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
@@ -286,9 +307,14 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(_PLE_SRC_DTYPES[self._src_dtype][0]).to(self.dtype)
-        if self.scale != 1.0:
-            values = values * self.scale
+        if self._src_dtype == "NVFP4_ROWS":
+            from freetoken.kernel.triton.ple import nvfp4_rows_dequant
+
+            values = nvfp4_rows_dequant(dev[:nbytes], self.head_dim, self.scale).to(self.dtype)
+        else:
+            values = dev[:nbytes].view(_PLE_SRC_DTYPES[self._src_dtype][0]).to(self.dtype)
+            if self.scale != 1.0:
+                values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
         if out is None:
             return values

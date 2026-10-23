@@ -554,6 +554,21 @@ def convert_checkpoint(
     # --ple none: no copy; the serve-time loader reads the table from source_model_path
     # (qwen4_exp.weight.ple_source_folder), which the index below records.
     side_tables = [] if ple_mode == "none" else side_table_files(model_path)
+    headers = []
+    for src in side_tables:
+        with open(os.path.abspath(src), "rb") as fh:
+            (hlen,) = _struct.unpack("<Q", fh.read(8))
+            headers.append(json.loads(fh.read(hlen)))
+    from freetoken.models.qwen4_exp.weight import ple_table_is_nvfp4, repack_ple_nvfp4
+
+    if side_tables and ple_table_is_nvfp4(headers):
+        # NVFP4 table: always repacked to interleaved rows (the disk backend's format);
+        # the source shards also hold dense tensors, so nothing rides verbatim.
+        if ple_mode not in ("auto", "bf16", "nvfp4"):
+            raise SystemExit(f"--ple {ple_mode} is not supported for an NVFP4 n-gram table")
+        copied.extend(repack_ple_nvfp4([os.path.abspath(p) for p in side_tables], out_dir))
+        ple_stored = "nvfp4"
+        side_tables = []
     for src in side_tables:
         src_abs = os.path.abspath(src)
         if not os.path.isfile(src_abs):

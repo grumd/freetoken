@@ -93,3 +93,51 @@ def ple_gather_rows(
 
 
 __all__ = ["ple_gather_rows"]
+
+
+@triton.jit
+def e2m1_to_f32(code):
+    """e2m1 nibble -> fp32 (exact): the 3 magnitude bits go to the top of an fp16 exponent/
+    mantissa field, which is the value times 2^-14 (incl. the 0.5 subnormal)."""
+    h = ((code & 0x8).to(tl.uint16) << 12) | ((code & 0x7).to(tl.uint16) << 9)
+    return h.to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
+
+
+@triton.jit
+def _nvfp4_rows_dequant_kernel(
+    rows_ptr,
+    out_ptr,
+    scale,
+    n_rows,
+    HALF: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Interleaved NVFP4 rows [n, HALF codes | HALF/8 e4m3 scales] -> bf16 [n, 2*HALF]."""
+    r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    k = tl.arange(0, BLOCK_K)
+    mask = (r < n_rows)[:, None] & (k < 2 * HALF)[None, :]
+    src = rows_ptr + r.to(tl.int64)[:, None] * WIDTH
+    byte = tl.load(src + k[None, :] // 2, mask=mask, other=0)
+    code = tl.where((k % 2 == 0)[None, :], byte & 0xF, byte >> 4)
+    sb = tl.load(src + HALF + k[None, :] // 16, mask=mask, other=0)
+    val = e2m1_to_f32(code) * e4m3_u8_to_f32(sb) * scale
+    tl.store(out_ptr + r.to(tl.int64)[:, None] * (2 * HALF) + k[None, :], val.to(tl.bfloat16),
+             mask=mask)
+
+
+def nvfp4_rows_dequant(rows: torch.Tensor, head_dim: int, scale: float, out: torch.Tensor | None = None) -> torch.Tensor:
+    """``rows`` uint8 [n, head_dim/2 + head_dim/16] (codes, then block scales) -> bf16 [n, head_dim]."""
+    half = head_dim // 2
+    width = half + head_dim // 16
+    rows = rows.view(-1, width)
+    n = rows.shape[0]
+    if out is None:
+        out = torch.empty((n, head_dim), dtype=torch.bfloat16, device=rows.device)
+    block_r = 16
+    _nvfp4_rows_dequant_kernel[(triton.cdiv(n, block_r),)](
+        rows, out, float(scale), n, HALF=half, WIDTH=width, BLOCK_R=block_r,
+        BLOCK_K=triton.next_power_of_2(head_dim), num_warps=4,
+    )
+    return out

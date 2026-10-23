@@ -78,6 +78,16 @@ _PLE_SHARD_RE = re.compile(
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
 _PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
+# NVFP4 table (FP4-Local): per shard ``.weight`` uint8 [R, D/2] e2m1 codes + ``.weight_scale``
+# e4m3 [R, D/16], one fp32 ``weight_scale_2`` for the table. The FTW stores each shard
+# interleaved as ``.nvfp4_rows`` [R, D/2 + D/16] so a disk lookup reads one row, not two.
+_PLE_NVFP4_SHARD_SCALE_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight_scale$"
+)
+_PLE_NVFP4_ROWS_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.nvfp4_rows$"
+)
+_PLE_GLOBAL_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale_2"
 
 # "naive-quantized" modelopt checkpoints store dense projections as Float8 weights
 # with a bf16 per-output-row .weight_scale sibling — dequantized at load (see iter_weights).
@@ -543,9 +553,98 @@ def _has_ple_shards(folder: str) -> bool:
             header, _ = _safetensors_header(path)
         except (OSError, ValueError, struct.error):
             continue
-        if any(_PLE_SHARD_RE.search(k) for k in header):
+        if any(_PLE_SHARD_RE.search(k) or _PLE_NVFP4_ROWS_RE.search(k) for k in header):
             return True
     return False
+
+
+def ple_table_is_nvfp4(headers: list[dict]) -> bool:
+    """Whether the n-gram table in these safetensors headers is ModelOpt NVFP4
+    (uint8 code shards with e4m3 block-scale siblings)."""
+    for header in headers:
+        for key, meta in header.items():
+            if key != "__metadata__" and _PLE_SHARD_RE.search(key) and meta["dtype"] == "U8":
+                return True
+    return False
+
+
+def repack_ple_nvfp4(paths: list[str], out_dir: str, *, file_bytes: int = 4 << 30) -> list[str]:
+    """Write an NVFP4 n-gram table as interleaved ``.nvfp4_rows`` shards
+    (``model-plenvfp4-*.safetensors``): each row is its codes then its block scales, so
+    the disk backend fetches a row with one read. Streams one table shard at a time."""
+    import numpy as np
+
+    parts: dict[int, dict[str, tuple[str, int, list[int], str]]] = {}
+    global_key = global_src = None
+    for path in paths:
+        header, base = _safetensors_header(path)
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            if key.endswith(_PLE_GLOBAL_SUFFIX):
+                global_key, global_src = key, (path, base + meta["data_offsets"][0], meta)
+                continue
+            m = _PLE_SHARD_RE.search(key) or _PLE_NVFP4_SHARD_SCALE_RE.search(key)
+            if m is None:
+                continue
+            kind = "codes" if key.endswith(".weight") else "scales"
+            parts.setdefault(int(m.group("shard")), {})[kind] = (
+                path, base + meta["data_offsets"][0], meta["shape"], meta["dtype"], key
+            )
+    if global_key is None:
+        raise ValueError("NVFP4 PLE table has no weight_scale_2")
+    shards = sorted(parts)
+    if shards != list(range(len(shards))) or any(len(parts[i]) != 2 for i in shards):
+        raise ValueError("NVFP4 PLE table needs codes + scales for shards 0..N-1")
+    rows, half = parts[0]["codes"][2]
+    groups = parts[0]["scales"][2][1]
+    if half != 8 * groups:
+        raise ValueError(f"NVFP4 PLE row has {2 * half} values but {groups} 16-blocks")
+    width = half + groups
+
+    gpath, goff, gmeta = global_src
+    with open(gpath, "rb") as fh:
+        fh.seek(goff)
+        global_bytes = fh.read(4)
+    assert gmeta["dtype"] == "F32" and len(global_bytes) == 4, gmeta
+
+    def read(path: str, off: int, nbytes: int) -> np.ndarray:
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            return np.frombuffer(fh.read(nbytes), dtype=np.uint8)
+
+    shard_bytes = rows * width
+    per_file = max(1, file_bytes // shard_bytes)
+    written: list[str] = []
+    for start in range(0, len(shards), per_file):
+        chunk = shards[start : start + per_file]
+        entries, offset = {}, 0
+        if start == 0:
+            entries[global_key] = {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}
+            offset = 4
+        for i in chunk:
+            key = parts[i]["codes"][4][: -len(".weight")] + ".nvfp4_rows"
+            entries[key] = {"dtype": "U8", "shape": [rows, width],
+                            "data_offsets": [offset, offset + shard_bytes]}
+            offset += shard_bytes
+        header = json.dumps(entries, separators=(",", ":")).encode()
+        header += b" " * ((-len(header)) % 8)
+        name = f"model-plenvfp4-{len(written):05d}.safetensors"
+        with open(os.path.join(out_dir, name), "wb") as out:
+            out.write(struct.pack("<Q", len(header)))
+            out.write(header)
+            if start == 0:
+                out.write(global_bytes)
+            for i in tqdm(chunk, desc=f"Repacking NVFP4 PLE -> {name}"):
+                cpath, coff, _, cdt, _ = parts[i]["codes"]
+                spath, soff, sshape, sdt, _ = parts[i]["scales"]
+                assert cdt == "U8" and sdt == "F8_E4M3" and sshape == [rows, groups], (cdt, sdt, sshape)
+                row = np.empty((rows, width), dtype=np.uint8)
+                row[:, :half] = read(cpath, coff, rows * half).reshape(rows, half)
+                row[:, half:] = read(spath, soff, rows * groups).reshape(rows, groups)
+                out.write(row.tobytes())
+        written.append(name)
+    return written
 
 
 def ple_source_folder(model_path: str) -> str:
@@ -642,6 +741,10 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
+            if meta["dtype"] == "U8":
+                raise NotImplementedError(
+                    "NVFP4 PLE table: only the disk backend serves it (--ple-backend disk)"
+                )
             if meta["dtype"] == _PLE_ST_DTYPE:
                 shape = meta["shape"]
                 if rows and tuple(shape) != (rows, cols):

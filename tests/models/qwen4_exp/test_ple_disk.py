@@ -213,7 +213,7 @@ def test_layouts_readers_and_errors(tmp_path):
     from freetoken.models.qwen4_exp.ple_disk import source_from_safetensors
 
     save_file(
-        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.uint8),
+        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.int32),
          f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
         str(tmp_path / "model.safetensors"),
     )
@@ -380,3 +380,56 @@ def test_disk_table_bf16_matches_oracle(tmp_path):
         ids = emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda()
         assert torch.equal(disk.lookup(ids), oracle.lookup(ids)), f"token {token}"
         older, newer = newer, token
+
+
+@requires_cuda
+def test_disk_table_nvfp4_matches_oracle(tmp_path):
+    """An NVFP4 n-gram table (FP4-Local): the source layout is refused by the disk backend,
+    ``repack_ple_nvfp4`` interleaves it into one row read, and lookups equal the bf16 dequant."""
+    from safetensors.torch import save_file
+
+    from freetoken.models.checkpoint_index import dequantize_nvfp4
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
+    from freetoken.models.qwen4_exp.weight import repack_ple_nvfp4
+
+    args = parse_config(toy_hf_config()).qwen4_args
+    D = args.ngram_head_dim
+    assert D % 16 == 0
+    multipliers, sizes, offsets = hash_constants(args)
+    total_rows = int(offsets[-1] + sizes[-1])
+    gen = torch.Generator().manual_seed(13)
+    codes = torch.randint(0, 256, (total_rows, D // 2), dtype=torch.uint8, generator=gen)
+    scales = torch.randint(80, 118, (total_rows, D // 16), dtype=torch.uint8, generator=gen).view(torch.float8_e4m3fn)
+    glob = torch.tensor([3.3e-5], dtype=torch.float32)
+    n_shards = next(k for k in (4, 2, 1) if total_rows % k == 0)
+    per = total_rows // n_shards
+    src = tmp_path / "src"
+    src.mkdir()
+    tensors = {f"{_KEY_PREFIX}.weight_scale_2": glob}
+    for i in range(n_shards):
+        tensors[f"{_KEY_PREFIX}.shard_{i}.weight"] = codes[i * per : (i + 1) * per].clone()
+        tensors[f"{_KEY_PREFIX}.shard_{i}.weight_scale"] = scales[i * per : (i + 1) * per].clone()
+    save_file(tensors, str(src / "model.safetensors"))
+    with pytest.raises(ValueError, match="repacked"):
+        source_from_safetensors(str(src))
+
+    out = tmp_path / "ftw"
+    out.mkdir()
+    written = repack_ple_nvfp4([str(src / "model.safetensors")], str(out), file_bytes=per * (D // 2 + D // 16) * 2)
+    assert len(written) == (n_shards + 1) // 2
+    constants = {
+        "num_ngram_heads": args.num_ngram_heads,
+        "layer_multipliers": multipliers.tolist(),
+        "per_head_vocab_sizes": sizes.tolist(),
+        "per_head_offsets": offsets.tolist(),
+        "eos_token_id": EOS,
+    }
+    source = source_from_safetensors(str(out))
+    assert source.src_dtype == "NVFP4_ROWS" and source.head_dim == D
+    disk = DiskRowTable(source, constants)
+    oracle = GpuResidentTable(dequantize_nvfp4(codes, scales, glob).cuda())
+    emb = _embedding()
+    seqs = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14]]
+    disk.fill([torch.tensor([EOS, EOS, *seqs[0]]), torch.tensor([21, 22, *seqs[1]])], graph=False)
+    row_ids = emb.row_ids(_meta(seqs, [[EOS, EOS], [21, 22]])).cuda()
+    assert torch.equal(disk.lookup(row_ids), oracle.lookup(row_ids))
