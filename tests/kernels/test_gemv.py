@@ -64,3 +64,34 @@ def test_linear_kernel_takes_gemv_only_for_one_bf16_row(monkeypatch):
         out = k.apply(layer, x)
         torch.testing.assert_close(out.float(), F.linear(x.float(), layer.weight.float()), rtol=2e-2, atol=2e-2)
     assert calls == [(1, 256)]
+
+
+@pytest.mark.parametrize("N,K", [(8240, 2560), (2560, 3072), (640, 2560), (2560, 320), (100, 1024)])
+def test_gemv_mxfp8_matches_dequantized_reference(N, K):
+    from freetoken.kernel.triton.gemv import gemv_mxfp8
+
+    torch.manual_seed(0)
+    q = (torch.randint(0, 256, (N, K), device="cuda", dtype=torch.uint8) & 0xF7).view(torch.float8_e4m3fn)
+    codes = torch.randint(110, 125, (N, K // 32), device="cuda", dtype=torch.uint8)
+    w = (q.float().view(N, -1, 32) * torch.exp2(codes.float() - 127).unsqueeze(-1)).view(N, K)
+    x = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    ref = F.linear(x.float(), w)
+    out = gemv_mxfp8(x, q, codes)
+    rel = ((out.float() - ref).pow(2).mean() / ref.pow(2).mean()).sqrt()
+    assert rel.item() < 4e-3, rel.item()
+
+
+def test_mxfp8_encode_is_exact_for_mxfp8_weights_and_refuses_others():
+    from freetoken.layers.quantization.linear.unquantized import mxfp8_encode_exact
+
+    torch.manual_seed(0)
+    q = (torch.randint(0, 256, (300, 512), device="cuda", dtype=torch.uint8) & 0xF7).view(torch.float8_e4m3fn)
+    codes = torch.randint(100, 130, (300, 16), device="cuda", dtype=torch.uint8)
+    w = (q.float().view(300, -1, 32) * torch.exp2(codes.float() - 127).unsqueeze(-1)).view(300, 512).to(torch.bfloat16)
+    w[7] = 0  # all-zero blocks encode too
+    enc = mxfp8_encode_exact(w, rows=128)
+    assert enc is not None
+    q2, c2 = enc
+    back = (q2.float().view(300, -1, 32) * torch.exp2(c2.float() - 127).unsqueeze(-1)).view(300, 512).to(torch.bfloat16)
+    assert torch.equal(back, w)
+    assert mxfp8_encode_exact(torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)) is None

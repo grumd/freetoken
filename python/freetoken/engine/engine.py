@@ -315,6 +315,25 @@ class ForwardOutput(NamedTuple):
     streams: "torch.Tensor | None" = None
 
 
+
+def _dense_mxfp8_enabled(hf_config) -> bool:
+    """FREETOKEN_DENSE_MXFP8 (auto|1|0): serve the dense linears of an MXFP8 checkpoint
+    (ModelOpt FP4-Local) as MXFP8 instead of the bf16 they were exactly dequantized to.
+    auto = on when the checkpoint's quantization_config uses MXFP8 anywhere (only weights
+    that round-trip exactly are re-encoded, so a non-MXFP8 layer is never touched)."""
+    mode = os.environ.get("FREETOKEN_DENSE_MXFP8", "auto").lower()
+    if mode in ("0", "off", "false", "no"):
+        return False
+    if mode in ("1", "on", "true", "yes"):
+        return True
+    q = getattr(hf_config, "quantization_config", None) or {}
+    if not isinstance(q, dict):
+        q = getattr(q, "to_dict", lambda: {})()
+    algos = [str(q.get("quant_algo") or "")]
+    algos += [str((v or {}).get("quant_algo") or "") for v in (q.get("quantized_layers") or {}).values()]
+    return any(a.upper() == "MXFP8" for a in algos)
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -372,6 +391,15 @@ class Engine:
             )
         from freetoken.env import ENV
 
+        if _dense_mxfp8_enabled(config.hf_config) and not ENV.DENSE_FP8:
+            from freetoken.layers.quantization.linear.unquantized import mark_online_mxfp8
+
+            # routers and the shared expert stay bf16 (the decode front-fuse reads them as one
+            # bf16 GEMV); the vision tower runs wherever --vision-on-cpu put it
+            done, kept = mark_online_mxfp8(
+                self.model, skip=frozenset({"gate", "shared_expert_gate", "shared_expert", "vision_tower"})
+            )
+            logger.info_rank0(f"MXFP8 dense: {done} linears re-encoded to MXFP8 (lossless), {kept} stay bf16")
         if ENV.DENSE_FP8:
             from freetoken.layers.quantization.linear.unquantized import mark_online_fp8
 
