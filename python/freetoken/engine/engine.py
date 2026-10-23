@@ -294,9 +294,15 @@ def _materialize_loaded_weight_state_dict(
         target = vision_device if (is_vision and vision_device is not None) else device
         expected = model_state.get(key)
         if expected is None:
-            state_dict[key] = weight.to(device=target)
+            moved = weight.to(device=target)
         else:
-            state_dict[key] = weight.to(device=target, dtype=expected.dtype)
+            moved = weight.to(device=target, dtype=expected.dtype)
+        if moved is weight and moved.device.type == "cpu":
+            # a host-resident param (--vision-on-cpu) would keep the loader's tensor, and FTW
+            # yields views into a ~2 GiB read window: holding one pins the whole window
+            # (4 GiB of shmem for a 0.84 GiB ViT), so copy it out
+            moved = moved.clone()
+        state_dict[key] = moved
     return state_dict
 
 

@@ -56,3 +56,16 @@ def test_default_keeps_everything_on_the_engine_device():
     state = _materialize_loaded_weight_state_dict(_model_state(), _stream(), device=host)
     assert len(state) == 4
     assert all(t.device == host for t in state.values())
+
+
+def test_host_params_do_not_alias_the_loader_buffer():
+    # FTW yields views into one shared read window; a host param that kept the view would
+    # hold the whole window resident for the server's lifetime
+    window = torch.zeros(64, dtype=torch.float32)
+    stream = [("vision_tower.merger.linear_fc2.weight", window[8:12].view(2, 2))]
+    host = torch.device("cpu")
+    state = _materialize_loaded_weight_state_dict({}, stream, device=host, vision_device=host)
+    t = state["vision_tower.merger.linear_fc2.weight"]
+    assert t.untyped_storage().data_ptr() != window.untyped_storage().data_ptr()
+    assert t.untyped_storage().nbytes() == t.numel() * t.element_size()
+    assert torch.equal(t, window[8:12].view(2, 2))
