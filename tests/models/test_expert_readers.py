@@ -171,7 +171,7 @@ def test_nvfp4_reader_yields_canonical_pieces(tmp_path):
             "down", "down_scale", "down_global",
         }
         assert piece["gate"].dtype is torch.uint8
-        assert piece["gate_global"].dtype is torch.float16
+        assert piece["gate_global"].dtype is torch.float32
 
 
 def test_nvfp4_reader_accepts_the_text_only_root(tmp_path):
@@ -224,5 +224,5 @@ def test_nvfp4_reader_inverts_the_compressed_tensors_global(tmp_path, monkeypatc
     assert [p[1:3] for p in pieces] == [(0, 1), (1, 2)]
     for _layer, _e0, _e1, piece in pieces:
         for role in ("gate", "up", "down"):
-            assert piece[role + "_global"].dtype is torch.float16
+            assert piece[role + "_global"].dtype is torch.float32
             assert torch.all(piece[role + "_global"] == 0.25)

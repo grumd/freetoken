@@ -46,7 +46,7 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
-    # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
+    # fp8-e4m3 per-16 block scales + per-output-row fp32 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
     "nvfp4": (
         "gate_up_packed",
@@ -101,7 +101,7 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
-    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
+    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 4) + H * (I // 2 + I // 16 + 4),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
     # WNA16: gate_up [H//8, 2I] int32 + zero [H//128, 2I//8] int32 + scale fp16,

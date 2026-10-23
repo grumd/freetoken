@@ -105,8 +105,8 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down_scale": H * (I // 16),
         }
         if fmt == "nvfp4":
-            banks["gate_up_global"] = 2 * I * 2
-            banks["down_global"] = H * 2
+            banks["gate_up_global"] = 2 * I * 4
+            banks["down_global"] = H * 4
         return banks
     if fmt == "mxfp4_triton":
         # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias

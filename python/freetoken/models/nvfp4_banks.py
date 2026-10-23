@@ -35,9 +35,10 @@ def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
 
 
 def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
+    # fp32: modelopt globals reach 2.5e-5 (Qwen3.8 FP4), below fp16's smallest normal.
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
-    return tensor.to(torch.float16)
+    return tensor.to(torch.float32)
 
 
 def _num_moe_layers(config) -> int:

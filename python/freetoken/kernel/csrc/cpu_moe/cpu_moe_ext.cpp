@@ -1245,9 +1245,9 @@ struct CpuMoeExecutor {
   const uint64_t* gate_up_tbl;   // bf16: [E,2I,H] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* down_tbl;      // bf16: [E,H,I] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* gu_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,2I,*] block scales
-  const uint64_t* gu_global_tbl; // nvfp4: [E,2I] fp16 row globals
+  const uint64_t* gu_global_tbl; // nvfp4: [E,2I] fp32 row globals
   const uint64_t* dn_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,H,*] block scales
-  const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
+  const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp32 row globals
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
   float swiglu_alpha;
@@ -1482,7 +1482,7 @@ struct CpuMoeExecutor {
   // bf16 uses the interleaved bf16 row; nvfp4 uses the pre-split fp32 even/odd halves
   // (or, with AVX-VNNI, the per-16-block int8 activations).
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
-                         const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
+                         const uint8_t* gu_scale_l, const float* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
                          const float* xas) {
     if (fmt == WF_BF16) {
@@ -1497,15 +1497,15 @@ struct CpuMoeExecutor {
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
-                     fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas);
+                     gu_global_l[r], xi8, H, e4m3_lut, xas);
     return nvdot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
-                 fp16_to_f32(gu_global_l[r]), xe, xo, H, e2m1_lut, e4m3_lut);
+                 gu_global_l[r], xe, xo, H, e2m1_lut, e4m3_lut);
   }
 
   // down output row `row` (in [0, H)) dotted with the intermediate over K = I. Same
   // layer-local-base convention as gemm1_dot.
   inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
-                         const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
+                         const uint8_t* dn_scale_l, const float* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
                          const float* gas) {
     if (fmt == WF_BF16) {
@@ -1519,9 +1519,9 @@ struct CpuMoeExecutor {
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
       return nvi8dot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
-                     fp16_to_f32(dn_global_l[r]), gi8, I, e4m3_lut, gas);
+                     dn_global_l[r], gi8, I, e4m3_lut, gas);
     return nvdot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
-                 fp16_to_f32(dn_global_l[r]), ge, go, I, e2m1_lut, e4m3_lut);
+                 dn_global_l[r], ge, go, I, e2m1_lut, e4m3_lut);
   }
 
   void pin_self(int tid) {
@@ -1599,8 +1599,8 @@ struct CpuMoeExecutor {
     const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
-    const uint16_t* gu_global_l =
-        reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+    const float* gu_global_l =
+        reinterpret_cast<const float*>(tbl_at(gu_global_tbl, t->layer_id));
     const bf16_t* x_row = t->x + (size_t)tok * H;
     const float* xe = needs_di ? xe_scratch.data() + (size_t)tok * (H / 2) : nullptr;
     const float* xo = needs_di ? xo_scratch.data() + (size_t)tok * (H / 2) : nullptr;
@@ -1653,8 +1653,8 @@ struct CpuMoeExecutor {
     const bf16_t* down_l = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
     const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
     const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
-    const uint16_t* dn_global_l =
-        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+    const float* dn_global_l =
+        reinterpret_cast<const float*>(tbl_at(dn_global_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;

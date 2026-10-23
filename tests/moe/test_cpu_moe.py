@@ -92,7 +92,7 @@ def _make_nvfp4_cache(L, E, H, I, seed=0):
         packed = _pack_nvfp4(codes)  # [S, OUT, IN//2]
         # block scales in fp8-e4m3 (1 byte), ~[0.5, 1.5]; row globals in fp16, small.
         scale = (0.5 + torch.rand(S, OUT, IN // 16)).to(torch.float8_e4m3fn)
-        glob = (0.02 + 0.01 * torch.rand(S, OUT)).to(torch.float16)
+        glob = (0.02 + 0.01 * torch.rand(S, OUT)).to(torch.float32)
         return packed, scale.contiguous(), glob.contiguous()
 
     gup, gus, gug = rows(2 * I, H)

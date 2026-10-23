@@ -344,13 +344,13 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
             "gate_up_scale": pin(E, 2 * I, H // 16, dtype=torch.uint8),
-            "gate_up_global": pin(E, 2 * I, dtype=torch.float16),
+            "gate_up_global": pin(E, 2 * I, dtype=torch.float32),
             "down_packed": pin(E, H, I // 2, dtype=torch.uint8),
             "down_scale": pin(E, H, I // 16, dtype=torch.uint8),
-            "down_global": pin(E, H, dtype=torch.float16),
+            "down_global": pin(E, H, dtype=torch.float32),
         }
         b["gate_up_global"].fill_(1.0)
-        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
+        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp32
         return b
     if fmt == "mxfp4_triton":  # transposed split-K layout
         b = {

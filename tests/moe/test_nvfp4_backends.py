@@ -478,10 +478,10 @@ def test_dummy_nvfp4_banks_match_the_triton_layout():
     expected = {
         "gate_up": ((E, 2 * I, H // 2), torch.uint8),
         "gate_up_scale": ((E, 2 * I, H // 16), torch.float8_e4m3fn),
-        "gate_up_global": ((E, 2 * I), torch.float16),
+        "gate_up_global": ((E, 2 * I), torch.float32),
         "down": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), torch.float8_e4m3fn),
-        "down_global": ((E, H), torch.float16),
+        "down_global": ((E, H), torch.float32),
     }
     assert banks.sources.keys() == expected.keys()
     for name, (shape, dtype) in expected.items():

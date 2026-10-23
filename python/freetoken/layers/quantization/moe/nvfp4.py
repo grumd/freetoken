@@ -55,10 +55,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
-            "gate_up_global": BankSpec((2 * i,), torch.float16),
+            "gate_up_global": BankSpec((2 * i,), torch.float32),
             "down": BankSpec((h, i // 2), torch.uint8),
             "down_scale": BankSpec((h, i // GROUP), FP8),
-            "down_global": BankSpec((h,), torch.float16),
+            "down_global": BankSpec((h,), torch.float32),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
