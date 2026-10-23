@@ -386,7 +386,7 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Routed prefill with CPU help (W4A16, ``cache.cpu_prefill``): the GPU computes the
+        """Routed prefill with CPU help (W4A16 / NVFP4, ``cache.cpu_prefill``): the GPU computes the
         cache hits plus ~``cpu_prefill_fetch`` of the misses (the most-routed ones), fetched over
         PCIe; meanwhile the CPU computes the other misses from the host banks at RAM bandwidth;
         the partial sums add up in fp32 and round to bf16 once, like the GPU-only reduction
@@ -417,20 +417,29 @@ class OffloadMoELayer(MoELayer):
             # set with another torch.unique, whose host sync would hold the CPU work back until
             # the PCIe fetch above lands. CPU experts read a resident slot at weight 0.
             from freetoken.layers.quantization.moe.base import limit_or_inf
-            from freetoken.models.wna16_banks import wna16_down_k_off
-            from freetoken.moe.fused_wna16 import fused_experts_wna16
             from freetoken.moe.legacy_format import canonical_role
 
             t = {canonical_role(n): v for n, v in zip(cache.bank_schema, cache.bank_views())}
             expert_map = slots.view(-1).masked_fill(slots.view(-1) < 0, resident)
-            gpu_routes = fused_experts_wna16(
-                hidden_states, t["gate_up"], t["gate_up_zero"], t["gate_up_scale"],
-                t["down"], t["down_zero"], t["down_scale"],
-                topk_weights.masked_fill(on_cpu, 0), inverse.to(torch.int32), expert_map.numel(),
-                self.activation, self.apply_router_weight_on_input, float(self.alpha),
-                limit_or_inf(self), down_k_off=wna16_down_k_off(t["down"].shape[-2] * 8),
-                expert_map=expert_map, reduce=False,
-            )
+            common = dict(expert_map=expert_map, reduce=False)
+            args = (topk_weights.masked_fill(on_cpu, 0), inverse.to(torch.int32), expert_map.numel(),
+                    self.activation, self.apply_router_weight_on_input, float(self.alpha), limit_or_inf(self))
+            if "gate_up_global" in t:
+                from freetoken.moe.fused_nvfp4_tile import fused_experts_nvfp4_tile
+
+                gpu_routes = fused_experts_nvfp4_tile(
+                    hidden_states, t["gate_up"], t["gate_up_scale"], t["gate_up_global"],
+                    t["down"], t["down_scale"], t["down_global"], *args, **common,
+                )
+            else:
+                from freetoken.models.wna16_banks import wna16_down_k_off
+                from freetoken.moe.fused_wna16 import fused_experts_wna16
+
+                gpu_routes = fused_experts_wna16(
+                    hidden_states, t["gate_up"], t["gate_up_zero"], t["gate_up_scale"],
+                    t["down"], t["down_zero"], t["down_scale"], *args,
+                    down_k_off=wna16_down_k_off(t["down"].shape[-2] * 8), **common,
+                )
         t0 = time.perf_counter()
         n_cpu = cpu.forward(self.layer_id, cpu.x[:T], cpu.ids[:T], cpu.w[:T], cpu.y[:T])
         if cpu.stats is not None:

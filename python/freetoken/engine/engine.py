@@ -951,10 +951,14 @@ class Engine:
         from freetoken.models.wna16_banks import wna16_down_k_off
         from freetoken.moe import wna16_cpu_prefill as wcp
 
+        from freetoken.moe.legacy_format import canonical_role
+
         roles = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
+        sources = {canonical_role(k): v for k, v in cache.bank_sources.items()}
+        nvfp4 = set(sources) == set(wcp.Nvfp4CpuPrefill.BANK_ROLES)
         reason = None
-        if set(cache.bank_sources) != set(roles):
-            reason = f"expert banks {sorted(cache.bank_sources)} are not W4A16"
+        if set(sources) != set(roles) and not nvfp4:
+            reason = f"expert banks {sorted(cache.bank_sources)} are neither W4A16 nor NVFP4"
         elif cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
             reason = "it needs the plain GPU decode target"
         elif not wcp.cpu_supported():
@@ -962,24 +966,33 @@ class Engine:
         if reason:
             logger.warning_rank0(f"FREETOKEN_WNA16_CPU_PREFILL ignored: {reason}")
             return
-        gate_up = cache.bank_sources["gate_up"][0]
-        hidden, inter = gate_up.shape[1] * 8, gate_up.shape[2] // 2
         tp = self.config.tp_info
         from freetoken.moe.cpu_executor import physical_core_cpus
 
         threads = wcp.threads_from_env(max(1, len(physical_core_cpus()) // tp.size))
+        common = dict(
+            num_experts=cache.num_experts, top_k=layers[0].top_k,
+            max_tokens=max(_ROUTED_PREFILL_TOKENS, layers[0].num_experts // layers[0].top_k + 1),
+            threads=threads, cpus=wcp.rank_cpus(threads, tp.rank, tp.size),
+        )
         try:
-            executor = wcp.Wna16CpuPrefill(
-                hidden=hidden, inter=inter, down_groups=cache.bank_sources["down_zero"][0].shape[1],
-                k_off=wna16_down_k_off(inter), num_experts=cache.num_experts, top_k=layers[0].top_k,
-                max_tokens=max(_ROUTED_PREFILL_TOKENS, layers[0].num_experts // layers[0].top_k + 1),
-                threads=threads, cpus=wcp.rank_cpus(threads, tp.rank, tp.size),
-            )
+            if nvfp4:
+                gate_up = sources["gate_up"][0]  # [E, 2I, H/2] uint8
+                hidden, inter = gate_up.shape[2] * 2, gate_up.shape[1] // 2
+                executor = wcp.Nvfp4CpuPrefill(hidden=hidden, inter=inter, **common)
+                roles = wcp.Nvfp4CpuPrefill.BANK_ROLES
+            else:
+                gate_up = sources["gate_up"][0]
+                hidden, inter = gate_up.shape[1] * 8, gate_up.shape[2] // 2
+                executor = wcp.Wna16CpuPrefill(
+                    hidden=hidden, inter=inter, down_groups=sources["down_zero"][0].shape[1],
+                    k_off=wna16_down_k_off(inter), **common,
+                )
         except Exception as exc:  # the JIT build needs a host C++ toolchain
             logger.warning(f"FREETOKEN_WNA16_CPU_PREFILL disabled: {exc}")
             return
         for layer_id in range(cache.num_layers):
-            executor.set_layer(layer_id, {r: cache.bank_sources[r][layer_id] for r in roles})
+            executor.set_layer(layer_id, {r: sources[r][layer_id] for r in roles})
         cache.cpu_prefill = executor
         fetch = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_FETCH", "")
         if fetch.strip():

@@ -330,13 +330,29 @@ class Pool {
   bool stop_ = false;
 };
 
+// The W4A16 expert tile as an ExecutorT policy (nvfp4_cpu.h supplies another).
+struct Wna16Kernel {
+  using Layer = wna16cpu::Layer;
+  using Dims = wna16cpu::Dims;
+  using Scratch = wna16cpu::Scratch;
+  static void routes(const Layer& L, const Dims& d, int e, const Route* rt, int n, const uint16_t* x,
+                     float* y, Scratch& s, bool precise) {
+    expert_routes(L, d, e, rt, n, x, y, s, precise);
+  }
+};
+
 // Routed-expert sum for one layer: y[T, H] = sum over routes with id >= 0 of w * expert_id(x),
 // written as bf16 (y) or unrounded fp32 (y32, for a caller that adds it to another partial
 // before rounding once). Experts are bucketed and handed out largest-first; each worker
-// accumulates into its own fp32 rows, then the rows are reduced in parallel.
-class Executor {
+// accumulates into its own fp32 rows, then the rows are reduced in parallel. ``K`` is the
+// expert-tile policy (Layer / Dims / Scratch types and a ``routes`` function).
+template <class K>
+class ExecutorT {
  public:
-  Executor(int threads, const std::vector<int>& cpus, const Dims& d, int num_experts)
+  using Layer = typename K::Layer;
+  using Dims = typename K::Dims;
+  using Scratch = typename K::Scratch;
+  ExecutorT(int threads, const std::vector<int>& cpus, const Dims& d, int num_experts)
       : d_(d), E_(num_experts), pool_(threads, cpus), scratch_(threads), acc_(threads) {
     for (auto& s : scratch_) s.ensure(d_);
   }
@@ -383,7 +399,7 @@ class Executor {
             a.touched[rt[r].token] = 1;
             std::memset(a.rows.data() + int64_t(rt[r].token) * H, 0, sizeof(float) * H);
           }
-        expert_routes(L, d_, e, rt, n, x, a.rows.data(), s, precise);
+        K::routes(L, d_, e, rt, n, x, a.rows.data(), s, precise);
       }
     };
     pool_.run(work);
@@ -432,5 +448,7 @@ class Executor {
   std::vector<Route> routes_;
   std::atomic<int> next_{0};
 };
+
+using Executor = ExecutorT<Wna16Kernel>;
 
 }  // namespace wna16cpu

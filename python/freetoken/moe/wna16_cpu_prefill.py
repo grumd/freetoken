@@ -1,10 +1,10 @@
-"""CPU side of the hybrid W4A16 routed prefill.
+"""CPU side of the hybrid W4A16 / NVFP4 routed prefill.
 
 A routed prefill chunk of a few hundred tokens touches most of a layer's experts, and on an
 offload setup most of those are VRAM-cache misses whose bytes must cross PCIe before the GPU can
 use them. This executor computes a share of the misses on the CPU, straight from the pinned host
 banks, while the GPU fetches and computes the rest (``OffloadMoELayer._prefill_cpu_hybrid``).
-Kernel: ``kernel/csrc/cpu_moe/wna16_cpu.h`` (AVX-512 BF16).
+Kernels: ``kernel/csrc/cpu_moe/wna16_cpu.h`` / ``nvfp4_cpu.h`` (AVX-512 BF16).
 """
 
 from __future__ import annotations
@@ -48,6 +48,19 @@ def load_extension():
     )
 
 
+@functools.cache
+def load_nvfp4_extension():
+    from torch.utils.cpp_extension import load
+
+    return load(
+        name="freetoken_nvfp4_cpu_prefill",
+        sources=[str(_SRC / "nvfp4_prefill_ext.cpp")],
+        extra_include_paths=[str(_SRC)],
+        extra_cflags=["-O3", "-march=native", "-std=c++17", "-pthread"],
+        verbose=False,
+    )
+
+
 def rank_cpus(threads: int, rank: int, world: int) -> list[int]:
     """This rank's share of the physical cores (one logical CPU each), so the ranks' pools
     never contend for a core."""
@@ -65,7 +78,12 @@ class Wna16CpuPrefill:
     def __init__(self, *, hidden: int, inter: int, down_groups: int, k_off: int, num_experts: int,
                  top_k: int, max_tokens: int, threads: int, cpus: list[int]) -> None:
         ext = load_extension()
-        self.impl = ext.Wna16CpuPrefill(threads, cpus, hidden, inter, down_groups, k_off, num_experts)
+        self._init_buffers(ext.Wna16CpuPrefill(threads, cpus, hidden, inter, down_groups, k_off, num_experts),
+                           hidden, top_k, max_tokens)
+        logger.info(f"wna16 CPU prefill experts: {threads} threads on cpus {cpus}")
+
+    def _init_buffers(self, impl, hidden: int, top_k: int, max_tokens: int) -> None:
+        self.impl = impl
         self.hidden, self.top_k, self.max_tokens = hidden, top_k, max_tokens
         pin = torch.cuda.is_available()
         self.x = torch.empty((max_tokens, hidden), dtype=torch.bfloat16, pin_memory=pin)
@@ -76,7 +94,6 @@ class Wna16CpuPrefill:
         self.meta = torch.empty((4,), dtype=torch.int64, pin_memory=pin)
         # FREETOKEN_WNA16_CPU_PREFILL_STATS=1: one log line per prefill forward
         self.stats = {} if os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_STATS") == "1" else None
-        logger.info(f"wna16 CPU prefill experts: {threads} threads on cpus {cpus}")
 
     def record(self, layer_id: int, tokens: int, routed: int, fetched: int, cpu_experts: int,
                cpu_s: float, gpu_busy: bool) -> None:
@@ -110,9 +127,26 @@ class Wna16CpuPrefill:
         return self.impl.forward(layer_id, x, ids, w, y, prefill_precise())
 
 
+class Nvfp4CpuPrefill(Wna16CpuPrefill):
+    """The NVFP4 executor (nvfp4_cpu.h) behind the same staging buffers and interface."""
+
+    BANK_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+
+    def __init__(self, *, hidden: int, inter: int, num_experts: int, top_k: int, max_tokens: int,
+                 threads: int, cpus: list[int]) -> None:
+        ext = load_nvfp4_extension()
+        self._init_buffers(ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts), hidden, top_k, max_tokens)
+        logger.info(f"nvfp4 CPU prefill experts: {threads} threads on cpus {cpus}")
+
+    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor]) -> None:
+        self.last_layer = max(getattr(self, "last_layer", 0), layer_id)
+        self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES))
+
+
 def threads_from_env(default: int) -> int:
     raw = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_THREADS", "")
     return int(raw) if raw.strip() else default
 
 
-__all__ = ["Wna16CpuPrefill", "cpu_supported", "load_extension", "rank_cpus", "threads_from_env"]
+__all__ = ["Nvfp4CpuPrefill", "Wna16CpuPrefill", "cpu_supported", "load_extension", "load_nvfp4_extension",
+           "rank_cpus", "threads_from_env"]
