@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeToken</title>
+<link rel="icon" href="data:,">
+<script>
+  try { if (JSON.parse(localStorage.getItem("freetoken-webui") || "{}").settings?.theme === "light")
+    document.documentElement.dataset.theme = "light"; } catch {}
+</script>
+<style>
+:root {
+  --bg: #17181a; --side: #1d1e21; --fg: #e6e6e9; --muted: #9a9aa2; --line: #2c2d31; --user: #26272b;
+  --accent: #6d9cff; --code: #1f2023; --err: #ff6b5b; --hover: #26272b;
+  color-scheme: dark;
+}
+:root[data-theme=light] {
+  --bg: #fff; --side: #f6f6f8; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e6; --user: #f0f0f3;
+  --accent: #2f6fde; --code: #f6f6f8; --err: #c0392b; --hover: #ebebef;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, sans-serif; display: flex; }
+a { color: var(--accent); }
+button, .btn { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; display: inline-block; }
+button:hover, .btn:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+input, textarea { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+input[type=number] { width: 90px; }
+
+aside { width: 260px; flex-shrink: 0; background: var(--side); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; }
+body.noside aside { display: none; }
+aside .top { padding: 8px; }
+aside .top button { width: 100%; }
+#chats { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; flex: 1; font-size: 14px; }
+#chats li { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+#chats li:hover { background: var(--hover); }
+#chats li.active { background: var(--user); }
+#chats li .t { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#chats li .x { visibility: hidden; border: none; padding: 0 4px; color: var(--muted); }
+#chats li:hover .x { visibility: visible; }
+#chats li.busy .t::after { content: " ..."; color: var(--muted); }
+
+#app { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+  border-bottom: 1px solid var(--line); font-size: 14px; }
+header .model { font-weight: 600; }
+header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+header .dot.ok { background: #2ecc71; } header .dot.loading { background: #f1c40f; }
+header .spacer { flex: 1; }
+#settings { display: none; padding: 10px 16px; border-bottom: 1px solid var(--line);
+  gap: 10px 16px; flex-wrap: wrap; align-items: center; font-size: 14px; }
+#settings.open { display: flex; }
+#settings label { display: flex; align-items: center; gap: 6px; }
+#settings textarea { width: 100%; min-height: 60px; }
+main { flex: 1; overflow-y: auto; }
+#log { max-width: 860px; margin: 0 auto; padding: 16px; }
+.msg { margin: 0 0 18px; }
+.msg.user .body { background: var(--user); border-radius: 10px; padding: 8px 12px;
+  white-space: pre-wrap; margin-left: 15%; }
+.msg.user img { max-width: 220px; max-height: 220px; border-radius: 6px; display: block; margin-top: 6px; }
+.msg .meta { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex; gap: 10px;
+  align-items: center; flex-wrap: wrap; }
+.msg .meta button { font-size: 12px; padding: 0 6px; }
+.msg.user .meta { justify-content: flex-end; }
+.err { color: var(--err); }
+details.think { color: var(--muted); border-left: 2px solid var(--line); padding-left: 10px;
+  margin-bottom: 8px; font-size: 14px; }
+details.think summary { cursor: pointer; user-select: none; }
+details.think .txt { white-space: pre-wrap; }
+.md p { margin: 0 0 .7em; } .md > :last-child { margin-bottom: 0; }
+.md pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px; overflow-x: auto; font-size: 13px; }
+.md code { font-family: ui-monospace, monospace; font-size: .92em; background: var(--code);
+  padding: 1px 4px; border-radius: 4px; }
+.md pre code { background: none; padding: 0; }
+.md table { border-collapse: collapse; margin: 0 0 .7em; }
+.md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
+.md h1, .md h2, .md h3, .md h4 { margin: .8em 0 .4em; line-height: 1.3; }
+.md ul, .md ol { margin: 0 0 .7em; padding-left: 1.5em; }
+.md blockquote { margin: 0 0 .7em; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+footer { border-top: 1px solid var(--line); padding: 10px 16px; }
+#composer { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 6px; }
+#input { width: 100%; resize: none; min-height: 44px; max-height: 40vh; padding: 10px; }
+#row { display: flex; gap: 8px; align-items: center; }
+#row .spacer { flex: 1; }
+#file { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+#thumbs { display: flex; gap: 6px; flex-wrap: wrap; }
+#thumbs img { height: 48px; border-radius: 4px; cursor: pointer; border: 1px solid var(--line); }
+#hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<aside>
+  <div class="top"><button id="newBtn">New chat</button></div>
+  <ul id="chats"></ul>
+</aside>
+<div id="app">
+  <header>
+    <button id="sideBtn" title="Toggle chat list">&#9776;</button>
+    <span class="dot" id="dot"></span><span class="model" id="model">FreeToken</span>
+    <span id="status" style="color:var(--muted)"></span>
+    <span class="spacer"></span>
+    <button id="themeBtn"></button>
+    <button id="settingsBtn">Settings</button>
+  </header>
+  <div id="settings">
+    <label><input type="checkbox" id="think"> Thinking</label>
+    <label>Temperature <input type="number" id="temp" step="0.05" min="0" placeholder="default"></label>
+    <label>Top-p <input type="number" id="topp" step="0.05" min="0" max="1" placeholder="default"></label>
+    <label>Max tokens <input type="number" id="maxtok" min="1" placeholder="default"></label>
+    <textarea id="system" placeholder="System prompt (optional)"></textarea>
+  </div>
+  <main id="scroller"><div id="log"></div></main>
+  <footer>
+    <div id="composer">
+      <div id="thumbs"></div>
+      <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for newline, paste or drop images)"></textarea>
+      <div id="row">
+        <label class="btn" for="file">Image</label>
+        <input type="file" id="file" accept="image/*" multiple>
+        <span id="hint"></span>
+        <span class="spacer"></span>
+        <button id="sendBtn" class="primary">Send</button>
+      </div>
+    </div>
+  </footer>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const STORE = "freetoken-webui";
+const settings = { think: true, temp: "", topp: "", maxtok: "", system: "", theme: "dark", side: true };
+let legacyMessages = null;
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || "{}");
+  Object.assign(settings, saved.settings || {});
+  legacyMessages = saved.messages?.length ? saved.messages : null;
+} catch {}
+const saveSettings = () => localStorage.setItem(STORE, JSON.stringify({ settings }));
+
+let chats = [];          // [{id, title, updated, messages}]
+let current = null;      // the open chat, or null for a fresh one not stored yet
+let modelId = null, ctrl = null, busyChat = null, pending = [];
+
+// ---- storage: chats live in IndexedDB (images make them too big for localStorage) ----
+let db = null;
+function openDb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("freetoken-webui", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("chats", { keyPath: "id" });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function dbOp(mode, fn) {
+  if (!db) return Promise.resolve(null);
+  return new Promise((res, rej) => {
+    const t = db.transaction("chats", mode);
+    const req = fn(t.objectStore("chats"));
+    t.oncomplete = () => res(req.result);
+    t.onerror = () => rej(t.error);
+  });
+}
+function persist(chat) {
+  chat.updated = Date.now();
+  dbOp("readwrite", (s) => s.put(chat)).catch((e) => console.error("save failed", e));
+  drawList();
+}
+function newChat() {
+  return { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: "", updated: Date.now(), messages: [] };
+}
+
+// ---- minimal markdown ----
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function inline(s) {
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  s = esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*(?!\s)(.+?)\*(?!\w)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + esc(codes[i]) + "</code>");
+}
+function md(src) {
+  const lines = src.split("\n"), out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    let m;
+    if (/^\s*```/.test(l)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      out.push("<pre><code>" + esc(buf.join("\n")) + "</code></pre>");
+    } else if ((m = l.match(/^(#{1,6})\s+(.*)/))) {
+      const n = Math.min(m[1].length + 1, 4);
+      out.push(`<h${n}>${inline(m[2])}</h${n}>`); i++;
+    } else if (/^\s*[-*+]\s+/.test(l) || /^\s*\d+[.)]\s+/.test(l)) {
+      const ordered = /^\s*\d/.test(l), items = [];
+      while (i < lines.length && (/^\s*([-*+]|\d+[.)])\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length))) {
+        const t = lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, "");
+        if (/^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) items.push(t); else items[items.length - 1] += " " + t.trim();
+        i++;
+      }
+      const tag = ordered ? "ol" : "ul";
+      out.push(`<${tag}>` + items.map((t) => "<li>" + inline(t) + "</li>").join("") + `</${tag}>`);
+    } else if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const row = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
+      const head = row(l); i += 2;
+      let html = "<table><tr>" + head.map((c) => "<th>" + c + "</th>").join("") + "</tr>";
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]))
+        html += "<tr>" + row(lines[i++]).map((c) => "<td>" + c + "</td>").join("") + "</tr>";
+      out.push(html + "</table>");
+    } else if (/^>\s?/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+      out.push("<blockquote>" + md(buf.join("\n")) + "</blockquote>");
+    } else if (!l.trim()) {
+      i++;
+    } else {
+      const buf = [];
+      while (i < lines.length && lines[i].trim() && !/^(\s*```|#{1,6}\s|\s*[-*+]\s+|\s*\d+[.)]\s+|>)/.test(lines[i])) buf.push(lines[i++]);
+      if (!buf.length) buf.push(lines[i++]);
+      out.push("<p>" + buf.map(inline).join("<br>") + "</p>");
+    }
+  }
+  return out.join("");
+}
+
+// ---- rendering ----
+function drawList() {
+  const ul = $("chats");
+  ul.innerHTML = "";
+  for (const c of [...chats].sort((a, b) => b.updated - a.updated)) {
+    const li = document.createElement("li");
+    li.className = (c === current ? "active " : "") + (c.id === busyChat ? "busy" : "");
+    li.title = c.title;
+    const t = document.createElement("span");
+    t.className = "t"; t.textContent = c.title || "(untitled)";
+    const x = btn("×", (e) => { e.stopPropagation(); deleteChat(c); });
+    x.className = "x"; x.title = "Delete chat";
+    li.append(t, x);
+    li.onclick = () => openChat(c);
+    ul.appendChild(li);
+  }
+}
+function render() {
+  const log = $("log");
+  log.innerHTML = "";
+  (current?.messages || []).forEach((m, idx) => log.appendChild(renderMsg(m, idx)));
+  scrollDown(true);
+  drawList();
+  setBusy();
+}
+function renderMsg(m, idx) {
+  const el = document.createElement("div");
+  el.className = "msg " + m.role;
+  const body = document.createElement("div");
+  body.className = "body";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  el.append(body, meta);
+  fillMsg(el, m, idx);
+  return el;
+}
+function fillMsg(el, m, idx) {
+  const body = el.querySelector(".body"), meta = el.querySelector(".meta");
+  if (m.role === "user") {
+    body.textContent = m.content;
+    (m.images || []).forEach((src) => { const im = new Image(); im.src = src; body.appendChild(im); });
+  } else {
+    const wasOpen = el.querySelector("details.think")?.open;
+    body.innerHTML = "";
+    if (m.reasoning) {
+      const d = document.createElement("details");
+      d.className = "think";
+      d.open = wasOpen ?? (m.streaming && !m.content);
+      d.innerHTML = `<summary>${m.streaming && !m.content ? "Thinking..." : "Thought"}</summary><div class="txt"></div>`;
+      d.querySelector(".txt").textContent = m.reasoning;
+      body.appendChild(d);
+    }
+    const c = document.createElement("div");
+    c.className = "md";
+    c.innerHTML = md(m.content || "");
+    body.appendChild(c);
+    if (m.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = m.error; body.appendChild(e); }
+  }
+  meta.innerHTML = "";
+  if (m.stats) { const s = document.createElement("span"); s.textContent = m.stats; meta.appendChild(s); }
+  if (!m.streaming) {
+    meta.appendChild(btn("Copy", () => navigator.clipboard.writeText(m.content || "")));
+    if (m.role === "user") meta.appendChild(btn("Edit", () => editFrom(idx)));
+    if (m.role === "assistant" && idx === current.messages.length - 1) meta.appendChild(btn("Regenerate", regenerate));
+  }
+}
+function btn(label, fn) { const b = document.createElement("button"); b.textContent = label; b.onclick = fn; return b; }
+function scrollDown(force) {
+  const s = $("scroller");
+  if (force || s.scrollHeight - s.scrollTop - s.clientHeight < 120) s.scrollTop = s.scrollHeight;
+}
+
+// ---- server status ----
+async function poll() {
+  let ok = false;
+  try {
+    const h = await (await fetch("/health")).json();
+    ok = h.status === "ok";
+    $("dot").className = "dot " + (ok ? "ok" : h.status === "loading" ? "loading" : "");
+    let status = "";
+    if (h.status === "loading") {
+      const p = h.progress || {};
+      status = "loading" + (p.total_bytes ? ` ${Math.floor(100 * p.done_bytes / p.total_bytes)}%` : "") + (h.phase ? ` (${h.phase})` : "");
+    } else if (!ok) status = h.status + (h.message ? ": " + h.message : "");
+    $("status").textContent = status;
+    if (h.model && h.model !== modelId) {
+      modelId = h.model; $("model").textContent = modelId; document.title = modelId + " - FreeToken";
+    }
+  } catch {
+    $("dot").className = "dot"; $("status").textContent = "offline";
+  }
+  setTimeout(poll, ok ? 10000 : 2000);
+}
+
+// ---- chat ----
+function apiMessages(chat) {
+  const out = [];
+  if (settings.system.trim()) out.push({ role: "system", content: settings.system });
+  for (const m of chat.messages) {
+    if (m.role === "user" && m.images?.length) {
+      out.push({ role: "user", content: [
+        ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
+        { type: "text", text: m.content },
+      ] });
+    } else if (m.role === "user" || m.content) {
+      out.push({ role: m.role, content: m.content || "" });
+    }
+  }
+  return out;
+}
+
+async function generate(chat) {
+  const body = {
+    model: modelId || "default",
+    messages: apiMessages(chat),
+    stream: true,
+    stream_options: { include_usage: true },
+    chat_template_kwargs: { enable_thinking: !!settings.think },
+  };
+  if (settings.temp !== "") body.temperature = Number(settings.temp);
+  if (settings.topp !== "") body.top_p = Number(settings.topp);
+  if (settings.maxtok !== "") body.max_tokens = Number(settings.maxtok);
+
+  const m = { role: "assistant", content: "", reasoning: "", streaming: true };
+  chat.messages.push(m);
+  const el = renderMsg(m, chat.messages.length - 1);
+  $("log").appendChild(el);
+  scrollDown(true);
+  busyChat = chat.id;
+  ctrl = new AbortController();
+  setBusy(); drawList();
+
+  const t0 = performance.now();
+  let tFirst = null, usage = null, dirty = false;
+  // Repaint at most every 50 ms; only while this chat is on screen.
+  const timer = setInterval(() => {
+    if (dirty && current === chat) { dirty = false; fillMsg(el, m, chat.messages.length - 1); scrollDown(); }
+  }, 50);
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body), signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, k); buf = buf.slice(k + 2);
+        for (const line of block.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          const j = JSON.parse(data);
+          if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+          if (j.usage) usage = j.usage;
+          const d = j.choices?.[0]?.delta;
+          if (!d) continue;
+          const r = d.reasoning_content || d.reasoning || "";
+          if (r || d.content) {
+            if (tFirst === null) tFirst = performance.now();
+            m.reasoning += r; m.content += d.content || ""; dirty = true;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    m.error = e.name === "AbortError" ? "(stopped)" : String(e.message || e);
+  } finally {
+    clearInterval(timer);
+    ctrl = null; busyChat = null;
+    const t1 = performance.now();
+    const parts = [];
+    if (tFirst !== null) parts.push(`TTFT ${((tFirst - t0) / 1000).toFixed(2)} s`);
+    if (usage) {
+      const cached = usage.prompt_tokens_details?.cached_tokens;
+      parts.push(`prompt ${usage.prompt_tokens}` + (cached ? ` (${cached} cached)` : ""));
+      parts.push(`gen ${usage.completion_tokens}`);
+      if (tFirst !== null && usage.completion_tokens > 1)
+        parts.push(`${((usage.completion_tokens - 1) / ((t1 - tFirst) / 1000)).toFixed(1)} tok/s`);
+    }
+    m.stats = parts.join(" · ");
+    delete m.streaming;
+    if (chats.includes(chat)) persist(chat);
+    if (current === chat) render(); else { drawList(); setBusy(); }
+  }
+}
+
+function setBusy() {
+  const busy = !!ctrl;
+  $("sendBtn").textContent = busy ? "Stop" : "Send";
+  $("sendBtn").classList.toggle("primary", !busy);
+  $("hint").textContent = !busy ? "" : busyChat === current?.id ? "generating..." : "generating in another chat...";
+}
+
+function send() {
+  if (ctrl) { ctrl.abort(); return; }
+  const text = $("input").value;
+  if (!text.trim() && !pending.length) return;
+  if (!current) { current = newChat(); chats.push(current); }
+  if (!current.title) current.title = (text.trim() || "(image)").replace(/\s+/g, " ").slice(0, 80);
+  current.messages.push({ role: "user", content: text, images: pending.length ? pending : undefined });
+  pending = []; drawThumbs();
+  $("input").value = ""; autosize();
+  persist(current); render();
+  generate(current);
+}
+function regenerate() {
+  if (ctrl) return;
+  if (current.messages.at(-1)?.role === "assistant") current.messages.pop();
+  render(); generate(current);
+}
+function editFrom(idx) {
+  if (ctrl && busyChat === current.id) return;
+  const m = current.messages[idx];
+  $("input").value = m.content; pending = m.images ? [...m.images] : [];
+  current.messages = current.messages.slice(0, idx);
+  persist(current);
+  drawThumbs(); autosize(); render(); $("input").focus();
+}
+function openChat(c) {
+  current = c;
+  render(); $("input").focus();
+}
+function deleteChat(c) {
+  if (!confirm(`Delete "${c.title || "(untitled)"}"?`)) return;
+  if (busyChat === c.id) ctrl.abort();
+  chats = chats.filter((x) => x !== c);
+  dbOp("readwrite", (s) => s.delete(c.id)).catch(() => {});
+  if (current === c) current = null;
+  render();
+}
+
+// ---- images ----
+function addFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    const r = new FileReader();
+    r.onload = () => { pending.push(r.result); drawThumbs(); };
+    r.readAsDataURL(f);
+  }
+}
+function drawThumbs() {
+  const t = $("thumbs"); t.innerHTML = "";
+  pending.forEach((src, i) => {
+    const im = new Image(); im.src = src; im.title = "click to remove";
+    im.onclick = () => { pending.splice(i, 1); drawThumbs(); };
+    t.appendChild(im);
+  });
+}
+
+// ---- wiring ----
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = t.scrollHeight + 2 + "px"; }
+function applyLayout() {
+  document.documentElement.dataset.theme = settings.theme;
+  $("themeBtn").textContent = settings.theme === "dark" ? "Light" : "Dark";
+  document.body.classList.toggle("noside", !settings.side);
+}
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+$("input").addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => { e.preventDefault(); addFiles(e.dataTransfer.files); });
+$("sendBtn").onclick = send;
+$("file").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
+$("newBtn").onclick = () => { current = null; pending = []; drawThumbs(); render(); $("input").focus(); };
+$("settingsBtn").onclick = () => $("settings").classList.toggle("open");
+$("themeBtn").onclick = () => { settings.theme = settings.theme === "dark" ? "light" : "dark"; saveSettings(); applyLayout(); };
+$("sideBtn").onclick = () => { settings.side = !settings.side; saveSettings(); applyLayout(); };
+for (const [id, prop] of [["think", "checked"], ["temp", "value"], ["topp", "value"], ["maxtok", "value"], ["system", "value"]]) {
+  $(id)[prop] = settings[id];
+  $(id).addEventListener(prop === "checked" ? "change" : "input", () => { settings[id] = $(id)[prop]; saveSettings(); });
+}
+
+(async () => {
+  applyLayout();
+  try {
+    db = await openDb();
+    chats = (await dbOp("readonly", (s) => s.getAll())) || [];
+  } catch (e) {
+    console.error("IndexedDB unavailable, chats will not be saved", e);
+  }
+  if (legacyMessages) {
+    // Chats from the first version of this page were a single conversation in localStorage.
+    const c = newChat();
+    c.messages = legacyMessages.filter((m) => !m.streaming);
+    c.title = (c.messages.find((m) => m.role === "user")?.content || "(untitled)").replace(/\s+/g, " ").slice(0, 80);
+    chats.push(c); persist(c);
+    saveSettings();
+  }
+  if (chats.length) current = [...chats].sort((a, b) => b.updated - a.updated)[0];
+  render();
+  poll();
+  $("input").focus();
+})();
+</script>
+</body>
+</html>

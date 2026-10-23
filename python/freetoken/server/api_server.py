@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Literal
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from freetoken import __version__
 from freetoken.core import SamplingParams
 from freetoken.message import (
@@ -446,6 +446,16 @@ register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
+
+
+_WEBUI_PATH = os.path.join(os.path.dirname(__file__), "webui.html")
+
+
+@app.get("/", include_in_schema=False)
+async def webui():
+    """Single-file chat page over /v1/chat/completions, like llama-server's built-in UI."""
+    with open(_WEBUI_PATH, encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 
 # Paths the HTTP middleware logs into the request ring. The three chat protocols funnel through

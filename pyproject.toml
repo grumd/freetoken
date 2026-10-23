@@ -121,6 +121,7 @@ where = ["python"]
 
 [tool.setuptools.package-data]
 "*" = ["csrc/**/*", "moe/configs/**/*.json"]
+"freetoken.server" = ["webui.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
