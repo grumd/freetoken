@@ -52,8 +52,11 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
         h.update(f"cc={torch.cuda.get_device_capability(device)}|".encode())
     except Exception:
         pass
+    from freetoken.models.loader import safetensors_files
+
     files = sorted(
-        glob.glob(os.path.join(model_path, "*.safetensors")) + glob.glob(os.path.join(model_path, "*.gguf"))
+        (safetensors_files(model_path) if os.path.isdir(model_path) else [])
+        + glob.glob(os.path.join(model_path, "*.gguf"))
     )
     for f in files:
         st = os.stat(f)

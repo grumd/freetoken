@@ -32,7 +32,7 @@ from .register import _load_attr, get_model_spec
 _ST_DTYPE = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
     "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
-    "U8": torch.uint8, "BOOL": torch.bool,
+    "U8": torch.uint8, "U32": torch.uint32, "BOOL": torch.bool,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
 }
 _ODIRECT_BLK = 4096

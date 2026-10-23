@@ -138,8 +138,19 @@ def iter_nvfp4_expert_pieces(
     with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
 
+    from freetoken.models.nvfp4_csf import CsfPairBuffer
+
     wanted: dict[str, tuple[int, int, str]] = {}
+    # CSF-compressed scales arrive as two streams per weight_scale; both are read, the
+    # decoded scale is yielded under the stem (``...weight_scale``) key.
+    csf_streams: set[str] = set()
     for name in weight_map:
+        stem = CsfPairBuffer.stem(name)
+        if stem is not None and spec.key_pattern.match(stem):
+            csf_streams.add(name)
+            name = stem
+            if name in wanted:
+                continue
         match = spec.key_pattern.match(name)
         if match is None:
             continue
@@ -158,39 +169,44 @@ def iter_nvfp4_expert_pieces(
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
     _, _, lo, hi = _tp_expert_geometry(config)
+    csf = CsfPairBuffer()
+
+    def _place(name: str, tensor: torch.Tensor):
+        if name in csf_streams:
+            decoded = csf.add(name, tensor)
+            if decoded is None:
+                return
+            name, tensor = decoded
+        if wanted[name][2].endswith("_global"):
+            tensor = _ingest_global(spec, tensor)
+        else:
+            tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
+        yield name, tensor
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
         for name, shard in weight_map.items():
-            if name in wanted:
+            if name in wanted or name in csf_streams:
                 by_shard[shard].append(name)
         for shard in tqdm(sorted(by_shard), desc=f"Loading {spec.desc}", disable=not primary):
             path = os.path.join(folder, shard)
             drop(path)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name in by_shard[shard]:
-                    tensor = f.get_tensor(name)
-                    if wanted[name][2].endswith("_global"):
-                        tensor = _ingest_global(spec, tensor)
-                    else:
-                        tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
-                    yield name, tensor
+                    yield from _place(name, f.get_tensor(name))
             drop(path)
+        csf.assert_empty()
 
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
-        for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
-            if wanted[name][2].endswith("_global"):
-                tensor = _ingest_global(spec, tensor)
-            else:
-                tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
-            yield name, tensor
+        for name, tensor in iter_expert_tensors_parallel(
+            folder, lambda n: n in wanted or n in csf_streams, workers=workers, chunk=chunk
+        ):
+            yield from _place(name, tensor)
+        csf.assert_empty()
 
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
-
-
-__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

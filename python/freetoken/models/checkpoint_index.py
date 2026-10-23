@@ -67,7 +67,9 @@ def _read_header(path: str) -> tuple[dict, int]:
 
 
 def _weight_files(folder: str) -> list[str]:
-    files = sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+    from freetoken.models.loader import safetensors_files
+
+    files = safetensors_files(folder)
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
 
@@ -84,7 +86,7 @@ class CheckpointIndex:
         entries: dict[str, TensorInfo] = {}
         for path in _weight_files(folder):
             header, _ = _read_header(path)
-            shard = os.path.basename(path)
+            shard = os.path.relpath(path, folder)
             for name, meta in header.items():
                 if name == "__metadata__":
                     continue
@@ -167,7 +169,13 @@ class StorageKind(Enum):
     BF16 = "bf16"
     FP8_PER_ROW = "fp8_per_row"
     FP8_BLOCK = "fp8_block"
+    MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
+
+
+# MXFP8 (OCP microscaling): e4m3 weight [N, K] + one e8m0 exponent code per 32 inputs,
+# stored as uint8 ``.weight_scale`` [N, K/32] (ModelOpt MIXED_PRECISION exports).
+MXFP8_BLOCK = 32
 
 
 def detect_storage(index: CheckpointIndex, base: str) -> StorageKind:
@@ -189,8 +197,46 @@ def detect_storage(index: CheckpointIndex, base: str) -> StorageKind:
         if has_block:
             return StorageKind.FP8_BLOCK
         if has_per_row:
+            scale = index.companion(base, "weight_scale")
+            if index.dtype(scale) in (torch.uint8, torch.float8_e8m0fnu) and _is_mx_block(
+                index.shape(weight), index.shape(scale)
+            ):
+                return StorageKind.MXFP8
             return StorageKind.FP8_PER_ROW
     return StorageKind.BF16
+
+
+def _is_mx_block(weight_shape: tuple[int, ...], scale_shape: tuple[int, ...]) -> bool:
+    return (
+        len(weight_shape) == 2 and len(scale_shape) == 2 and scale_shape[0] == weight_shape[0]
+        and weight_shape[1] == scale_shape[1] * MXFP8_BLOCK
+    )
+
+
+def dequantize_mxfp8(weight: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+    """e4m3 weight [N, K] * 2**(code - 127) per 32 inputs -> bf16 (exact: a power-of-two scale
+    of an e4m3 value is representable in bf16 for every code a checkpoint uses)."""
+    n, k = weight.shape
+    scale = torch.exp2(codes.view(torch.uint8).to(torch.float32) - 127.0)
+    w = weight.to(torch.float32).reshape(n, k // MXFP8_BLOCK, MXFP8_BLOCK) * scale.unsqueeze(-1)
+    return w.reshape(n, k).to(torch.bfloat16)
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def dequantize_nvfp4(
+    packed: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor | None
+) -> torch.Tensor:
+    """ModelOpt NVFP4 -> bf16: packed e2m1 [N, K/2] (low nibble = even k), e4m3 block scales
+    [N, K/16], dequant-side fp32 global. Computed in fp32 and rounded once."""
+    n = packed.shape[0]
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32)
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(n, -1).long()
+    w = lut[codes].reshape(n, -1, 16) * scale.to(torch.float32).unsqueeze(-1)
+    if global_scale is not None:
+        w = w * global_scale.to(torch.float32).reshape(())
+    return w.reshape(n, -1).to(torch.bfloat16)
 
 
 def dequantize_fp8_per_row(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -219,7 +265,7 @@ def dequantize_fp8_block(
 
 
 def dequantize(
-    index: CheckpointIndex, base: str, get, *, block: int = 128
+    index: CheckpointIndex, base: str, get, *, block: int = 128, nvfp4_to_bf16: bool = False
 ) -> torch.Tensor:
     """Read + dequantize ``base``'s weight to bf16, generically across dialects.
 
@@ -235,6 +281,14 @@ def dequantize(
     if kind is StorageKind.FP8_BLOCK:
         scale = get(index.companion(base, "block_scale"))
         return dequantize_fp8_block(weight, scale, block=block)
+    if kind is StorageKind.MXFP8:
+        return dequantize_mxfp8(weight, get(index.companion(base, "weight_scale")))
+    if kind is StorageKind.NVFP4 and nvfp4_to_bf16:
+        scale = index.companion(base, "weight_scale")
+        if scale is None or index.dtype(scale) is not torch.float8_e4m3fn:
+            raise ValueError(f"{base!r}: NVFP4 weight without an e4m3 .weight_scale")
+        glob = index.companion(base, "weight_global")
+        return dequantize_nvfp4(weight, get(scale), get(glob) if glob is not None else None)
     raise ValueError(f"{base!r} is stored NVFP4 packed; it has no bf16 dequant path")
 
 
@@ -248,5 +302,7 @@ __all__ = [
     "dequantize",
     "dequantize_fp8_block",
     "dequantize_fp8_per_row",
+    "dequantize_mxfp8",
+    "dequantize_nvfp4",
     "detect_storage",
 ]

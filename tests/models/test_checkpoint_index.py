@@ -7,6 +7,7 @@ wrote the checkpoint.
 
 from __future__ import annotations
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -112,3 +113,41 @@ def test_dequantize_rejects_nvfp4_without_a_bf16_target(tmp_path):
 
     with pytest.raises(ValueError, match="NVFP4"):
         dequantize(idx, "nv", get=lambda n: _load(tmp_path, idx, n))
+
+
+def test_mxfp8_weight_is_detected_and_dequantized_exactly(tmp_path):
+    from safetensors.torch import save_file
+
+    from freetoken.models.checkpoint_index import (
+        CheckpointIndex, StorageKind, TensorReader, dequantize, detect_storage,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    q = (torch.randint(0, 256, (8, 64), generator=g, dtype=torch.uint8) & 0xF7).view(torch.float8_e4m3fn)
+    codes = torch.randint(110, 125, (8, 2), generator=g, dtype=torch.uint8)
+    save_file({"lin.weight": q, "lin.weight_scale": codes}, str(tmp_path / "model.safetensors"))
+    idx = CheckpointIndex.load(str(tmp_path))
+    assert detect_storage(idx, "lin") is StorageKind.MXFP8
+    rd = TensorReader(idx)
+    w = dequantize(idx, "lin", rd.get)
+    ref = q.float().view(8, 2, 32) * torch.exp2(codes.float() - 127).unsqueeze(-1)
+    assert w.dtype == torch.bfloat16 and torch.equal(w.float(), ref.view(8, 64))
+
+
+def test_nvfp4_dense_dequant_is_opt_in(tmp_path):
+    from safetensors.torch import save_file
+
+    from freetoken.models.checkpoint_index import CheckpointIndex, TensorReader, dequantize
+
+    packed = torch.tensor([[0x21, 0xF7] * 8], dtype=torch.uint8)  # codes 1,2 / 7,15 -> 0.5,1 / 6,-6
+    scale = torch.tensor([[2.0, 0.5]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    glob = torch.tensor(0.25, dtype=torch.float32)
+    save_file({"v.weight": packed, "v.weight_scale": scale, "v.weight_scale_2": glob}, str(tmp_path / "model.safetensors"))
+    idx = CheckpointIndex.load(str(tmp_path))
+    rd = TensorReader(idx)
+    with pytest.raises(ValueError):
+        dequantize(idx, "v", rd.get)
+    w = dequantize(idx, "v", rd.get, nvfp4_to_bf16=True)
+    vals = torch.tensor([0.5, 1.0, 6.0, -6.0] * 8)
+    ref = vals * torch.tensor([2.0] * 16 + [0.5] * 16) * 0.25
+    assert torch.equal(w.float().view(-1), ref)

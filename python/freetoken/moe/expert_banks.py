@@ -233,7 +233,9 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
         model_path = download_hf_weight(model_path)
     except Exception:
         return True
-    sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))]
+    from freetoken.models.loader import safetensors_files
+
+    sizes = [os.path.getsize(p) for p in safetensors_files(model_path)]
     if not sizes:
         return True
     return avail > sum(sizes) + max(sizes)

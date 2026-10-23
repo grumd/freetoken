@@ -43,6 +43,11 @@ _QWEN3_5_PACKED = _DENSE_PACKED + (
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
 )
+# The qwen4_exp dense reader dequantizes every non-expert weight to bf16 (FP4-Local's MXFP8
+# attention / GDN / shared expert, its NVFP4 vision MLP and MTP experts), so only the routed
+# experts take the checkpoint's quant scheme; MXFP8 dense comes back at load, losslessly
+# (FREETOKEN_DENSE_MXFP8, engine/engine.py).
+_QWEN4_EXP_DEQUANTIZED = ("*.self_attn", "*.linear_attn", "*.shared_expert", "*.visual", "visual", "mtp")
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
@@ -141,6 +146,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen4ExpForCausalLM",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        unquantized_modules=_QWEN4_EXP_DEQUANTIZED,
     ),
     # Text-only sibling (model_type qwen4_exp_text): the text tower's own architectures entry
     # in a language-model-only export. No wrapper, so the weights sit under the bare ``model.``
@@ -149,6 +155,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen4_exp",
         "Qwen4ExpForCausalLM",
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        unquantized_modules=_QWEN4_EXP_DEQUANTIZED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

@@ -131,6 +131,8 @@ def _rename(raw_name: str, keep_mtp: bool = False, include_vision: bool = False)
     if raw_name.startswith(("model.visual.", "visual.")):
         if not include_vision:
             return None  # text-only serving: the tower is not built (see ModelConfig.is_multimodal)
+        if raw_name.endswith(_SCALE_SUFFIXES):
+            return None  # consumed with its quantized weight (FP4-Local: MXFP8 attn, NVFP4 MLP)
         # The vision tower lives under ``vision_tower.`` in the model; the generic FTW
         # replay gate (VISION_KEY_PREFIXES) uses the same prefix.
         prefix = "model.visual." if raw_name.startswith("model.visual.") else "visual."
@@ -284,7 +286,7 @@ def _read_mtp_weight(index, reader, key: str) -> torch.Tensor:
     from freetoken.models.checkpoint_index import dequantize
 
     if key.endswith(".weight"):
-        return dequantize(index, key[: -len(".weight")], reader.get)
+        return dequantize(index, key[: -len(".weight")], reader.get, nvfp4_to_bf16=True)
     # Stacked residents store the tensor under the bare key (no ".weight"); the
     # RadixArk draft is bf16 there, so no companion is involved.
     return reader.get(key)
@@ -464,6 +466,12 @@ def iter_weights(
                                 f"fp8 weight has no .weight_scale/.weight_scale_inv companion: {stem!r}"
                             )
                         tensor = dequantize(index, stem, reader.get)
+                    elif tensor.dtype == torch.uint8 and raw_name.endswith(".weight"):
+                        # W4A16_NVFP4 dense linears (the FP4-Local vision MLP/merger): served bf16.
+                        stem = raw_name[: -len(".weight")]
+                        if detect_storage(index, stem) is not StorageKind.NVFP4:
+                            raise ValueError(f"uint8 weight {stem!r} is not NVFP4-packed")
+                        tensor = dequantize(index, stem, reader.get, nvfp4_to_bf16=True)
                     fused = _try_fuse(name, tensor, fuse_buf)
                     if fused is not None:
                         if fused != ():  # () means buffered, not yet complete

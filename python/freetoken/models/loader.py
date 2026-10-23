@@ -47,9 +47,25 @@ def shard_tensor(
     return value
 
 
+def safetensors_files(folder: str) -> list[str]:
+    """Every weight shard of a local checkpoint: the files its ``model.safetensors.index.json``
+    names (which may live in a subfolder, e.g. NVIDIA's ``tensors/``), else the root
+    ``*.safetensors``."""
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        import json
+
+        with open(index, encoding="utf-8") as fh:
+            names = sorted(set(json.load(fh)["weight_map"].values()))
+        files = [os.path.join(folder, n) for n in names]
+        if files and all(os.path.exists(f) for f in files):
+            return files
+    return sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+
+
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
-    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = safetensors_files(model_folder)
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
 
