@@ -30,6 +30,9 @@ if [ "$ELASTIC" = "0" ] && [ "${#gpu_list[@]}" -lt 2 ]; then
   : "${MAXLEN:=131072}" "${MEM_RATIO:=0.84}"
 fi
 : "${MAXLEN:=262144}"           # longest request (prompt + output)
+: "${PREFILL_CHUNK:=8192}"      # tokens per prefill chunk; elastic keeps 256 MiB + 230 KiB per token
+                                # free for its activations (8192: 2.0 GiB, 4096: 1.2, 2048: 0.7). Halving
+                                # it roughly halves long-prompt prefill speed; it buys context on 16 GB.
 : "${PORT:=8080}"
 : "${HOST:=127.0.0.1}"
 : "${MTP:=off}"
@@ -82,6 +85,7 @@ args=(
   --mtp "$MTP"
   --vision-on-cpu --vision-threads "$VISION_THREADS"
   --moe-routed-prefill-tokens "$ROUTED_PF"
+  --max-prefill-length "$PREFILL_CHUNK"
   --enable-cache-report
   --host "$HOST" --port "$PORT"
 )

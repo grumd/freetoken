@@ -80,7 +80,8 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | `MAXLEN` | `262144` | longest request; lowered to what fits in VRAM, and reserved as KV when `ELASTIC=0` (`131072` on one GPU) |
 | `ELASTIC` | `1` | KV and the expert cache share VRAM at runtime (`--elastic-kv`); replaces `MEM_RATIO`. Decode +16%, output identical |
 | `KEEP_FREE_MB` | `128` | elastic: VRAM left free per GPU, also at the prefill peak |
-| `PREFILL_RESERVE_GB` | auto | elastic: VRAM per GPU kept for prefill activations (auto: 2 GiB per 8192-token chunk) |
+| `PREFILL_CHUNK` | `8192` | tokens per prefill chunk. Smaller chunks need less VRAM for prefill (more context on 16 GB) but halve long-prompt prefill speed per halving |
+| `PREFILL_RESERVE_GB` | auto | elastic: VRAM per GPU kept for prefill activations (auto: 256 MiB + 230 KiB per `PREFILL_CHUNK` token); lent to the expert cache while decoding |
 | `CACHE_RAM_GB` | `0` | whole GiB of pinned host RAM (all GPUs) for evicted prompt prefixes, reloaded instead of prefilled again (`--cache-ram-gb`); raises `MIN_AVAIL_GIB` and `MEM_MAX` by as much |
 | `MEM_RATIO` | `0.86` (`0.84` on one GPU) | `ELASTIC=0`: VRAM share for weights + expert cache + KV; the rest is activation headroom |
 | `CPU_PREFILL` | `1` | compute about 65% of prefill cache misses on the CPU; `0` = GPU only, bit-reproducible |
