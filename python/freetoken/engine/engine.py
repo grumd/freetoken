@@ -660,6 +660,12 @@ class Engine:
                 self._sync_get_memory()[0], self._elastic_reserve, self._elastic_keep_free,
                 self.tp_cpu_group if config.tp_info.size > 1 else None,
             )
+            # requests are length-checked against max_seq_len, which came from the pre-graph
+            # estimate; past the settled KV limit a prompt would be admitted and never get pages
+            limit = self.elastic.limit_pages * self._elastic_page_tokens
+            if limit < self.max_seq_len:
+                logger.info_rank0(f"--elastic-kv: max context {self.max_seq_len} -> {limit} tokens (VRAM)")
+                self.max_seq_len = limit
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -770,6 +776,7 @@ class Engine:
             raise ValueError("--elastic-kv needs --moe-strategy offload with GPU decode")
         cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         fixed += state_pool_bytes(config)
+        self._elastic_page_tokens = page_tokens
         self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, config.max_extend_tokens)
         self._elastic_keep_free = config.vram_keep_free_mb << 20
         free = self._sync_get_memory()[0]

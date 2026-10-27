@@ -137,7 +137,8 @@ def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: i
     """VRAM kept back for prefill activations under --elastic-kv. Auto: 2 GiB per 8192-token chunk,
     scaled up for larger chunks. A full 261.5k-token prefill on Qwen3.8-Flash-Next (2x RTX 3080,
     2026-10-27) peaked at 1.81-2.16 GiB over the idle footprint; with 2.25 GiB kept back it still
-    left 445-817 MiB above a 128 MiB keep-free margin."""
+    left 445-817 MiB above a 128 MiB keep-free margin. One unsplit GPU peaked at 1.92 GiB on a
+    233k-token prompt, so the same auto value covers TP=1."""
     if prefill_reserve_gb is not None:
         return int(prefill_reserve_gb * 2**30)
     return int(2 * 2**30 * max(1.0, max_extend_tokens / 8192))
