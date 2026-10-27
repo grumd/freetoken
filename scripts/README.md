@@ -2,14 +2,7 @@
 
 ## `serve-qwen38.sh`: Qwen3.8-Flash-Next on consumer GPUs
 
-Serves Qwen3.8-Flash-Next from an FTW checkpoint with:
-
-- routed experts pinned in host RAM, a VRAM LRU expert cache in front of them
-- the PLE n-gram table read from disk per token (io_uring, O_DIRECT)
-- the vision tower on the CPU (no VRAM spent on it)
-- full 262144-token context, bf16 KV, one request at a time
-- on 2 GPUs, KV and the expert cache share VRAM at runtime: the cache gets whatever the live context does not need (`--elastic-kv`)
-- hybrid prefill: short chunks load only their routed experts, and the CPU computes most VRAM-cache misses while the GPU fetches the rest
+Serves Qwen3.8-Flash-Next from an FTW checkpoint: experts pinned in host RAM behind a VRAM expert cache that takes whatever the live context does not need, the PLE n-gram table read from disk, the vision tower on the CPU, and hybrid CPU/GPU prefill. Full 262144-token context on 2 GPUs, one request at a time.
 
 The same script serves both checkpoints. It reads `quant_format` from the FTW index to pick the model name.
 
@@ -32,7 +25,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
   - dense weights: 8.2 GiB unsplit, 5.5 GiB per GPU at TP=2
   - KV: 25 KiB/token (6.4 GiB at 262k)
   - expert cache: whatever is left.
-- **RAM:** 96 GB class. The script refuses to start under 75 GiB `MemAvailable`. Pinned memory cannot swap. With 128 GB, see `CACHE_RAM_GB` under Other hardware.
+- **RAM:** 96 GB class. The script refuses to start under 75 GiB `MemAvailable`. Pinned memory cannot swap. With 128 GB, see `CACHE_RAM_GB` under Settings.
 - **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for `CPU_PREFILL=1`. Without it the server logs `FREETOKEN_WNA16_CPU_PREFILL ignored` and prefills on the GPU only.
 - **Disk:** NVMe. PLE rows are read on every token.
 - **Optional:** a systemd user session for the RAM-capped scope (`CGROUP=0` skips it).
@@ -66,18 +59,30 @@ The API is OpenAI/Anthropic-compatible at `http://127.0.0.1:8080/v1`, with a cha
 - **FP4:** its NVFP4 PLE table is always repacked into `model-plenvfp4-*.safetensors` rows, so `--ple none` does not work for it.
 - **Re-convert** after pulling changes to the expert-bank layout (quant format or kernel commits). An old FTW will not load.
 
-### Knobs (env vars)
+### Settings
+
+The defaults are the fastest settings measured on this hardware; usually only `SNAP` is needed.
+
+| Var | Default | When to change it |
+|---|---|---|
+| `SNAP` | required | FTW checkpoint dir |
+| `GPUS` | `0,1` | one GPU: `GPUS=0` (picks 128k context and the one-GPU VRAM split by itself) |
+| `CACHE_RAM_GB` | `0` | 128 GB of RAM: `16` keeps about 520k tokens of older conversations in RAM; going back to one reloads it (a 13.6k-token one in 27 ms instead of 6.3 s). Leave it off on 96 GB |
+| `HOST`, `PORT` | `127.0.0.1`, `8080` | listen address |
+| `EXTRA` | | extra `ft serve` flags; arguments after the script name are passed too |
+
+<details><summary>All knobs (tuning and A/B runs)</summary>
 
 | Var | Default | Meaning |
 |---|---|---|
 | `SNAP` | required | FTW checkpoint dir |
 | `GPUS` | `0,1` | nvidia-smi indices; the count sets the TP size |
-| `MAXLEN` | `262144` | longest request; also reserved as KV when `ELASTIC=0` |
+| `MAXLEN` | `262144` (`131072` on one GPU) | longest request; also reserved as KV when `ELASTIC=0` |
 | `ELASTIC` | `1` on 2+ GPUs, `0` on one | KV and the expert cache share VRAM at runtime (`--elastic-kv`); replaces `MEM_RATIO`. Decode +16%, output identical |
 | `KEEP_FREE_MB` | `128` | elastic: VRAM left free per GPU, also at the prefill peak |
 | `PREFILL_RESERVE_GB` | auto | elastic: VRAM per GPU kept for prefill activations (auto: 2 GiB per 8192-token chunk) |
 | `CACHE_RAM_GB` | `0` | whole GiB of pinned host RAM (all GPUs) for evicted prompt prefixes, reloaded instead of prefilled again (`--cache-ram-gb`); raises `MIN_AVAIL_GIB` and `MEM_MAX` by as much |
-| `MEM_RATIO` | `0.86` | `ELASTIC=0`: VRAM share for weights + expert cache + KV; the rest is activation headroom |
+| `MEM_RATIO` | `0.86` (`0.84` on one GPU) | `ELASTIC=0`: VRAM share for weights + expert cache + KV; the rest is activation headroom |
 | `CPU_PREFILL` | `1` | compute about 65% of prefill cache misses on the CPU; `0` = GPU only, bit-reproducible |
 | `CPU_PREFILL_FETCH` | `0.35` | share of misses fetched over PCIe instead |
 | `ROUTED_PF` | `3072` (`1280` without CPU prefill) | prefill chunks up to this many tokens load only their routed experts |
@@ -94,11 +99,11 @@ The API is OpenAI/Anthropic-compatible at `http://127.0.0.1:8080/v1`, with a cha
 | `EXTRA` | | extra `ft serve` flags; arguments after the script name are passed too |
 | `FT` | `.venv/bin/ft` | `ft` binary to run |
 
+</details>
+
 **Other hardware:**
 
-- **One 20 GB GPU:** `GPUS=0 MAXLEN=131072 MEM_RATIO=0.84`. The full 262k KV and the 1024-slot expert-cache minimum do not both fit. `ELASTIC` stays off here: its prefill reserve was calibrated at TP=2 only.
-- **128 GB RAM:** `CACHE_RAM_GB=16` keeps about 520k tokens of older conversations in RAM (one 262k context is 6.4 GiB). Returning to one reloads it instead of prefilling it again: a 13.6k-token conversation came back in 27 ms instead of 6.3 s. On 96 GB leave it off: with FP4 loaded only about 10 GiB stays free (INT4 about 17).
-- **Bigger cards:** keep 262k and re-sweep `MEM_RATIO`. A single GPU needs more activation headroom than a TP=2 rank.
+- **Bigger cards:** on one GPU raise `MAXLEN` and re-sweep `MEM_RATIO`. On two, elastic VRAM sizes itself.
 - **Faster PCIe or RAM:** `CPU_PREFILL_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5. On a faster link, fetch more over PCIe and lower `ROUTED_PF`.
 
 ### Troubleshooting
