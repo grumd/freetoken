@@ -77,6 +77,7 @@ The API is OpenAI/Anthropic-compatible at `http://127.0.0.1:8080/v1`, with a cha
 | `CPU_PREFILL_FETCH` | `0.35` | share of misses fetched over PCIe instead |
 | `ROUTED_PF` | `3072` (`1280` without CPU prefill) | prefill chunks up to this many tokens load only their routed experts |
 | `PRECISE_PREFILL` | `1` | W4A16 exact-dequant prefill (no speed cost) |
+| `HIT_D2D` | `1` | prefill chunks above `ROUTED_PF` copy VRAM-cached experts device-side and stream only the misses over PCIe |
 | `BALANCED` | `1` | W4A16 at TP=2: even 320/320 expert split |
 | `DENSE_FP8` | `0` | fp8 dense linears: faster decode, lossy |
 | `MTP` | `off` | `--mtp` mode (`off`, `on`, `auto`, `file`) |

@@ -38,6 +38,8 @@ if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1
                                 # prefill chunks <= ROUTED_PF tokens load only their routed experts
                                 # instead of streaming every expert over PCIe (~2.4 s per chunk at
                                 # x8 gen4); re-tune on a faster link
+: "${HIT_D2D:=1}"               # 1 = longer chunks copy VRAM-cached experts device-side and stream only
+                                # the misses (pp16384 -14% warm, output identical)
 : "${BALANCED:=1}"              # W4A16 at TP=2: even 320/320 expert split (vs 256/384)
 : "${MIN_AVAIL_GIB:=75}"        # refuse to start below this much MemAvailable
 : "${CGROUP:=1}"                # 1 = run in a systemd --user scope with a hard RAM cap, no swap
@@ -73,6 +75,7 @@ args=(
   --host "$HOST" --port "$PORT"
 )
 [ "$DENSE_FP8" = "1" ] && args+=(--dense-fp8)
+[ "$HIT_D2D" = "1" ] && args+=(--moe-prefill-hit-d2d)
 [ -n "$EXTRA" ] && args+=($EXTRA)
 
 export FREETOKEN_WNA16_BALANCED_TP="$BALANCED"
