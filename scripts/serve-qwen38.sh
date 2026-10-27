@@ -20,15 +20,25 @@ case "$fmt" in
 esac
 
 : "${GPUS:=0,1}"                # nvidia-smi indices, entry i = TP rank i; TP size = count
-: "${MAXLEN:=262144}"           # longest request; also reserved as KV when ELASTIC=0
+# ELASTIC=1: KV and the expert cache share VRAM at runtime, so the cache gets whatever the live
+# context does not need (decode +16%, output identical); it replaces MEM_RATIO. MAXLEN is the
+# longest request (and the KV reserve when ELASTIC=0). One 20 GB GPU cannot hold the full 262k KV
+# beside the 1024-slot expert-cache minimum and needs more activation headroom than a TP=2 rank;
+# elastic's prefill reserve is calibrated at TP=2 only.
+IFS=, read -ra gpu_list <<<"$GPUS"
+if [ "${#gpu_list[@]}" -ge 2 ]; then
+  : "${ELASTIC:=1}" "${MAXLEN:=262144}"
+else
+  : "${ELASTIC:=0}" "${MAXLEN:=131072}" "${MEM_RATIO:=0.84}"
+fi
 : "${PORT:=8080}"
 : "${HOST:=127.0.0.1}"
 : "${MTP:=off}"
 : "${VISION_THREADS:=8}"        # host ViT intra-op threads (16 -> 3.5 s, 4 -> 6.8 s per full-size image)
 : "${DENSE_FP8:=0}"             # 1 = fp8 dense linears (faster decode, lossy)
-: "${MEM_RATIO:=0.86}"          # ELASTIC=0: VRAM share for weights + expert cache + KV; the rest is activation
-                                # headroom. 0.87+ OOMed on 20 GB cards on the first decode after a
-                                # full 262k prefill. One unsplit GPU needs more headroom: start at 0.84.
+: "${MEM_RATIO:=0.86}"          # ELASTIC=0: VRAM share for weights + expert cache + KV; the rest is
+                                # activation headroom. 0.87+ OOMed on 20 GB cards on the first decode
+                                # after a full 262k prefill.
 : "${CPU_PREFILL:=1}"           # 1 = routed prefill computes most VRAM-cache misses on the CPU
                                 # (AVX-512 BF16, 4 physical cores per rank) while the GPU fetches the
                                 # rest; 0 = GPU only (bit-reproducible, use it for A/B runs)
@@ -41,12 +51,6 @@ if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1
 : "${HIT_D2D:=1}"               # 1 = longer chunks copy VRAM-cached experts device-side and stream only
                                 # the misses (pp16384 -14% warm, output identical)
 : "${BALANCED:=1}"              # W4A16 at TP=2: even 320/320 expert split (vs 256/384)
-IFS=, read -ra gpu_list <<<"$GPUS"
-if [ "${#gpu_list[@]}" -ge 2 ]; then : "${ELASTIC:=1}"; else : "${ELASTIC:=0}"; fi
-                                # 1 = KV and the expert cache share VRAM at runtime: the cache gets
-                                # whatever the live context does not need (decode +16%, output
-                                # identical); replaces MEM_RATIO. Off on one GPU, where its prefill
-                                # reserve is not calibrated yet.
 : "${KEEP_FREE_MB:=128}"        # elastic: VRAM left free per GPU, also at the prefill peak
 : "${PREFILL_RESERVE_GB:=}"     # elastic: prefill activation reserve per GPU; empty = auto
 : "${CACHE_RAM_GB:=0}"          # whole GiB of pinned host RAM (all GPUs) for evicted prompt prefixes:
