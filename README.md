@@ -4,19 +4,35 @@ A fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apa
 
 ## What to expect
 
-FP4 with the default settings on RTX 3080s (PCIe 4.0 x8 each), a Ryzen 7 9800X3D and 96 GB of DDR5. The 16 GB rows are 20 GB cards with 4 GiB held back.
+FP4 with the default settings: RTX 3080s on PCIe 4.0 x8, a Ryzen 7 9800X3D, 96 GB of DDR5. Decode is greedy chat; prefill is one fresh 16k-token prompt. The 16 GB numbers are 20 GB cards with 4 GiB held back.
 
-| GPUs | Longest context | Expert cache | Decode | Prompt that fills the context |
-|---|---|---|---|---|
-| 1x 16 GB | 149k tokens | 2.2k experts (9%) | 23 tok/s | 1.4k tok/s prefill, then 15 tok/s |
-| 1x 20 GB | 262k | 3.8k (15%) | 32 tok/s | 1.5k tok/s, then 16 tok/s |
-| 2x 16 GB | 262k | 6.5k (26%) | 76 tok/s | 2.5k tok/s, then 51 tok/s |
-| 2x 20 GB | 262k | 9.6k (39%) | 88 tok/s | 2.7k tok/s, then 62 tok/s |
+**One 16 GB GPU**
 
-- **Expert cache:** how many of the 24,576 experts (48 layers x 512) fit in VRAM while the context is short. It hands slots back as the context grows, and every cache miss is a copy over PCIe, so decode speed tracks it.
+| Prefill chunk | Decode | 16k prefill | Max context |
+|---|---|---|---|
+| 8192 (default) | 27 tok/s | 1,520 tok/s | 147k |
+| 4096 | 27 tok/s | 790 tok/s | 186k |
+| 2048 | 27 tok/s | 880 tok/s | 205k |
+
+**One 20 GB GPU**
+
+| Prefill chunk | Decode | 16k prefill | Max context |
+|---|---|---|---|
+| 8192 (default) | 34 tok/s | 1,580 tok/s | 262k |
+| 4096 | 34 tok/s | 830 tok/s | 262k |
+
+**Two GPUs**
+
+| GPUs | Decode | 16k prefill | Max context |
+|---|---|---|---|
+| 2x 16 GB | 82 tok/s | 2,760 tok/s | 262k |
+| 2x 20 GB | 93 tok/s | 3,030 tok/s | 262k |
+
+- **Prefill chunk** (`PREFILL_CHUNK`): smaller chunks need less VRAM while a prompt is read, which leaves more for context, at about half the prefill speed. Each max context above was checked with a prompt that fills it.
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. Every setup needs a 96 GB machine.
-- **INT4** decodes about 11% slower (79 tok/s on 2x 20 GB) and downloads 169 GB instead of 96 GB.
+- **INT4** decodes about 11% slower and downloads 169 GB instead of 96 GB.
 - **Two GPUs** were measured with P2P between them (patched driver); without it, expect roughly 8% less decode.
+- **PCIe:** every card had a x8 link. Experts stream over it on every cache miss, so a card on x16 should decode and prefill faster (not measured).
 
 ## Quick start
 
@@ -37,6 +53,7 @@ For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead; the same 
 The defaults are the fastest settings measured, and the context and expert cache size themselves to your VRAM. Set something else only if:
 
 - you have one GPU: `GPUS=0`
+- you need more than 147k tokens on one 16 GB GPU: `PREFILL_CHUNK=4096` (186k, half the prefill speed)
 - you have 128 GB of RAM: `CACHE_RAM_GB=16` keeps older conversations in RAM, so going back to one skips its prefill
 - you need another address: `HOST=0.0.0.0 PORT=8000`
 

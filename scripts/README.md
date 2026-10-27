@@ -21,7 +21,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 ### Requirements
 
 - **OS / toolchain:** Linux x86_64, NVIDIA driver r580+ (CUDA 13), CUDA 13 toolkit with `nvcc` on PATH (kernels JIT-compile on first use), `g++` (the CPU prefill extension builds with `-march=native`).
-- **GPU:** one or two with 16 GB or more; tuned on 2x 20 GB. One 16 GB GPU holds 149k tokens of context, 20 GB the full 262k. VRAM use:
+- **GPU:** one or two with 16 GB or more; tuned on 2x 20 GB. One 16 GB GPU holds 147k tokens of context (186k with `PREFILL_CHUNK=4096`), 20 GB the full 262k. VRAM use:
   - dense weights: 8.2 GiB unsplit, 5.5 GiB per GPU at TP=2
   - KV: 25 KiB/token (6.4 GiB at 262k)
   - expert cache: whatever is left.
@@ -96,7 +96,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | `HOST`, `PORT`, `NAME` | `127.0.0.1`, `8080`, from FTW | listen address, served model name |
 | `MIN_AVAIL_GIB` | `75` + `CACHE_RAM_GB` | start-up RAM check |
 | `CGROUP`, `MEM_MAX` | `1`, `78G` + `CACHE_RAM_GB` | systemd scope with a hard RAM cap and no swap |
-| `MEMGUARD`, `FLOOR` | `1`, `8` | `memguard.sh` kills the server under `FLOOR` GiB free (log: `/tmp/ft-memguard.log`) |
+| `MEMGUARD`, `FLOOR` | `1`, `2` | `memguard.sh` kills the server under `FLOOR` GiB free (log: `/tmp/ft-memguard.log`) |
 | `EXTRA` | | extra `ft serve` flags; arguments after the script name are passed too |
 | `FT` | `.venv/bin/ft` | `ft` binary to run |
 

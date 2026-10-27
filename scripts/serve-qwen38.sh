@@ -62,7 +62,7 @@ if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1
 : "${CGROUP:=1}"                # 1 = run in a systemd --user scope with a hard RAM cap, no swap
 : "${MEM_MAX:=$((78 + CACHE_RAM_GB))G}"
 : "${MEMGUARD:=1}"              # 1 = kill the server when MemAvailable drops under FLOOR GiB
-: "${FLOOR:=8}"
+: "${FLOOR:=2}"                # GiB; the server itself is capped by MEM_MAX, so this guards the rest of the desktop
 : "${EXTRA:=}"
 
 # Pinned memory cannot swap, so an overshoot freezes the host instead of reaching the OOM killer.
