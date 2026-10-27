@@ -386,10 +386,179 @@ def hc_combine_norm(
     return out, y
 
 
+@triton.jit
+def _hc_combine_rmsnorm_kernel(
+    block_ptr,
+    res_ptr,
+    inj_ptr,
+    w_ptr,
+    out_ptr,
+    y_ptr,
+    stride_block,
+    stride_res,
+    stride_inj,
+    stride_out,
+    stride_y,
+    HC_DIM: tl.constexpr,
+    HC: tl.constexpr,
+    EPS: tl.constexpr,
+) -> None:
+    # One stream per program over the same [next_pow2(HC_DIM)] tile and sum as
+    # _grouped_gemma_rmsnorm_kernel, so both outputs match the unfused pair bit for bit
+    # (hc_combine_norm's 2-D tile reduces in another order).
+    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(HC_DIM)
+    row = tl.program_id(0).to(tl.int64)
+    stream = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < HC_DIM
+    offsets = stream * HC_DIM + offs
+
+    inj = 2.0 * tl.sigmoid(tl.load(inj_ptr + row * stride_inj + stream).to(tl.float32) / HC)
+    block = tl.load(block_ptr + row * stride_block + offs, mask, other=0.0)
+    res = tl.load(res_ptr + row * stride_res + offsets, mask, other=0.0)
+    out = (res.to(tl.float32) + block.to(tl.float32) * inj).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_out + offsets, out, mask)
+
+    x = out.to(tl.float32)
+    w = tl.load(w_ptr + offsets, mask, other=0.0)
+    rrms = tl.rsqrt(tl.sum(x * x) / HC_DIM + EPS)
+    y = x * rrms
+    y += y * w.to(tl.float32)
+    tl.store(y_ptr + row * stride_y + offsets, y, mask)
+
+
+def hc_combine_rmsnorm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_combine`` and ``grouped_gemma_rmsnorm`` of its result in one launch, bit-identical
+    to the two kernels: ``(residual', normed residual')``."""
+    N, DIM = residual.shape
+    assert DIM % hc_count == 0
+    hc_dim = DIM // hc_count
+    assert block_output.shape == (N, hc_dim)
+    assert injection_logits.shape == (N, hc_count)
+    assert residual.stride(1) == 1 and block_output.stride(1) == 1 and injection_logits.stride(1) == 1
+    assert norm_weight.is_contiguous() and norm_weight.numel() == DIM
+
+    out = residual.new_empty(residual.shape)
+    y = residual.new_empty(residual.shape)
+    _hc_combine_rmsnorm_kernel[(N, hc_count)](
+        block_output,
+        residual,
+        injection_logits,
+        norm_weight,
+        out,
+        y,
+        block_output.stride(0),
+        residual.stride(0),
+        injection_logits.stride(0),
+        out.stride(0),
+        y.stride(0),
+        hc_dim,
+        hc_count,
+        EPS=eps,
+    )
+    return out, y
+
+
+@triton.jit
+def _hc_up_gate_mix_kernel(
+    lora_ptr,
+    w_ptr,
+    rn_ptr,
+    y_ptr,
+    K,
+    stride_wn,
+    h_lo,
+    w_h0,
+    w_stream,
+    HC: tl.constexpr,
+    HC_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    # One hidden index per program: its HC gate rows are reduced like gemv.py's _gemv_rows
+    # (one row, one K step) over the bf16-rounded hc_silu output, rounded to bf16 as gemv
+    # stores them, then summed in hc_gate_mix's stream order. Program i writes y[i] for hidden
+    # index h_lo + i, whose stream-s weight row is s * w_stream + h - w_h0.
+    i = tl.program_id(0) + tl.arange(0, 1)
+    h = h_lo + i
+    cols = tl.arange(0, BLOCK_K)
+    kmask = cols < K
+    a = tl.load(lora_ptr + cols, mask=kmask, other=0.0).to(tl.float32) / HC
+    a = (a * tl.sigmoid(a)).to(tl.bfloat16)
+
+    mixed = tl.zeros([1], dtype=tl.float32)
+    for stream in tl.static_range(HC):
+        rows = stream * w_stream + h - w_h0
+        w = tl.load(
+            w_ptr + rows[:, None].to(tl.int64) * stride_wn + cols[None, :],
+            mask=kmask[None, :], other=0.0, eviction_policy="evict_first",
+        )
+        acc = tl.zeros((1, BLOCK_K), dtype=tl.float32)
+        acc += w.to(tl.float32) * a[None, :].to(tl.float32)
+        gate = tl.sum(acc, axis=1).to(tl.bfloat16)
+        x = tl.load(rn_ptr + stream * HC_DIM + h)
+        mixed += tl.sigmoid(gate.to(tl.float32)) * x.to(tl.float32)
+    mixed /= HC
+    tl.store(y_ptr + i, mixed.to(y_ptr.dtype.element_ty))
+
+
+def hc_up_gate_mix_supported(w_up: torch.Tensor, hc_count: int, lora: torch.Tensor | None = None) -> bool:
+    """Whether :func:`hc_up_gate_mix` reproduces ``gemv`` on this shape: the bf16 GEMV tile must
+    be one row and one K step, the reduction the fused kernel mirrors."""
+    from freetoken.kernel.triton.gemv import _config
+
+    if w_up.dim() != 2 or w_up.dtype != torch.bfloat16 or w_up.stride(1) != 1:
+        return False
+    N, K = w_up.shape
+    if lora is not None and (
+        lora.dim() != 2 or lora.shape != (1, K) or lora.stride(1) != 1 or lora.dtype != torch.bfloat16
+    ):
+        return False
+    bn, bk, warps = _config(N, K)
+    return N % hc_count == 0 and bn == 1 and warps == 1 and K <= bk
+
+
+def hc_up_gate_mix(
+    lora: torch.Tensor,
+    w_up: torch.Tensor,
+    rn: torch.Tensor,
+    hc_count: int,
+    h_lo: int = 0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``hc_gate_mix(rn, gemv(hc_silu(lora), w_up), hc_count)`` for one token in one launch,
+    bit for bit (see :func:`hc_up_gate_mix_supported`). With ``out`` given, only hidden indices
+    ``[h_lo, h_lo + out.shape[1])`` are computed into it."""
+    from freetoken.kernel.triton.gemv import _config
+
+    N, K = w_up.shape
+    hc_dim = N // hc_count
+    assert rn.shape == (1, N) and rn.stride(1) == 1
+    _, bk, warps = _config(N, K)
+    if out is None:
+        out = rn.new_empty((1, hc_dim))
+    count = out.shape[1]
+    assert out.shape == (1, count) and out.stride(1) == 1 and 0 <= h_lo and h_lo + count <= hc_dim
+    _hc_up_gate_mix_kernel[(count,)](
+        lora, w_up, rn, out, K, w_up.stride(0), h_lo, 0, hc_dim,
+        HC=hc_count, HC_DIM=hc_dim, BLOCK_K=bk, num_warps=warps,
+    )
+    return out
+
+
 __all__ = [
     "grouped_gemma_rmsnorm",
     "hc_combine",
     "hc_combine_norm",
+    "hc_combine_rmsnorm",
     "hc_gate_mix",
     "hc_silu",
+    "hc_up_gate_mix",
+    "hc_up_gate_mix_supported",
 ]

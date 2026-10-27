@@ -22,7 +22,7 @@ from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.hc import GatedResidual
 from freetoken.models.qwen4_exp.ple import GpuResidentTable, PLELayer, PLEMetadata
 
-from .common import EOS, hash_constants, requires_cuda, toy_hf_config
+from .common import EOS, hash_constants, hf_config, requires_cuda, toy_hf_config
 
 
 def _config(num_layers: int = 4) -> ModelConfig:
@@ -129,6 +129,120 @@ def test_hc_merged_gemm_layout_and_top_level_mixer():
     )
     assert ref_inject is None
     assert torch.allclose(x, ref_x, rtol=1e-5, atol=1e-6)
+
+
+def _cuda_hc(use_combine: bool, seed: int, norm_dtype: torch.dtype):
+    """A GatedResidual at the shipping geometry (lowrank 320, 4 x 2560 streams) on the current
+    CUDA device, plus a second hc_norm standing in for the next mix's. A CPU generator, so every
+    device builds the same weights from the same seed."""
+    from freetoken.models.qwen4_exp.hc import GroupedPlusOneRMSNorm
+
+    config = parse_config(hf_config(hidden=2560, hc_lowrank=320))
+    args = config.qwen4_args
+    gen = torch.Generator().manual_seed(seed)
+
+    def rand(*shape, scale, dtype=torch.bfloat16):
+        return (torch.randn(*shape, generator=gen) * scale).to("cuda", dtype)
+
+    hc = GatedResidual(config, use_combine=use_combine)
+    width = args.ple_state_width
+    down = hc.input_mix_weight_down_block_inject if use_combine else hc.input_mix_weight_down
+    down.weight = rand(*down.weight.shape, scale=0.02)
+    hc.input_mix_weight_up.weight = rand(width, args.hc_lowrank, scale=0.05)
+    hc.hc_norm.weight = rand(width, scale=0.1, dtype=norm_dtype)
+    nxt = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, args.hc_count)
+    nxt.weight = rand(width, scale=0.1, dtype=norm_dtype)
+    return hc, nxt, args, rand
+
+
+@requires_cuda
+@pytest.mark.parametrize("use_combine", [True, False])
+@pytest.mark.parametrize("norm_dtype", [torch.float32, torch.bfloat16])
+def test_hc_fused_single_token_mix_is_bit_identical(monkeypatch, use_combine, norm_dtype):
+    """hc_silu -> up GEMV -> hc_gate_mix in one kernel gives the unfused chain's bits."""
+    from freetoken.kernel.triton import hc as hc_kernels
+    from freetoken.models.qwen4_exp import hc as hc_module
+
+    hc, _, args, rand = _cuda_hc(use_combine, seed=11, norm_dtype=norm_dtype)
+    calls = []
+    real = hc_kernels.hc_up_gate_mix
+    monkeypatch.setattr(hc_module, "hc_up_gate_mix", lambda *a, **k: calls.append(1) or real(*a, **k))
+    monkeypatch.setattr(hc_module, "get_p2p_comm", lambda: None)
+    for scale in (0.5, 1.0, 4.0):
+        R = rand(1, args.ple_state_width, scale=scale)
+        monkeypatch.setattr(hc_module, "HC_FUSE", False)
+        ref_x, ref_s = hc.mix(R)
+        monkeypatch.setattr(hc_module, "HC_FUSE", True)
+        x, s = hc.mix(R)
+        torch.testing.assert_close(x, ref_x, rtol=0, atol=0)
+        if use_combine:
+            torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+    assert len(calls) == 3
+
+
+@requires_cuda
+@pytest.mark.parametrize("tokens", [1, 5])
+@pytest.mark.parametrize("norm_dtype", [torch.float32, torch.bfloat16])
+def test_hc_combine_norm_is_bit_identical(tokens, norm_dtype):
+    """combine + the next mix's RMSNorm in one kernel gives hc_combine -> grouped_gemma_rmsnorm's bits."""
+    hc, nxt, args, rand = _cuda_hc(True, seed=12, norm_dtype=norm_dtype)
+    R = rand(tokens, args.ple_state_width, scale=1.0)
+    y = rand(tokens, args.hidden_size, scale=3.0)
+    s = rand(tokens, args.hc_count, scale=1.0)
+    got_R, got_rn = hc.combine_norm(R, y, s, nxt)
+    ref_R = hc.combine(R, y, s)
+    torch.testing.assert_close(got_R, ref_R, rtol=0, atol=0)
+    torch.testing.assert_close(got_rn, nxt.forward(ref_R), rtol=0, atol=0)
+
+
+def _hc_shard_worker(rank: int, port: int, q) -> None:
+    import os
+
+    import torch.distributed as dist
+
+    from freetoken.distributed.p2p_allreduce import P2PAllReduce
+    from freetoken.models.qwen4_exp import hc as hc_module
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.cuda.set_device(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=2)
+    comm = P2PAllReduce(rank, dist.group.WORLD)
+    ok = True
+    for use_combine in (True, False):
+        hc, _, args, rand = _cuda_hc(use_combine, seed=21, norm_dtype=torch.float32)
+        for scale in (0.5, 1.0, 4.0):
+            R = rand(1, args.ple_state_width, scale=scale)
+            hc_module.get_p2p_comm = lambda: None
+            ref_x, ref_s = hc.mix(R)
+            hc_module.get_p2p_comm = lambda: comm
+            x, s = hc.mix(R)
+            ok &= torch.equal(x, ref_x) and (s is None) == (ref_s is None)
+            ok &= s is None or torch.equal(s, ref_s)
+    q.put((rank, bool(ok)))
+    dist.destroy_process_group()
+
+
+@requires_cuda
+def test_hc_sharded_single_token_mix_is_bit_identical():
+    """Two peer-access ranks splitting the mix GEMV rows and all-gathering both halves give the
+    single-rank fused mix's bits, with and without the inject logits."""
+    import socket
+
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 2 or not torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("needs two GPUs with peer access")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_hc_shard_worker, args=(r, port, q)) for r in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=300)
+    assert dict(q.get(timeout=5) for _ in range(2)) == {0: True, 1: True}
 
 
 # --------------------------------------------------------------------------------------

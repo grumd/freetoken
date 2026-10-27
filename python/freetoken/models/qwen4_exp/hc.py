@@ -10,20 +10,43 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
+from freetoken.distributed import get_p2p_comm
+from freetoken.kernel.triton.gemv import gemv
 from freetoken.kernel.triton.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_combine_rmsnorm,
     hc_gate_mix,
     hc_silu,
+    hc_up_gate_mix,
+    hc_up_gate_mix_supported,
 )
 from freetoken.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+# Single-token mixes fuse hc_silu -> up GEMV -> hc_gate_mix, and a combine feeding the next
+# mix fuses with its RMSNorm; both bit-identical. FREETOKEN_HC_FUSE=0 for A/B.
+HC_FUSE = os.getenv("FREETOKEN_HC_FUSE", "1") != "0"
+# On two peer-access ranks a single-token mix splits its (replicated) GEMV rows between them
+# and all-gathers both halves, still bit-identical. FREETOKEN_HC_SHARD=0 for A/B.
+HC_SHARD = os.getenv("FREETOKEN_HC_SHARD", "1") != "0"
+_TRITON_GEMV = os.getenv("FREETOKEN_TRITON_GEMV", "1") != "0"
+
+
+def _plain_gemv(linear: LinearReplicated) -> bool:
+    """Whether a single bf16 row through ``linear`` runs gemv.py's ``gemv``."""
+    return (
+        _TRITON_GEMV and linear.bias is None and linear.weight.dtype == torch.bfloat16
+        and type(linear.quant_method).__name__ == "UnquantizedLinearMethod"
+        and type(linear.quant_method.kernel).__name__ == "TorchLinearKernel"
+    )
 
 
 def grouped_plus_one_rms_norm(
@@ -121,9 +144,42 @@ class GatedResidual(BaseOP):
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+        return self.mix_normed(rn)
+
+    def mix_normed(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """:meth:`mix` from the already-normalized streams ``rn`` (CUDA only)."""
+        down = self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        # the fused kernel replays gemv's reduction, so take it only where gemv would run
+        fused = (
+            HC_FUSE and rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
+            and rn.dtype == torch.bfloat16 and _plain_gemv(down) and _plain_gemv(up)
+            and hc_up_gate_mix_supported(up.weight, self.hc_count)
+        )
+        comm = get_p2p_comm() if fused and HC_SHARD else None
+        if comm is not None and down.weight.shape[0] % 4 == 0 and self.hidden_size % 4 == 0:
+            return self._mix_sharded(rn, comm, down.weight, up.weight)
         lora, s = self._down(rn)
-        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        if fused and hc_up_gate_mix_supported(up.weight, self.hc_count, lora):
+            return hc_up_gate_mix(lora, up.weight, rn, self.hc_count), s
+        gate = up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
+
+    def _mix_sharded(self, rn, comm, w_down, w_up) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Each rank computes half the down rows and half the hidden indices with the
+        unsharded kernels, and the P2P all-gathers put the halves back together exactly."""
+        r = comm.rank
+        n = w_down.shape[0] // 2
+        down = rn.new_empty((1, 2 * n))
+        gemv(rn, w_down[r * n : (r + 1) * n], out=down[:, r * n : (r + 1) * n])
+        comm.all_gather(down[:, r * n : (r + 1) * n], down)
+        lora = down[:, : self.lowrank]
+        s = down[:, self.lowrank : self.lowrank + self.hc_count] if self.use_combine else None
+        half = self.hidden_size // 2
+        x = rn.new_empty((1, self.hidden_size))
+        hc_up_gate_mix(lora, w_up, rn, self.hc_count, h_lo=r * half, out=x[:, r * half : (r + 1) * half])
+        comm.all_gather(x[:, r * half : (r + 1) * half], x)
+        return x, s
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
@@ -149,6 +205,15 @@ class GatedResidual(BaseOP):
         if R.is_cuda:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
+
+    def combine_norm(
+        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor, norm: GroupedPlusOneRMSNorm
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`combine`, plus ``norm`` (the next mix's ``hc_norm``) of the result: ``(R', rn)``."""
+        if R.is_cuda and R.dim() == 2 and norm.weight.numel() == R.shape[1]:
+            return hc_combine_rmsnorm(R, y, s, norm.weight, norm.eps, self.hc_count)
+        R = self.combine(R, y, s)
+        return R, norm.forward(R)
 
 
 __all__ = ["GatedResidual", "GroupedPlusOneRMSNorm", "grouped_plus_one_rms_norm"]

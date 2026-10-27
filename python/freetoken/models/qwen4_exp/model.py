@@ -24,7 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .hc import GatedResidual
+from .hc import HC_FUSE, GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 
@@ -71,17 +71,37 @@ class Qwen4ExpDecoderLayer(BaseOP):
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        batch: Batch,
+        rn: torch.Tensor | None = None,
+        next_norm: GroupedPlusOneRMSNorm | None = None,
+    ):
+        """``rn``: the attention mix's normalized input, already produced by the previous layer's
+        fused combine. With ``next_norm`` the layer returns ``(R', next_norm(R'))``."""
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        if rn is None:
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
+        else:
+            block_input, inject = self.attn_hyper_connection.mix_normed(rn)
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        if HC_FUSE and hidden.is_cuda and hidden.dim() == 2 and hidden.shape[0] == 1:
+            hidden, rn = self.attn_hyper_connection.combine_norm(
+                hidden, block_output, inject, self.mlp_hyper_connection.hc_norm
+            )
+            block_input, inject = self.mlp_hyper_connection.mix_normed(rn)
+        else:
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        block_output = self.mlp.forward(block_input)
+        if next_norm is not None:
+            return self.mlp_hyper_connection.combine_norm(hidden, block_output, inject, next_norm)
+        return self.mlp_hyper_connection.combine(hidden, block_output, inject)
 
 
 class Qwen4ExpModel(BaseOP):
@@ -129,8 +149,22 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
-            hidden = layer.forward(hidden, batch)
+        layers = self.layers.op_list
+        # single-token steps hand each layer's final combine the next mix's norm (not across
+        # a PLE layer, which adds to R in between)
+        fuse = HC_FUSE and hidden.is_cuda and hidden.shape[0] == 1
+        rn = None
+        for i, layer in enumerate(layers):
+            next_norm = None
+            if fuse:
+                if i + 1 == len(layers):
+                    next_norm = self.hyper_connection_mixer.hc_norm
+                elif layers[i + 1].ple is None:
+                    next_norm = layers[i + 1].attn_hyper_connection.hc_norm
+            if next_norm is None:
+                hidden, rn = layer.forward(hidden, batch, rn), None
+            else:
+                hidden, rn = layer.forward(hidden, batch, rn, next_norm)
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
@@ -139,6 +173,8 @@ class Qwen4ExpModel(BaseOP):
         # Reference only; the top-level mixer is pure (no in-place mutation). Absent
         # under CUDA-graph replay (no Python runs), which the engine surfaces as None.
         batch.mtp_streams = hidden
+        if rn is not None:
+            return self.hyper_connection_mixer.mix_normed(rn)[0]
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
