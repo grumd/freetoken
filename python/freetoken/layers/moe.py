@@ -1,6 +1,6 @@
 import os
 import time
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Callable, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -147,7 +147,12 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
         reduce: bool = True,
+        during_copy: Callable[[], None] | None = None,
     ):
+        """``during_copy``: caller work independent of the experts. The offload decode runs it
+        while the step's expert copy is in flight; everywhere else it simply runs first."""
+        if during_copy is not None:
+            during_copy()
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -156,6 +161,11 @@ class MoELayer(BaseOP):
         )
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out) if reduce else out
+
+    def overlaps_decode_copy(self) -> bool:
+        """Whether single-token ``forward`` runs ``during_copy`` while expert weights stream in
+        (otherwise it runs first, and splitting work out for it only adds launches)."""
+        return False
 
 
 class OffloadMoELayer(MoELayer):
@@ -207,13 +217,19 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
         reduce: bool = True,
+        during_copy: Callable[[], None] | None = None,
     ):
         ctx = get_global_ctx()
         if ctx.batch.is_prefill and not self._fetch_routed_only(hidden_states):
+            if during_copy is not None:
+                during_copy()
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
-            final_hidden_states = self.decode_forward(hidden_states, router_logits)
+            final_hidden_states = self.decode_forward(hidden_states, router_logits, during_copy)
         return self._maybe_all_reduce(final_hidden_states) if reduce else final_hidden_states
+
+    def overlaps_decode_copy(self) -> bool:
+        return _COPY_OVERLAP and hasattr(getattr(self.quant_method, "kernel", None), "decode_overlapped")
 
     def _fetch_routed_only(self, hidden_states: torch.Tensor) -> bool:
         """Whether to fetch on demand (decode-style) instead of streaming whole layers.
@@ -266,6 +282,7 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        during_copy: Callable[[], None] | None = None,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -273,7 +290,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, during_copy)
 
     def prefill_forward(
         self,
@@ -309,6 +326,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        during_copy: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -322,30 +340,40 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # the early returns below have no slot copy to hide ``during_copy`` behind: it runs first
+        run_first = during_copy or (lambda: None)
         # --moe-verify-cpu: the MTP verify's routed experts run on the CPU executor (RAM
         # banks) even though decode_target is "gpu", so the verify's k+1 new tokens never
         # stream their experts over PCIe. Normal decode/prefill keep the GPU path.
         if self._cpu_experts_for(get_global_ctx().batch):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
+            run_first()
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
+            run_first()
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         if (cache.cpu_prefill is not None and hidden_states.size(0) <= cache.cpu_prefill.max_tokens
                 and get_global_ctx().batch.is_prefill):
+            run_first()
             return self._prefill_cpu_hybrid(cache, hidden_states, topk_weights, topk_ids)
         # Only a knob-extended prefill chunk gets here at this size; a big decode batch
         # keeps the capturable path below (torch.unique syncs).
         if (hidden_states.size(0) * self.top_k >= self.num_experts
                 and get_global_ctx().batch.is_prefill):
+            run_first()
             return self._prefill_fetch_routed(cache, hidden_states, topk_weights, topk_ids)
         from freetoken.moe import route_log
 
         if (log := route_log.current()) is not None:
             log.record_actual(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        if _COPY_OVERLAP and (out := self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids)) is not None:
+        if _COPY_OVERLAP and (
+            out := self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids, during_copy)
+        ) is not None:
             return out
+        if during_copy is not None:
+            during_copy()
         cache.copy_missing()
         return self._expert_gemm(
             cache,
@@ -566,9 +594,10 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        during_copy: Callable[[], None] | None = None,
     ) -> torch.Tensor | None:
-        """The staged copy runs on a side stream while the resident routes compute; None when
-        the expert kernel has no overlapped decode (the caller then copies and computes)."""
+        """The staged copy runs on a side stream while ``during_copy`` and then the resident
+        routes compute; None (nothing run) when the expert kernel has no overlapped decode."""
         hook = getattr(getattr(self.quant_method, "kernel", None), "decode_overlapped", None)
         if hook is None or not hidden_states.is_cuda or cache.is_unpinned_layer(self.layer_id):
             return None
@@ -579,6 +608,8 @@ class OffloadMoELayer(MoELayer):
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 cache.copy_missing()
+            if during_copy is not None:
+                during_copy()
 
         view = self._expert_view(cache, cache.bank_views(), None, cache.alphas_for_slots(self.layer_id), topk_ids)
         return hook(

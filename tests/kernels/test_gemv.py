@@ -47,6 +47,23 @@ def test_gemv3_equals_gemv_over_concat():
     torch.testing.assert_close(gemv3(x, *ws), gemv(x, torch.cat(ws)), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_gemv3_split_router_first_is_bit_identical(seed):
+    """Qwen4ExpMoE's early-router decode at the q38 TP=2 shapes: the router rows alone, then gemv3
+    over the rest with an empty middle matrix, both into the front's row, reproduce the one-launch
+    gemv3 bit for bit."""
+    from freetoken.kernel.triton.gemv import gemv, gemv3
+
+    torch.manual_seed(seed)
+    x = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    r, gu, g = (torch.randn(n, 2560, device="cuda", dtype=torch.bfloat16) * 0.02 for n in (512, 640, 1))
+    full = gemv3(x, r, gu, g)
+    front = torch.empty_like(full)
+    gemv(x, r, out=front[:, :512])
+    gemv3(x, gu, gu[:0], g, out=front[:, 512:])
+    torch.testing.assert_close(front, full, rtol=0, atol=0)
+
+
 def test_linear_kernel_takes_gemv_only_for_one_bf16_row(monkeypatch):
     from freetoken.layers.quantization.linear import unquantized
 

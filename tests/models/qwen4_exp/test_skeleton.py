@@ -517,6 +517,49 @@ def test_shared_expert_gate_fusion_matches_eager():
 
 
 @requires_cuda
+def test_early_router_decode_is_bit_identical(monkeypatch):
+    """The early-router decode (router GEMV alone, shared expert run separately) against the
+    one-launch gemv3 front, bit for bit, routing included. q38's router (512 experts, top-10) puts
+    its input row stride on both sides of triton's divisibility specialization (512 alone vs the
+    front's 512 + 128 + 1), which changes its softmax sum order unless the logits keep the front's
+    row; a one-ulp routing weight rarely survives into the bf16 output, so the routing is
+    compared directly."""
+    from freetoken.layers import moe as layer_mod
+    from freetoken.models.qwen4_exp import moe as moe_mod
+    from freetoken.utils.torch_utils import torch_dtype
+
+    routes = []
+
+    def recording_topk(*args, **kwargs):
+        w, ids = fused_topk(*args, **kwargs)
+        routes.append((w.clone(), ids.clone()))
+        return w, ids
+
+    fused_topk = layer_mod.fused_topk
+    monkeypatch.setattr(layer_mod, "fused_topk", recording_topk)
+
+    config = parse_config(toy_hf_config(4, num_experts=512, num_experts_per_tok=10, moe_intermediate_size=16))
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    with torch.device(device), torch_dtype(dtype):
+        moe = moe_mod.Qwen4ExpMoE(config, 0)
+    _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=False, is_decode=True))
+    moe.fuse_decode_front()
+    assert moe._front and not moe.experts.overlaps_decode_copy()
+    # resident experts have no copy to hide the shared expert behind; force the split path
+    monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
+    gen = torch.Generator(device=device).manual_seed(5)
+    for _ in range(16):
+        x = torch.randn(1, config.hidden_size, device=device, dtype=dtype, generator=gen)
+        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", False)
+        ref = moe.forward(x.clone())
+        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", True)
+        torch.testing.assert_close(moe.forward(x.clone()), ref, rtol=0, atol=0)
+        (w0, i0), (w1, i1) = routes[-2:]
+        assert torch.equal(i0, i1) and torch.equal(w0.view(torch.int32), w1.view(torch.int32))
+
+
+@requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_tokens,hidden", [(1, 2560), (7, 640)])
 def test_shared_gate_kernels_match_torch(num_tokens, hidden, dtype):

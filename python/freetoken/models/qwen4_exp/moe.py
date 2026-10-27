@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,6 +9,11 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+# Single-token steps whose expert kernel overlaps the copy score the router alone and run the shared
+# expert while the routed experts' copy is in flight, so a miss starts streaming ~10 us earlier.
+# Same tiles, same bits; FREETOKEN_EARLY_ROUTER=0 for A/B.
+_EARLY_ROUTER = os.getenv("FREETOKEN_EARLY_ROUTER", "1") != "0"
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -38,15 +44,46 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         shared = self.shared_expert.down_proj.forward(silu_and_mul(out[:, a : a + b]), reduce=False)
         return out[:, :a], shared, out[:, a + b]
 
+    def _decode_shared(self, hidden_states: torch.Tensor, out: torch.Tensor):
+        """:meth:`_decode_front` past the router, into ``out`` (its row after the router logits):
+        (shared-expert output, raw gate logit). The empty middle matrix keeps gemv3's two-row tile,
+        so every row reduces as it did in the one launch."""
+        from freetoken.kernel.triton.gemv import gemv3
+        from freetoken.layers import silu_and_mul
+
+        gu = self.shared_expert.gate_up_proj.weight
+        gemv3(hidden_states, gu, gu[:0], self.shared_expert_gate.weight, out=out)
+        b = gu.shape[0]
+        shared = self.shared_expert.down_proj.forward(silu_and_mul(out[:, :b]), reduce=False)
+        return shared, out[:, b]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if num_tokens == 1 and getattr(self, "_front", False) and hidden_states.is_contiguous():
-            router_logits, shared, gate_logit = self._decode_front(hidden_states)
-            self._log_route_lookahead(hidden_states, num_tokens)
-            routed = self.experts.forward(
-                hidden_states=hidden_states, router_logits=router_logits, reduce=False
-            )
+            if _EARLY_ROUTER and self.experts.overlaps_decode_copy():
+                from freetoken.kernel.triton.gemv import gemv
+
+                # The router kernel's tile layout follows its input's row stride (triton specializes
+                # it), so the logits keep the one-launch front's row: same stride, same routing bits.
+                a = self.gate.weight.shape[0]
+                front = hidden_states.new_empty(
+                    (1, a + self.shared_expert.gate_up_proj.weight.shape[0] + self.shared_expert_gate.weight.shape[0])
+                )
+                router_logits = gemv(hidden_states, self.gate.weight, out=front[:, :a])
+                res = []
+                self._log_route_lookahead(hidden_states, num_tokens)
+                routed = self.experts.forward(
+                    hidden_states=hidden_states, router_logits=router_logits, reduce=False,
+                    during_copy=lambda: res.append(self._decode_shared(hidden_states, front[:, a:])),
+                )
+                shared, gate_logit = res[0]
+            else:
+                router_logits, shared, gate_logit = self._decode_front(hidden_states)
+                self._log_route_lookahead(hidden_states, num_tokens)
+                routed = self.experts.forward(
+                    hidden_states=hidden_states, router_logits=router_logits, reduce=False
+                )
             out = shared_gate_mul_add(routed, shared, gate_logit, gate_is_logit=True)
             return self.experts._maybe_all_reduce(out).view(num_tokens, hidden_dim)
         # one TP all_reduce for routed + gated shared (see Qwen3_5MoE.forward)

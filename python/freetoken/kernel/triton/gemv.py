@@ -91,14 +91,17 @@ def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> t
     return out
 
 
-def gemv3(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+def gemv3(
+    x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """``x @ cat(w0, w1, w2).T`` -> [1, N0 + N1 + N2] in one launch, without the concat."""
     K = x.shape[1]
     N0, N1, N2 = w0.shape[0], w1.shape[0], w2.shape[0]
     bn, bk, warps = _config(N0 + N1 + N2, K)
     while N0 % bn or N1 % bn:
         bn //= 2
-    out = torch.empty((1, N0 + N1 + N2), dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty((1, N0 + N1 + N2), dtype=x.dtype, device=x.device)
     _gemv3_kernel[(triton.cdiv(N0, bn) + triton.cdiv(N1, bn) + triton.cdiv(N2, bn),)](
         x, w0, w1, w2, out, N0, N1, N2, K, w0.stride(0), w1.stride(0), w2.stride(0),
         BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps,
