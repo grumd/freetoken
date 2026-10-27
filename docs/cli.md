@@ -125,7 +125,8 @@ With `--elastic-kv`, KV pages and MoE expert slots share one pool of VRAM at run
 | `--elastic-kv-min-tokens` | 16384 | KV tokens that always stay backed |
 | `--elastic-kv-step-tokens` | 16384 | KV grows and shrinks in steps of this many tokens |
 | `--elastic-keep-requests` | auto | Cached prefixes untouched by this many admissions are dropped (or spilled to the RAM tier) before KV takes expert slots; auto = max(4, 2 x max running requests), max(2, ...) with `--cache-ram-gb` |
-| `--prefill-reserve-gb` | auto | VRAM per GPU kept back for prefill activations; auto = 2 GiB per 8192-token prefill chunk |
+| `--prefill-reserve-gb` | auto | VRAM per GPU kept back for prefill activations; auto = 256 MiB + 230 KiB per token of `--max-prefill-length` (2.0 GiB at 8192, 1.2 at 4096, 0.7 at 2048) |
+| `--elastic-lend-after` | 1 | Decode steps with no prefill waiting after which the idle prefill reserve is lent to the expert cache until the next prefill; one ~80 ms gap per turn. 0 never lends |
 | `--cache-ram-gb` | 0 | Pinned host RAM (GiB, total over all GPUs) that evicted prompt prefixes and their GDN snapshots spill to; a later request with that prefix reloads them instead of prefilling again. Hybrid GDN models; preallocated at startup |
 
 ### PLE — Qwen3.8-Flash-Next n-gram table

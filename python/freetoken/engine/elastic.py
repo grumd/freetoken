@@ -10,6 +10,13 @@ At runtime the scheduler grows KV when its free pages run out (:meth:`grow`, whi
 coldest expert slots) and shrinks it back when idle (:meth:`shrink`). Both are deterministic
 functions of the replicated scheduler state, so every TP rank moves the same pages at the
 same step; only the slot counts may differ per rank (bank shards can differ in size).
+
+Decode also borrows the prefill workspace: after ``lend_after`` decode steps with no prefill
+waiting, :meth:`lend` turns the VRAM it left free into extra expert slots, and :meth:`reclaim`
+hands it back before the next prefill (or at idle, between turns). A lend stalls decode ~80 ms
+once, mostly torch releasing its cached activations, which blocks decode even from another
+thread (kbench/bench_bg_lend.py); the extra slots are worth ~0.5 ms per token at TP=2 and
+several ms at TP=1 on RTX 3080s.
 """
 
 from __future__ import annotations
@@ -25,6 +32,10 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+# VRAM left beyond the keep-free margin while lent: decode's eager temporaries (sampling,
+# page bookkeeping) still allocate through torch
+_LEND_DECODE_MARGIN = 256 << 20
+
 
 class ElasticVram:
     def __init__(
@@ -36,6 +47,7 @@ class ElasticVram:
         floor_slots: int,
         cap_slots: int,
         cap_pages: int,
+        lend_after: int = 0,
     ) -> None:
         assert 0 < min_pages <= cap_pages and floor_slots <= cap_slots
         self.device = device
@@ -55,6 +67,11 @@ class ElasticVram:
         self._banks: List[Tuple[ElasticTensor, int]] = []
         self.transitions = 0
         self.transition_ms = 0.0
+        # decode-time lending of the prefill workspace (0 = never)
+        self.lend_after = lend_after
+        self.lent = 0  # chunks borrowed beyond the persistent pool
+        self._quiet_steps = 0
+        self._keep_free = 0
 
     # ------------------------------------------------------------- allocation hooks
     def kv_tier(self, role: str, shape, dtype: torch.dtype, intervals) -> torch.Tensor:
@@ -82,9 +99,10 @@ class ElasticVram:
     def _bank_chunks(self, slots: int) -> int:
         return sum(t.count_required([(0, slots * row)]) for t, row in self._banks)
 
-    def _max_slots(self, pages: int) -> int:
-        """Most expert slots that fit beside ``pages`` KV pages in the pool."""
-        budget = self.pool.num_handles - self._kv_chunks(pages)
+    def _max_slots(self, pages: int, handles: int | None = None) -> int:
+        """Most expert slots that fit beside ``pages`` KV pages in ``handles`` chunks (default:
+        the whole pool, lent chunks included)."""
+        budget = (self.pool.num_handles if handles is None else handles) - self._kv_chunks(pages)
         lo, hi = self.floor_slots, self.cap_slots
         if self._bank_chunks(lo) > budget:
             raise RuntimeError(f"{pages} KV pages leave no room for {lo} expert slots")
@@ -133,6 +151,7 @@ class ElasticVram:
             torch.distributed.all_reduce(limit, op=torch.distributed.ReduceOp.MIN, group=tp_group)
         self.limit_pages = int(limit.item())
         self._tp_group = tp_group
+        self._keep_free = keep_free_bytes
         self._resize(self.pages, self._max_slots(self.pages))
         kv_page, slot = self.bytes_per()
         logger.info_rank0(
@@ -159,6 +178,40 @@ class ElasticVram:
         if pages < self.pages:
             self._resize(pages, self._max_slots(pages))
 
+    def decode_step(self, prefill_pending: bool) -> None:
+        """Once per decode batch: lend the prefill workspace after ``lend_after`` steps in a row
+        with no prefill waiting."""
+        self._quiet_steps += 1
+        if (self.lend_after and not self.lent and not prefill_pending
+                and self._quiet_steps >= self.lend_after):
+            self.lend()
+
+    def lend(self) -> int:
+        """Turn the VRAM free beside the pool (the idle prefill workspace) into expert slots."""
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()  # the last prefill's activations, cached by torch
+        free = torch.cuda.mem_get_info(self.device)[0]
+        n = (free - self._keep_free - _LEND_DECODE_MARGIN) // self.pool.chunk_bytes
+        # no further than the bank reservations reach
+        n = min(n, self._kv_chunks(self.pages) + self._bank_chunks(self.cap_slots) - self.pool.num_handles)
+        if n <= 0:
+            return 0
+        self.pool.create(n)
+        self.lent = n
+        self._resize(self.pages, self._max_slots(self.pages), why="lend")
+        return n
+
+    def reclaim(self) -> None:
+        """Give lent chunks back to the driver, coldest expert slots first. Before any prefill,
+        any KV growth and any idle-time page work: those allocate through torch."""
+        self._quiet_steps = 0
+        if not self.lent:
+            return
+        persistent = self.pool.num_handles - self.lent
+        self._resize(self.pages, self._max_slots(self.pages, persistent), why="reclaim")
+        self.pool.release(self.lent)
+        self.lent = 0
+
     def move_pages(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Copy whole KV pages ``src`` -> ``dst`` (disjoint sets) across every page-scaled tier."""
         src, dst = src.to(self.device, torch.long), dst.to(self.device, torch.long)
@@ -168,7 +221,7 @@ class ElasticVram:
                 view[dst[i : i + 256]] = view[src[i : i + 256]]
         torch.cuda.synchronize(self.device)
 
-    def _resize(self, pages: int, slots: int) -> None:
+    def _resize(self, pages: int, slots: int, why: str = "") -> None:
         t0 = time.perf_counter()
         old_pages, old_slots = self.pages, self.slots
         torch.cuda.synchronize(self.device)
@@ -200,8 +253,8 @@ class ElasticVram:
         self.transition_ms += ms
         if old_pages != pages or old_slots != slots:
             logger.info_rank0(
-                f"elastic: kv {old_pages}->{pages} pages, experts {old_slots}->{slots} slots"
-                f"{f' ({moved} kept)' if moved else ''}, {ms:.1f} ms"
+                f"elastic{f' {why}' if why else ''}: kv {old_pages}->{pages} pages, experts "
+                f"{old_slots}->{slots} slots{f' ({moved} kept)' if moved else ''}, {ms:.1f} ms"
             )
 
     def stats(self) -> dict:
@@ -210,6 +263,7 @@ class ElasticVram:
             "kv_pages_limit": self.limit_pages,
             "expert_slots": self.slots,
             "expert_slots_floor": self.floor_slots,
+            "lent_chunks": self.lent,
             "transitions": self.transitions,
             "transition_ms": round(self.transition_ms, 1),
         }

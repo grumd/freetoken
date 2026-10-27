@@ -963,6 +963,16 @@ def parse_args(
         ),
     )
     elastic_group.add_argument(
+        "--elastic-lend-after",
+        type=int,
+        default=ServerArgs.elastic_lend_after,
+        help=(
+            "With --elastic-kv: after this many decode steps with no prefill waiting, lend the "
+            "idle prefill reserve to the expert cache until the next prefill (one ~80 ms gap per "
+            "turn, faster decode after). 1 = right after the first token, 0 never lends."
+        ),
+    )
+    elastic_group.add_argument(
         "--cache-ram-gb",
         type=float,
         default=ServerArgs.cache_ram_gb,
@@ -1170,6 +1180,8 @@ def parse_args(
             parser.error("--elastic-kv sizes the expert cache itself; drop --moe-cache-size/-rate")
         if kwargs["vram_keep_free_mb"] < 0 or kwargs["elastic_kv_step_tokens"] <= 0:
             parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
+        if kwargs["elastic_lend_after"] < 0:
+            parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
 
     # --memory-ratio takes a single float or a per-GPU list; a list is the same
     # override set as --gpu-memory-ratio (combining both is ambiguous).

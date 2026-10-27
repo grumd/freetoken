@@ -134,14 +134,13 @@ def resolve_moe_cache_auto(
 
 
 def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: int) -> int:
-    """VRAM kept back for prefill activations under --elastic-kv. Auto: 2 GiB per 8192-token chunk,
-    scaled up for larger chunks. A full 261.5k-token prefill on Qwen3.8-Flash-Next (2x RTX 3080,
-    2026-10-27) peaked at 1.81-2.16 GiB over the idle footprint; with 2.25 GiB kept back it still
-    left 445-817 MiB above a 128 MiB keep-free margin. One unsplit GPU peaked at 1.92 GiB on a
-    233k-token prompt, so the same auto value covers TP=1."""
+    """VRAM kept back for prefill activations under --elastic-kv. Auto: 256 MiB + 230 KiB per
+    token of the prefill chunk (--max-prefill-length). Qwen3.8-Flash-Next FP4 prefills at 261k
+    tokens of depth peaked 526 / 947 / 2030 MiB over the idle footprint with 2048 / 4096 / 8192-
+    token chunks (RTX 3080, 2026-10-27), the same on one unsplit GPU as on each TP=2 rank."""
     if prefill_reserve_gb is not None:
         return int(prefill_reserve_gb * 2**30)
-    return int(2 * 2**30 * max(1.0, max_extend_tokens / 8192))
+    return (256 << 20) + 230 * 1024 * max_extend_tokens
 
 
 def plan_elastic_geometry(
@@ -155,14 +154,16 @@ def plan_elastic_geometry(
     floor_slots: int,
     min_pages: int,
     max_slots: int | None = None,
+    lendable_bytes: int = 0,
 ) -> tuple[int, int]:
     """Upper bounds (cap_slots, cap_pages) for --elastic-kv's virtual reservations.
 
     ``budget_bytes`` is free VRAM before the expert banks, minus the fixed pools, the prefill
     reserve and the keep-free margin; the CUDA graphs and allocator slack land later, so the
     pool the engine finally builds is a little smaller and these caps are never all reachable
-    at once. Experts at most fill the budget beside ``min_pages`` of KV; KV at most fills it
-    beside ``floor_slots`` experts.
+    at once. Experts at most fill the budget beside ``min_pages`` of KV, plus
+    ``lendable_bytes`` (the prefill reserve, lent to them during long decodes); KV at most
+    fills the budget beside ``floor_slots`` experts.
     """
     hard_floor = 2 * num_experts if prefill_overlap else num_experts
     if floor_slots < hard_floor:
@@ -172,7 +173,7 @@ def plan_elastic_geometry(
                if prefill_overlap else "a prefill materializes a whole expert layer")
         )
     hi = total_experts if max_slots is None else min(total_experts, max_slots)
-    cap_slots = min(hi, (budget_bytes - min_pages * cache_per_page) // per_expert_bytes)
+    cap_slots = min(hi, (budget_bytes + lendable_bytes - min_pages * cache_per_page) // per_expert_bytes)
     if cap_slots < floor_slots:
         raise ValueError(
             f"elastic VRAM budget {budget_bytes / 2**30:.2f} GiB holds only {max(cap_slots, 0)} "

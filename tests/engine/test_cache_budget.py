@@ -508,10 +508,11 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
 def test_prefill_reserve_auto_scales_with_the_chunk_and_honors_an_override():
     from freetoken.engine.cache_budget import prefill_reserve_bytes
 
-    gib = 2**30
-    assert prefill_reserve_bytes(None, 8192) == 2 * gib
-    assert prefill_reserve_bytes(None, 4096) == 2 * gib  # never below the measured peak
-    assert prefill_reserve_bytes(None, 16384) == 4 * gib
+    gib, mib = 2**30, 2**20
+    # above each chunk size's measured peak (2030 / 947 / 526 MiB), and less for smaller chunks
+    for chunk, peak in ((8192, 2030), (4096, 947), (2048, 526)):
+        assert peak * mib < prefill_reserve_bytes(None, chunk) < (peak + 260) * mib
+    assert prefill_reserve_bytes(None, 16384) > 2 * prefill_reserve_bytes(None, 8192) - 512 * mib
     assert prefill_reserve_bytes(1.5, 16384) == int(1.5 * gib)
 
 
@@ -527,6 +528,9 @@ def test_elastic_geometry_caps_each_side_beside_the_other_ones_minimum():
     # the kernel's slot limit and the expert count both cap the slots
     assert plan_elastic_geometry(budget_bytes=10_000 * MiB, max_slots=4096, **kw)[0] == 4096
     assert plan_elastic_geometry(budget_bytes=10**9 * MiB, **kw)[0] == 48 * 512
+    # the lendable prefill reserve widens only the expert reservation
+    lent = plan_elastic_geometry(budget_bytes=10_000 * MiB, lendable_bytes=2048 * MiB, **kw)
+    assert lent == (10_000 - 128 + 2048, cap_pages)
 
 
 def test_elastic_geometry_rejects_a_floor_below_the_prefill_double_buffer():

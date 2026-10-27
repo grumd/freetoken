@@ -18,6 +18,10 @@ class _Elastic:
     def __init__(self, pages, limit, step, min_pages):
         self.pages, self.limit_pages, self.step_pages, self.min_pages = pages, limit, step, min_pages
         self.calls = []
+        self.reclaims = 0  # the lent prefill reserve handed back
+
+    def reclaim(self):
+        self.reclaims += 1
 
     def growable_pages(self):
         return self.limit_pages - self.pages
@@ -62,8 +66,10 @@ def test_pages_come_lowest_first_and_a_shortfall_grows_the_pool():
     cm._free(a[1:3].flip(0))
     assert cm.free_slots.tolist() == [1, 2, 5, 6, 7]  # sorted, not FIFO
     assert cm._allocate(2).tolist() == [1, 2]
+    assert el.reclaims == 0  # served from free pages: a lent reserve stays lent
     got = cm._allocate(10)  # 3 free, so grow by whole steps
     assert el.calls == [("grow", 8, 16)]
+    assert el.reclaims == 1  # growth and spills allocate, so the reserve comes back first
     assert got.tolist() == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     assert cm.free_slots.tolist() == [15]
 
@@ -72,6 +78,7 @@ def test_idle_shrink_returns_free_tail_but_never_a_cached_page():
     cm, el = _cm(pages=40, min_pages=8)
     held = cm._allocate(3)  # pages 0..2 stay in use
     cm.elastic_idle()
+    assert el.reclaims == 1  # between turns, before any page moves
     assert el.calls == [("shrink", 40, 16)]  # used 3 + one step of slack, rounded to a step
     assert cm.free_slots.tolist() == list(range(3, 16))
     cm._free(held)

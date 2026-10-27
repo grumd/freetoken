@@ -118,6 +118,41 @@ def test_kv_growth_takes_expert_slots_and_gives_them_back_intact():
 
 
 @CUDA
+def test_a_long_decode_borrows_the_prefill_reserve_and_hands_it_back_intact():
+    el, cache, kv = _build(spare_mib=8)
+    el.lend_after = 3
+    s0, handles0 = el.slots, el.pool.num_handles
+    _decode(cache, 50, seed=5)
+    _stamp(kv, 64)
+    el.decode_step(prefill_pending=False)
+    el.decode_step(prefill_pending=True)
+    el.decode_step(prefill_pending=True)
+    assert el.lent == 0  # a waiting prefill keeps the reserve
+    el.decode_step(prefill_pending=False)
+    assert el.lent > 0 and el.slots == L * E and cache.active_slots == el.slots
+    _decode(cache, 50, seed=6)
+    _coherent(cache)
+    _no_leak(el)
+
+    el.reclaim()
+    assert el.lent == 0 and el.slots == s0 and el.pool.num_handles == handles0
+    _check_stamp(kv, 64)
+    _coherent(cache)
+    _decode(cache, 30, seed=7)
+    _no_leak(el)
+    el.decode_step(prefill_pending=False)
+    assert el.lent == 0  # the quiet-step count restarts after a reclaim
+
+
+@CUDA
+def test_lend_after_zero_never_lends():
+    el, cache, kv = _build(spare_mib=8)
+    for _ in range(200):
+        el.decode_step(prefill_pending=False)
+    assert el.lent == 0
+
+
+@CUDA
 def test_kv_growth_stops_where_experts_hit_their_floor():
     el, cache, kv = _build(spare_mib=8)
     assert el.limit_pages < 1024

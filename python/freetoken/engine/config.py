@@ -78,6 +78,9 @@ class EngineConfig:
     elastic_kv_min_tokens: int = 16384
     elastic_kv_step_tokens: int = 16384
     elastic_keep_requests: int | None = None
+    # Decode steps in a row (no prefill waiting) after which the idle prefill reserve is lent to
+    # the expert cache until the next prefill; 1 = right after the first token, 0 never lends.
+    elastic_lend_after: int = 1
     prefill_reserve_gb: float | None = None
     # Prefix RAM tier (hybrid GDN models): pinned host RAM, total across TP ranks, that evicted
     # prefixes and their GDN snapshots spill to instead of being dropped; 0 disables it.

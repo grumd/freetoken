@@ -791,6 +791,7 @@ class Engine:
             floor_slots=config.expert_cache_min_slots,
             min_pages=min_pages,
             max_slots=method.slot_limit() if method is not None else None,
+            lendable_bytes=self._elastic_reserve if config.elastic_lend_after > 0 else 0,
         )
         self.elastic = ElasticVram(
             self.device,
@@ -799,6 +800,7 @@ class Engine:
             floor_slots=config.expert_cache_min_slots,
             cap_slots=cap_slots,
             cap_pages=cap_pages,
+            lend_after=config.elastic_lend_after,
         )
         object.__setattr__(config, "moe_cache_size", cap_slots)
         object.__setattr__(config, "num_page_override", cap_pages)

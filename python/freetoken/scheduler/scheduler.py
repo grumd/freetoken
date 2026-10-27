@@ -1142,6 +1142,10 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        elastic = getattr(getattr(self, "engine", None), "elastic", None)
+        if elastic is not None and self.prefill_manager.runnable:
+            # a prefill needs its activation workspace back, and admission may reload from RAM
+            elastic.reclaim()
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
@@ -1149,6 +1153,8 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        if elastic is not None and not batch.is_prefill:
+            elastic.decode_step(prefill_pending=self.prefill_manager.runnable)
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
         if getattr(batch, "is_decode", False) and mtp._deferred:
             # MTP rounds deferred this iteration (prefill priority): keep their
