@@ -157,7 +157,9 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     }
     try:
         config = engine.config
-        pools["num_pages"] = int(engine.num_pages or 0)
+        elastic = getattr(engine, "elastic", None)
+        # elastic VRAM: the pages and slots backed right now, not the address-space caps
+        pools["num_pages"] = int(elastic.pages if elastic is not None else engine.num_pages or 0)
         if config is not None:
             pools["page_size"] = int(config.page_size or 0)
             # Window pool: its own page unit (swa_page_size -- DSV4 windows are P-token pages,
@@ -175,7 +177,7 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
                 pools["num_swa_pages"] = max(0, int(getattr(engine.kv_cache, "swa_num_tokens", 0) or 0) - 1)
         moe = engine.moe_offload_cache
         if moe is not None:
-            pools["moe_cache_size"] = int(moe.cache_size or 0)
+            pools["moe_cache_size"] = int(getattr(moe, "active_slots", None) or moe.cache_size or 0)
         lsp = engine.linear_state_pool
         if lsp is not None:
             pools["num_mamba_slots"] = max(0, int(lsp.num_slots or 0) - 1)

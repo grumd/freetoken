@@ -503,3 +503,41 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_prefill_reserve_auto_scales_with_the_chunk_and_honors_an_override():
+    from freetoken.engine.cache_budget import prefill_reserve_bytes
+
+    gib = 2**30
+    assert prefill_reserve_bytes(None, 8192) == 2 * gib
+    assert prefill_reserve_bytes(None, 4096) == 2 * gib  # never below the measured peak
+    assert prefill_reserve_bytes(None, 16384) == 4 * gib
+    assert prefill_reserve_bytes(1.5, 16384) == int(1.5 * gib)
+
+
+def test_elastic_geometry_caps_each_side_beside_the_other_ones_minimum():
+    from freetoken.engine.cache_budget import plan_elastic_geometry
+
+    MiB = 2**20
+    kw = dict(per_expert_bytes=MiB, cache_per_page=MiB // 2, num_experts=512,
+              total_experts=48 * 512, prefill_overlap=True, floor_slots=1024, min_pages=256)
+    cap_slots, cap_pages = plan_elastic_geometry(budget_bytes=10_000 * MiB, **kw)
+    assert cap_slots == 10_000 - 128  # beside 256 pages of 0.5 MiB
+    assert cap_pages == (10_000 - 1024) * 2  # beside the 1024-slot floor
+    # the kernel's slot limit and the expert count both cap the slots
+    assert plan_elastic_geometry(budget_bytes=10_000 * MiB, max_slots=4096, **kw)[0] == 4096
+    assert plan_elastic_geometry(budget_bytes=10**9 * MiB, **kw)[0] == 48 * 512
+
+
+def test_elastic_geometry_rejects_a_floor_below_the_prefill_double_buffer():
+    import pytest
+    from freetoken.engine.cache_budget import plan_elastic_geometry
+
+    MiB = 2**20
+    kw = dict(budget_bytes=10_000 * MiB, per_expert_bytes=MiB, cache_per_page=MiB,
+              num_experts=512, total_experts=48 * 512, min_pages=16)
+    with pytest.raises(ValueError, match="below 1024"):
+        plan_elastic_geometry(prefill_overlap=True, floor_slots=1000, **kw)
+    assert plan_elastic_geometry(prefill_overlap=False, floor_slots=512, **kw)[0] > 512
+    with pytest.raises(ValueError, match="holds only"):
+        plan_elastic_geometry(**{**kw, "budget_bytes": 900 * MiB}, prefill_overlap=True, floor_slots=1024)

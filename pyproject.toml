@@ -35,6 +35,9 @@ classifiers = [
 # there is no lockfile.
 dependencies = [
     "apache-tvm-ffi==0.1.13.post3", # pin it
+    # --elastic-kv: CUDA VMM driver calls (kernel/vmm.py). torch's cu130 wheel already pulls
+    # it in; declared because we import it directly. Range matches torch 2.11's.
+    "cuda-bindings>=13.0.3,<14; platform_system == 'Linux'",
     "einops>=0.8,<1",
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.

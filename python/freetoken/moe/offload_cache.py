@@ -120,6 +120,11 @@ _BANK_BYTES_PER_EXPERT = {
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
 
+# Usage stamp of an inactive (elastic, unbacked) slot. Above any real step (one per ensure call)
+# so the argmin victim scans never pick it, below the INT64_MAX they use for claimed and padding
+# lanes, and small enough that lru_ensure's packed (usage << slot_bits) | slot key cannot overflow.
+FENCE_USAGE = 1 << 45
+
 
 @dataclass
 class OffloadMoeCache:
@@ -175,6 +180,11 @@ class OffloadMoeCache:
     # over PCIe instead (see OffloadMoELayer._prefill_cpu_hybrid).
     cpu_prefill: object | None = None
     cpu_prefill_fetch: float = 0.35
+    # Elastic VRAM (--elastic-kv): ``bank_alloc(name, shape, dtype)`` returns each bank's slot
+    # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
+    # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.
+    bank_alloc: object | None = None
+    active_slots: int | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -213,6 +223,12 @@ class OffloadMoeCache:
             device=self.device,
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        if self.active_slots is None:
+            self.active_slots = self.cache_size
+        assert self.num_experts <= self.active_slots <= self.cache_size, (
+            f"active_slots {self.active_slots} outside [{self.num_experts}, {self.cache_size}]"
+        )
+        self._apply_fence()
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
@@ -385,11 +401,11 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
-            )
+            shape = (self.cache_size, *head.shape[1:])
+            if self.bank_alloc is not None:
+                self.bank_caches[name] = self.bank_alloc(name, shape, head.dtype)
+            else:
+                self.bank_caches[name] = torch.empty(shape, dtype=head.dtype, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
@@ -503,6 +519,8 @@ class OffloadMoeCache:
         ``ctx.moe_offload_cache`` stay valid.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
+        if self.bank_alloc is not None:
+            raise RuntimeError("an elastic slot cache resizes through shrink_active/grow_active, not rebuild")
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
@@ -942,9 +960,73 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        self._apply_fence()  # reset_cache zeroes every slot's usage, inactive ones included
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+
+    def _apply_fence(self) -> None:
+        if self.active_slots < self.cache_size:
+            self.usage[self.active_slots :].fill_(FENCE_USAGE)
+
+    def bank_row_bytes(self) -> dict[str, int]:
+        """Bytes of one slot's row in each bank cache."""
+        return {
+            name: math.prod(cache.shape[1:]) * cache.element_size()
+            for name, cache in self.bank_caches.items()
+        }
+
+    def shrink_active(self, n: int) -> int:
+        """Retire slots ``[n, active_slots)`` and return how many experts moved down.
+
+        The retired slots' most recently used experts are copied over the least recently used
+        slots below ``n`` when they are hotter, so the survivors are what an ``n``-slot LRU
+        would hold; everything left in the retired range is evicted and fenced. The device must
+        be idle (no forward reading the tables or banks), and the caller unmaps the retired
+        rows afterwards.
+        """
+        old = self.active_slots
+        floor = 2 * self.num_experts if self.prefill_overlap else self.num_experts
+        assert floor <= n <= old, f"cannot shrink {old} -> {n} slots (floor {floor})"
+        if n == old:
+            return 0
+        flat = self.slot_for_id.view(-1)
+        tail_ids = self.id_of_slot[n:old]
+        resident = (tail_ids >= 0).nonzero().squeeze(1)
+        moved = 0
+        if resident.numel():
+            k = min(int(resident.numel()), n)
+            hot_use, hot_order = self.usage[n:old][resident].sort(descending=True)
+            cold_use, cold_slot = self.usage[:n].sort()
+            # hot descends and cold ascends, so the profitable pairs are a prefix
+            moved = int((hot_use[:k] > cold_use[:k]).sum())
+            if moved:
+                src = resident[hot_order[:moved]] + n
+                dst = cold_slot[:moved]
+                for _, cache in self.banks:
+                    rows = cache.view(cache.shape[0], -1).view(torch.uint8)
+                    for i in range(0, moved, 64):  # bound the gather temporary
+                        rows[dst[i : i + 64]] = rows[src[i : i + 64]]
+                dst_old = self.id_of_slot[dst]
+                flat[dst_old[dst_old >= 0].long()] = -1
+                src_ids = self.id_of_slot[src]
+                self.id_of_slot[dst] = src_ids
+                self.usage[dst] = self.usage[src]
+                flat[src_ids.long()] = dst.to(torch.int32)
+                self.id_of_slot[src] = -1
+        tail_ids = self.id_of_slot[n:old]
+        flat[tail_ids[tail_ids >= 0].long()] = -1
+        self.id_of_slot[n:old] = -1
+        self.active_slots = n
+        self._apply_fence()
+        return moved
+
+    def grow_active(self, n: int) -> None:
+        """Open slots ``[active_slots, n)`` as empty, first-to-fill LRU slots. The caller maps
+        their rows first."""
+        assert self.active_slots <= n <= self.cache_size, (self.active_slots, n, self.cache_size)
+        self.usage[self.active_slots : n] = 0
+        self.active_slots = n
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -1047,7 +1129,7 @@ class OffloadMoeCache:
         valid = total > 0
         if int(valid.sum()) == 0:
             return {}
-        slots_per_layer = self.cache_size / self.num_layers
+        slots_per_layer = self.active_slots / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
         oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()

@@ -89,6 +89,11 @@ class PrefillAdder:
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
                 return self.cache_manager.unlock(handle)
 
+        if self.cache_manager.elastic is not None:
+            self.cache_manager.note_admission(handle)
+            # back the whole prompt now: one pool resize instead of one per prefill chunk
+            self.cache_manager.reserve_pages(div_ceil(extend_len, self.cache_manager.page_size))
+
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]

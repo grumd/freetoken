@@ -113,6 +113,21 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--expert-load` | auto | How expert banks are read into host RAM: `auto` (parallel for scattered experts, serial when RAM is tight), `serial`, `parallel` |
 | `--expert-load-workers` | 16 | Parallel expert-bank reader thread count |
 
+### Elastic VRAM
+
+With `--elastic-kv`, KV pages and MoE expert slots share one pool of VRAM at runtime instead of being split once at startup: experts take whatever the live context does not need, and give slots back (coldest first) when the context grows. Needs `--moe-strategy offload` with GPU decode; replaces `--memory-ratio`, `--kv-reserve-tokens` and `--moe-cache-size`/`-rate`, which are rejected with it. `--max-seq-len-override` still caps one request; the total over parallel requests is limited only by VRAM.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--elastic-kv` | off | Share VRAM between KV and the expert cache at runtime |
+| `--vram-keep-free-mb` | 128 | VRAM left free per GPU, also at the prefill peak |
+| `--expert-cache-min-slots` | 1024 | Expert slots KV growth never takes; at least 2 x num_experts (the prefill double buffer) |
+| `--elastic-kv-min-tokens` | 16384 | KV tokens that always stay backed |
+| `--elastic-kv-step-tokens` | 16384 | KV grows and shrinks in steps of this many tokens |
+| `--elastic-keep-requests` | auto | Cached prefixes untouched by this many admissions are dropped (or spilled to the RAM tier) before KV takes expert slots; auto = max(4, 2 x max running requests), max(2, ...) with `--cache-ram-gb` |
+| `--prefill-reserve-gb` | auto | VRAM per GPU kept back for prefill activations; auto = 2 GiB per 8192-token prefill chunk |
+| `--cache-ram-gb` | 0 | Pinned host RAM (GiB, total over all GPUs) that evicted prompt prefixes and their GDN snapshots spill to; a later request with that prefix reloads them instead of prefilling again. Hybrid GDN models; preallocated at startup |
+
 ### PLE — Qwen3.8-Flash-Next n-gram table
 
 | Flag | Default | Meaning |

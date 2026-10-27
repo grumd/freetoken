@@ -64,6 +64,24 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Elastic VRAM (--elastic-kv): KV pages and expert slots share one CUDA-VMM chunk pool and
+    # trade memory at runtime instead of splitting it once at startup. Replaces --memory-ratio
+    # and --kv-reserve-tokens: the pool is all VRAM left after the weights, the fixed pools,
+    # the CUDA graphs, the prefill workspace (prefill_reserve_gb, None = auto) and
+    # vram_keep_free_mb. Experts never drop below expert_cache_min_slots; KV never drops below
+    # elastic_kv_min_tokens and moves in elastic_kv_step_tokens steps. Prefix-cache leaves not
+    # touched by the last elastic_keep_requests admissions are dropped before KV takes slots
+    # (None = max(4, 2 x max_running_req); max(2, ...) with the RAM tier, which makes a spill cheap).
+    elastic_kv: bool = False
+    vram_keep_free_mb: int = 128
+    expert_cache_min_slots: int = 1024
+    elastic_kv_min_tokens: int = 16384
+    elastic_kv_step_tokens: int = 16384
+    elastic_keep_requests: int | None = None
+    prefill_reserve_gb: float | None = None
+    # Prefix RAM tier (hybrid GDN models): pinned host RAM, total across TP ranks, that evicted
+    # prefixes and their GDN snapshots spill to instead of being dropped; 0 disables it.
+    cache_ram_gb: float = 0.0
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill

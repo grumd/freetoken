@@ -108,6 +108,15 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             swa_eviction_interval=config.swa_eviction_interval,
+            elastic=self.engine.elastic,
+            # a cold prefix is cheap to bring back from the RAM tier, so spill sooner with one
+            keep_requests=(
+                config.elastic_keep_requests
+                if config.elastic_keep_requests is not None
+                else max(2 if self.engine.host_prefix_pool is not None else 4,
+                         2 * config.max_running_req)
+            ),
+            host_pool=self.engine.host_prefix_pool,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -213,6 +222,7 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        self.cache_manager.elastic_idle()
         self.cache_manager.check_integrity()
 
     @torch.inference_mode()
@@ -1021,8 +1031,8 @@ class Scheduler(SchedulerIOMixin):
         ):  # usable window tokens = pool tokens minus the slot-0 sentinel
             num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
         return dict(
-            num_pages=eng.num_pages,
-            moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
+            num_pages=eng.elastic.pages if eng.elastic is not None else eng.num_pages,
+            moe_cache_size=eng.moe_offload_cache.active_slots if eng.moe_offload_cache is not None else None,
             num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
             num_swa_pages=num_swa_pages,
         )

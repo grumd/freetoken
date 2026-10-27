@@ -1,12 +1,54 @@
 from __future__ import annotations
 
-from typing import Sequence
+from contextlib import contextmanager
+from typing import Callable, List, Sequence, Tuple
 
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
+
+# Elastic VRAM (--elastic-kv) installs an allocator around pool construction:
+# ``alloc(role, shape, dtype, intervals)`` returns the tensor for one page-scaled tier, where
+# ``intervals(num_pages)`` gives the byte ranges that must stay backed while pages
+# ``[0, num_pages)`` are usable. None = plain torch allocations.
+_TIER_ALLOC: Callable | None = None
+
+
+@contextmanager
+def elastic_tier_allocator(alloc: Callable):
+    global _TIER_ALLOC
+    _TIER_ALLOC = alloc
+    try:
+        yield
+    finally:
+        _TIER_ALLOC = None
+
+
+def paged_run_intervals(
+    num_runs: int, run_bytes: int, page_bytes: int, top_bytes: int
+) -> Callable[[int], List[Tuple[int, int]]]:
+    """Backed ranges of a tier laid out as ``num_runs`` equal runs of ``run_bytes``, each holding
+    one page's ``page_bytes`` per page from offset 0, and ending in ``top_bytes`` that are always
+    live (the dummy page, scratch rows)."""
+
+    def intervals(num_pages: int) -> List[Tuple[int, int]]:
+        out = []
+        for r in range(num_runs):
+            base = r * run_bytes
+            out.append((base, base + num_pages * page_bytes))
+            out.append((base + run_bytes - top_bytes, base + run_bytes))
+        return out
+
+    return intervals
+
+
+def alloc_tier(role, shape, dtype, device, intervals, *, zero: bool = False) -> torch.Tensor:
+    if _TIER_ALLOC is not None:
+        return _TIER_ALLOC(role, shape, dtype, intervals)
+    alloc = torch.zeros if zero else torch.empty
+    return alloc(shape, device=device, dtype=dtype)
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -52,10 +94,15 @@ class MHAKVCache(BaseKVCachePool):
                 layer_map[global_id] = dense
             self._layer_map = layer_map
             self._num_layers = map_size
-        self._kv_buffer = torch.empty(
+        self.elastic = _TIER_ALLOC is not None
+        page_bytes = page_size * local_kv_heads * head_dim * dtype.itemsize
+        self._kv_buffer = alloc_tier(
+            "kv",
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+            dtype,
+            device,
+            # the last page of every (k/v, layer) run is the dummy page padded rows point at
+            paged_run_intervals(2 * num_storage_layers, num_pages * page_bytes, page_bytes, page_bytes),
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
@@ -69,6 +116,8 @@ class MHAKVCache(BaseKVCachePool):
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
+        if self.elastic:
+            raise RuntimeError("an elastic KV pool resizes by remapping pages, not rebuild")
         _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
         dtype = self._kv_buffer.dtype
         device = self._device
@@ -115,6 +164,11 @@ class MHAKVCache(BaseKVCachePool):
         if dense < 0:
             raise KeyError(f"layer {layer_id} has no paged KV storage")
         return dense
+
+    def page_views(self) -> List[torch.Tensor]:
+        """Every page-scaled tier viewed with the page on dim 0, so gathering or scattering by
+        page index moves all of a page's bytes (elastic compaction, the prefix RAM tier)."""
+        return [self._kv_buffer.permute(2, 0, 1, 3, 4, 5)]
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[self._dense(index)]

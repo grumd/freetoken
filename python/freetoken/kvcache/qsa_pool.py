@@ -27,7 +27,7 @@ from typing import Sequence
 
 import torch
 
-from .mha_pool import MHAKVCache
+from .mha_pool import MHAKVCache, alloc_tier, paged_run_intervals
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
 _INDEX_DTYPE_BYTES = 2
@@ -106,19 +106,29 @@ class QSAKVCache(MHAKVCache):
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
         # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        # An elastic slab is zeroed chunk by chunk as it is mapped (and most of it is not).
+        if not self.elastic:
+            self._kv_buffer.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
         # never-written tail rows dotting to a finite 0. Written rows are never cleared again,
         # so the kernel must clamp visible blocks to kvlen // index_ratio.
         self._cmp_scratch_base = num_pages * self._page_size // self._index_ratio
-        self._cmp_k_buffer = torch.zeros(
-            self._num_index_layers,
-            self._cmp_scratch_base + self._num_req_slots,
-            self._index_head_dim,
-            dtype=self._index_dtype,
-            device=self._device,
+        rows = self._cmp_scratch_base + self._num_req_slots
+        row_bytes = self._index_head_dim * self._index_dtype.itemsize
+        page_bytes = self._page_size // self._index_ratio * row_bytes
+        self._cmp_k_buffer = alloc_tier(
+            "cmp_k",
+            (self._num_index_layers, rows, self._index_head_dim),
+            self._index_dtype,
+            self._device,
+            # the dummy page's rows and the scratch rows after them stay live
+            paged_run_intervals(
+                self._num_index_layers, rows * row_bytes, page_bytes,
+                page_bytes + self._num_req_slots * row_bytes,
+            ),
+            zero=True,
         )
         self._pending_ring = torch.zeros(
             self._num_req_slots,
@@ -177,6 +187,12 @@ class QSAKVCache(MHAKVCache):
             * self._index_dtype.itemsize
         )
         return kv + slab // tokens, swa
+
+    def page_views(self) -> list[torch.Tensor]:
+        pages = self._kv_buffer.shape[2]
+        rows = self._page_size // self._index_ratio
+        slab = self._cmp_k_buffer[:, : pages * rows].unflatten(1, (pages, rows)).permute(1, 0, 2, 3)
+        return super().page_views() + [slab]
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

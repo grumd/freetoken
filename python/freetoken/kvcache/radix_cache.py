@@ -25,6 +25,16 @@ class RadixTreeNode:
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+        # Admission sequence number of the last request whose prefix walked through this node
+        # (HybridRadixCache.req_seq). A logical clock, unlike timestamp, so every TP rank ages
+        # nodes identically; elastic VRAM drops nodes untouched by the last few admissions.
+        self.last_seq: int = 0
+        # Prefix RAM tier (HybridRadixCache + HostPrefixPool): the host page holding each of this
+        # node's KV pages, and a host GDN snapshot slot. ``value`` is None while the node lives in
+        # host RAM only; ``host_pinned`` keeps a node being reloaded out of host eviction.
+        self.host_pages: List[int] | None = None
+        self.host_mamba: int | None = None
+        self.host_pinned: bool = False
 
         # Secondary "currency" for hybrid models (HybridRadixCache): an optional GDN state
         # snapshot slot attached at this node's END boundary, with its own ref count. None
@@ -49,8 +59,8 @@ class RadixTreeNode:
         self._value: torch.Tensor
         self._length: int
 
-    def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
-        assert len(key) == len(value)
+    def set_key_value(self, key: torch.Tensor, value: torch.Tensor | None) -> None:
+        assert value is None or len(key) == len(value)
         self._key = key
         self._value = value
         self._length = len(key)
@@ -89,7 +99,14 @@ class RadixTreeNode:
         parent = self.parent
 
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
-        new_node.set_key_value(self._key[:pos], self._value[:pos])
+        new_node.last_seq = self.last_seq
+        value = self._value
+        new_node.set_key_value(self._key[:pos], None if value is None else value[:pos])
+        if self.host_pages is not None:
+            # node lengths are whole pages, so the cut is too; the host snapshot stays with the
+            # suffix node, whose end boundary it describes
+            cut = pos * len(self.host_pages) // self._length
+            new_node.host_pages, self.host_pages = self.host_pages[:cut], self.host_pages[cut:]
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
@@ -100,7 +117,7 @@ class RadixTreeNode:
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
 
-        self.set_key_value(self._key[pos:], self._value[pos:])
+        self.set_key_value(self._key[pos:], None if value is None else value[pos:])
         self.set_parent(new_node)
 
         return new_node

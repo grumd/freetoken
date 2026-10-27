@@ -20,7 +20,7 @@ from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import align_ceil, div_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -436,6 +436,7 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
+        self.elastic = None  # ElasticVram under --elastic-kv, planned with the expert banks
         self.moe_offload_cache = None
         self.dspark_offload_cache = None
         self.cpu_moe_executor = None
@@ -468,9 +469,22 @@ class Engine:
             available_memory -= new_free - current_free
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
-        )
+        if self.elastic is not None:
+            from freetoken.kvcache.mha_pool import elastic_tier_allocator
+
+            with elastic_tier_allocator(self.elastic.kv_tier):
+                self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+                    config, self.num_pages, device=self.device, dtype=self.dtype
+                )
+            if not getattr(self.kv_cache, "elastic", False):
+                raise ValueError(
+                    f"--elastic-kv supports paged MHA/QSA KV pools, not {type(self.kv_cache).__name__}"
+                )
+            self.elastic.kv_pool = self.kv_cache
+        else:
+            self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+                config, self.num_pages, device=self.device, dtype=self.dtype
+            )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -488,6 +502,10 @@ class Engine:
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
+
+        self.host_prefix_pool = None
+        if config.cache_ram_gb > 0:
+            self._init_host_prefix_pool(config)
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -636,6 +654,12 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        if self.elastic is not None:
+            # last: everything the graphs and the warm-ups hold is resident by now
+            self.elastic.finalize(
+                self._sync_get_memory()[0], self._elastic_reserve, self._elastic_keep_free,
+                self.tp_cpu_group if config.tp_info.size > 1 else None,
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -721,6 +745,61 @@ class Engine:
             max_slots=method.slot_limit() if method is not None else None,
         )
 
+    def _init_host_prefix_pool(self, config: EngineConfig) -> None:
+        from freetoken.kvcache.host_prefix_pool import HostPrefixPool
+
+        lsp = self.linear_state_pool
+        if config.cache_type != "hybrid_radix" or lsp is None or not hasattr(self.kv_cache, "page_views"):
+            raise ValueError("--cache-ram-gb needs a hybrid GDN model on the hybrid radix cache")
+        self.host_prefix_pool = HostPrefixPool(
+            self.kv_cache.page_views(),
+            [lsp.conv_states, lsp.recurrent_states, *lsp.slot_states.values()],
+            int(config.cache_ram_gb * 2**30) // config.tp_info.size,
+            config.page_size,
+        )
+
+    def _plan_elastic(self, config: EngineConfig, banks, method) -> None:
+        """--elastic-kv: size the virtual reservations of the expert banks and the KV pool from
+        the VRAM free now, before either exists. The physical pool is settled in finalize()."""
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot, plan_elastic_geometry, prefill_reserve_bytes,
+        )
+        from freetoken.engine.elastic import ElasticVram
+
+        if config.moe_strategy != "offload" or config.model_config.decode_target != "gpu":
+            raise ValueError("--elastic-kv needs --moe-strategy offload with GPU decode")
+        cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
+        fixed += state_pool_bytes(config)
+        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, config.max_extend_tokens)
+        self._elastic_keep_free = config.vram_keep_free_mb << 20
+        free = self._sync_get_memory()[0]
+        min_pages = div_ceil(config.elastic_kv_min_tokens, page_tokens)
+        cap_slots, cap_pages = plan_elastic_geometry(
+            budget_bytes=free - fixed - self._elastic_reserve - self._elastic_keep_free,
+            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            cache_per_page=cache_per_page,
+            num_experts=config.model_config.num_experts,
+            total_experts=config.model_config.num_moe_layers * config.model_config.num_experts,
+            prefill_overlap=config.moe_prefill_overlap,
+            floor_slots=config.expert_cache_min_slots,
+            min_pages=min_pages,
+            max_slots=method.slot_limit() if method is not None else None,
+        )
+        self.elastic = ElasticVram(
+            self.device,
+            min_pages=min_pages,
+            step_pages=div_ceil(config.elastic_kv_step_tokens, page_tokens),
+            floor_slots=config.expert_cache_min_slots,
+            cap_slots=cap_slots,
+            cap_pages=cap_pages,
+        )
+        object.__setattr__(config, "moe_cache_size", cap_slots)
+        object.__setattr__(config, "num_page_override", cap_pages)
+        logger.info_rank0(
+            f"--elastic-kv: reserving {cap_slots} expert slots / {cap_pages * page_tokens} KV tokens "
+            f"of address space ({mem_GB(free)} free before the caches)"
+        )
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         from freetoken.env import ENV
 
@@ -792,7 +871,9 @@ class Engine:
             )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        if config.moe_cache_auto:
+        if config.elastic_kv:
+            self._plan_elastic(config, banks, method)
+        elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
@@ -843,7 +924,11 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            bank_alloc=self.elastic.bank if self.elastic is not None else None,
+            active_slots=self.elastic.slots if self.elastic is not None else None,
         )
+        if self.elastic is not None:
+            self.elastic.cache = cache
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
@@ -1133,6 +1218,8 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        if self.elastic is not None:
+            raise CacheRebuildRejected("--elastic-kv moves VRAM between the caches by itself")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the

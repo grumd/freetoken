@@ -131,3 +131,52 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+
+
+def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: int) -> int:
+    """VRAM kept back for prefill activations under --elastic-kv. Auto: 2 GiB per 8192-token chunk,
+    scaled up for larger chunks. A full 261.5k-token prefill on Qwen3.8-Flash-Next (2x RTX 3080,
+    2026-10-27) peaked at 1.81-2.16 GiB over the idle footprint; with 2.25 GiB kept back it still
+    left 445-817 MiB above a 128 MiB keep-free margin."""
+    if prefill_reserve_gb is not None:
+        return int(prefill_reserve_gb * 2**30)
+    return int(2 * 2**30 * max(1.0, max_extend_tokens / 8192))
+
+
+def plan_elastic_geometry(
+    *,
+    budget_bytes: int,
+    per_expert_bytes: int,
+    cache_per_page: int,
+    num_experts: int,
+    total_experts: int,
+    prefill_overlap: bool,
+    floor_slots: int,
+    min_pages: int,
+    max_slots: int | None = None,
+) -> tuple[int, int]:
+    """Upper bounds (cap_slots, cap_pages) for --elastic-kv's virtual reservations.
+
+    ``budget_bytes`` is free VRAM before the expert banks, minus the fixed pools, the prefill
+    reserve and the keep-free margin; the CUDA graphs and allocator slack land later, so the
+    pool the engine finally builds is a little smaller and these caps are never all reachable
+    at once. Experts at most fill the budget beside ``min_pages`` of KV; KV at most fills it
+    beside ``floor_slots`` experts.
+    """
+    hard_floor = 2 * num_experts if prefill_overlap else num_experts
+    if floor_slots < hard_floor:
+        raise ValueError(
+            f"--expert-cache-min-slots {floor_slots} is below {hard_floor}: "
+            + ("prefill streams two whole expert layers through the slot cache"
+               if prefill_overlap else "a prefill materializes a whole expert layer")
+        )
+    hi = total_experts if max_slots is None else min(total_experts, max_slots)
+    cap_slots = min(hi, (budget_bytes - min_pages * cache_per_page) // per_expert_bytes)
+    if cap_slots < floor_slots:
+        raise ValueError(
+            f"elastic VRAM budget {budget_bytes / 2**30:.2f} GiB holds only {max(cap_slots, 0)} "
+            f"expert slots beside {min_pages} KV pages; --expert-cache-min-slots is {floor_slots}"
+        )
+    cap_pages = (budget_bytes - floor_slots * per_expert_bytes) // cache_per_page
+    assert cap_pages >= min_pages
+    return int(cap_slots), int(cap_pages)

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
+
+logger = init_logger(__name__)
 
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
 # The CacheManager takes an explicit interval (--swa-eviction-interval); None falls back to the
@@ -51,11 +54,22 @@ def _resolve_decode_snapshot_interval(page_size: int) -> int:
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 swa_eviction_interval: int | None = None):
+                 swa_eviction_interval: int | None = None, elastic=None,
+                 keep_requests: int = 4, host_pool=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        # Elastic VRAM (engine/elastic.py): only pages [0, elastic.pages) are backed. The free
+        # list stays sorted so allocation is lowest-first, live data packs low, and the backed
+        # range can shrink from the top; prefix-cache leaves untouched by the last
+        # ``keep_requests`` admissions go before KV takes expert slots.
+        self.elastic = elastic
+        self.keep_requests = keep_requests
+        # Prefix RAM tier (--cache-ram-gb, hybrid only): evicted prefixes and GDN snapshots spill
+        # to pinned host RAM and reload on a later match instead of being dropped.
+        self.host_pool = host_pool
+        active = elastic.pages if elastic is not None else num_pages
+        self.free_slots = torch.arange(active, dtype=torch.int32, device=device) * page_size
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -96,10 +110,16 @@ class CacheManager:
         point for the rest of the prompt. 1 (no-op) everywhere else."""
         return self.page_size if self.is_hybrid else 1
 
+    @property
+    def active_pages(self) -> int:
+        """Pages backed by VRAM right now (all of them unless elastic)."""
+        elastic = getattr(self, "elastic", None)
+        return elastic.pages if elastic is not None else self.num_pages
+
     def page_usage(self) -> tuple[int, int]:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""
-        total = self.num_pages
+        total = CacheManager.active_pages.fget(self)
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
         return total - len(self.free_slots) - evictable // self.page_size, total
@@ -107,7 +127,7 @@ class CacheManager:
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridRadixCache(device, page_size)
+            return HybridRadixCache(device, page_size, host=getattr(self, "host_pool", None))
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
             return SWARadixCache(device, page_size, self.sliding_window_size)
@@ -126,12 +146,48 @@ class CacheManager:
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
+            if self.host_pool is not None and len(ids):
+                node, from_ram = self.prefix_cache.match_tiered(ids)
+                if from_ram:
+                    self._load_from_ram(node)
             m = self.prefix_cache.match_prefix(ids)
             if _PREFIX_DEBUG:
                 self._debug_divergence(req.input_ids[:input_len], m.cached_len)
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
+
+    def _load_from_ram(self, node) -> None:
+        """Bring a matched prefix whose snapshot (and maybe KV tail) lives in the RAM tier back to
+        the GPU, so the match below can reuse it. Best effort: without room it stays in RAM and
+        the match falls back to what is on the device."""
+        pc, ps = self.prefix_cache, self.page_size
+        nodes = pc.host_path(node)
+        anchor = nodes[0].parent if nodes else node
+        for n in nodes + [node]:
+            n.host_pinned = True
+        pc.inc_lock(anchor)  # the device part of the path must stay put while pages move
+        t0 = time.perf_counter()
+        try:
+            need = sum(n.length for n in nodes) // ps
+            if need:
+                if need * ps > self.available_size:
+                    return
+                pc.load_pages(nodes, self._allocate(need))
+            if node.mamba_value is None:
+                if self.linear_state_pool.num_free_slots < 1:
+                    self.ensure_mamba_slots(1)
+                if self.linear_state_pool.num_free_slots < 1:
+                    return
+                pc.load_snapshot(node, self.linear_state_pool.alloc(1)[0])
+            logger.info_rank0(
+                f"prefix RAM tier: reloaded {need * ps} tokens + GDN snapshot in "
+                f"{(time.perf_counter() - t0) * 1e3:.0f} ms"
+            )
+        finally:
+            pc.dec_lock(anchor)
+            for n in nodes + [node]:
+                n.host_pinned = False
 
     def _debug_divergence(self, ids: torch.Tensor, cached_len: int) -> None:
         import json
@@ -152,7 +208,9 @@ class CacheManager:
     def available_size(self) -> int:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        return evictable + len(self.free_slots) * self.page_size
+        elastic = getattr(self, "elastic", None)
+        growable = elastic.growable_pages() if elastic is not None else 0
+        return evictable + (len(self.free_slots) + growable) * self.page_size
 
     @property
     def mamba_available_size(self) -> int:
@@ -641,12 +699,14 @@ class CacheManager:
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
+        if len(self.free_slots) + cache_pages != self.active_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
                 f" free_pages({len(self.free_slots)}) +"
-                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
+                f" cache_pages({cache_pages}) != num_pages({self.active_pages})"
             )
+        if self.elastic is not None and len(self.free_slots):
+            assert int(self.free_slots.max()) < self.active_pages * self.page_size, "free page above the backed range"
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 
@@ -683,9 +743,89 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            self._add_free(lazy_free_list)
+
+    def _add_free(self, pages: List[torch.Tensor]) -> None:
+        merged = torch.cat([self.free_slots] + pages)
+        self.free_slots = torch.sort(merged).values if self.elastic is not None else merged
+
+    def _evict_cold(self) -> None:
+        if not self.is_hybrid:
+            return
+        er = self.prefix_cache.evict_cold(self.prefix_cache.req_seq - self.keep_requests + 1)
+        if er.mamba_slots:
+            self.linear_state_pool.free(er.mamba_slots)
+        if len(er.kv_indices):
+            self._add_free([er.kv_indices[:: self.page_size]])
+
+    def note_admission(self, handle: BaseCacheHandle) -> None:
+        if self.is_hybrid:
+            self.prefix_cache.note_admission(handle.node)
+
+    def reserve_pages(self, needed_pages: int) -> None:
+        """Elastic: make ``needed_pages`` free pages backed now (a prompt's worth at admission),
+        so its prefill chunks do not each stop to grow the pool."""
+        if self.elastic is not None and needed_pages > len(self.free_slots):
+            self._elastic_make_room(needed_pages)
+
+    def _elastic_make_room(self, needed_pages: int) -> None:
+        self._evict_cold()
+        short = needed_pages - len(self.free_slots)
+        if short > 0 and self.elastic.growable_pages() > 0:
+            old, new = self.elastic.grow(short)
+            if new > old:
+                pages = torch.arange(old, new, dtype=torch.int32, device=self.device)
+                self.free_slots = torch.cat([self.free_slots, pages * self.page_size])
+
+    def elastic_idle(self) -> None:
+        """Idle point (no request running): drop cold prefixes and hand the backed pages above
+        what the cache still holds, plus one step of slack, back to the experts."""
+        if self.elastic is None:
+            return
+        parked = self.prefix_cache.spilled_tokens if self.host_pool is not None else 0
+        self._evict_cold()
+        if self.host_pool is not None and self.prefix_cache.spilled_tokens > parked:
+            logger.info_rank0(
+                f"prefix RAM tier: parked {self.prefix_cache.spilled_tokens - parked} tokens "
+                f"({self.host_pool.free_pages} pages, {self.host_pool.free_snaps} snapshots free)"
+            )
+        el, ps = self.elastic, self.page_size
+        active = el.pages
+        used = active - len(self.free_slots)
+        step = el.step_pages
+        target = min(active, max(el.min_pages, -(-(used + step) // step) * step))
+        if active - target < step:
+            return
+        free_pages = self.free_slots // ps
+        if int((free_pages >= target).sum()) < active - target:
+            in_use = torch.ones(active, dtype=torch.bool, device=self.device)
+            in_use[free_pages.long()] = False
+            if self.is_hybrid:
+                # move the prefix tree's pages above the target into free pages below it; it is
+                # their only owner here, while anything else above the target stays put
+                owned = torch.zeros(active, dtype=torch.bool, device=self.device)
+                owned[self.prefix_cache.device_pages().long()] = True
+                src = (in_use & owned)[target:].nonzero().squeeze(1) + target
+                dst = free_pages[free_pages < target][: len(src)]
+                if len(src) and len(dst) == len(src):
+                    el.move_pages(src, dst)
+                    new_page = torch.arange(active, dtype=torch.int32, device=self.device)
+                    new_page[src] = dst.to(torch.int32)
+                    self.prefix_cache.remap_pages(new_page)
+                    in_use[src] = False
+                    in_use[dst.long()] = True
+                    self.free_slots = in_use.logical_not().nonzero().squeeze(1).to(torch.int32) * ps
+            # whatever could not move pins the top: shrink to just above the highest used page
+            top = int(in_use.nonzero().max()) + 1
+            target = min(active, max(target, -(-top // step) * step))
+            if active - target < step:
+                return
+        self.free_slots = self.free_slots[self.free_slots < target * ps]
+        el.shrink(target)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
+        if self.elastic is not None and needed_pages > len(self.free_slots):
+            self._elastic_make_room(needed_pages)
         if needed_pages > (free_pages := len(self.free_slots)):
             need = (needed_pages - free_pages) * self.page_size
             if self.is_swa:
@@ -701,7 +841,7 @@ class CacheManager:
                     self.linear_state_pool.free(er.mamba_slots)
             else:
                 evicted = self.prefix_cache.evict(need)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            self._add_free([evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
@@ -709,7 +849,7 @@ class CacheManager:
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
-            self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            self._add_free([indices[:: self.page_size]])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:
