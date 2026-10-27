@@ -68,12 +68,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
     # for every size).
     fp8_reduce: bool = False
     fp8_min_bytes: int = 64 * 1024
-    # small bf16 reductions on a 2-rank group without peer access (see host_allreduce.py)
-    host_ar: Any = None
+    # small bf16 reductions on a 2-rank group (see p2p_allreduce.py / host_allreduce.py)
+    small_ar: Any = None
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        if self.host_ar is not None and self.host_ar.eligible(x):
-            return self.host_ar.all_reduce(x)
+        if self.small_ar is not None and self.small_ar.eligible(x):
+            return self.small_ar.all_reduce(x)
         if (
             self.fp8_reduce
             and x.dtype == torch.bfloat16
@@ -176,32 +176,40 @@ def enable_pynccl_distributed(
     DistributedCommunicator.plugins.append(
         PyNCCLDistributedImpl(
             comm, fp8_reduce=fp8_reduce, fp8_min_bytes=fp8_min_bytes,
-            host_ar=_maybe_host_allreduce(tp_info, tp_cpu_group),
+            small_ar=_maybe_small_allreduce(tp_info, tp_cpu_group),
         )
     )
 
 
-def _maybe_host_allreduce(tp_info: DistributedInfo, group: torch.distributed.ProcessGroup):
-    """The shared-host-memory path for small reductions (FREETOKEN_HOST_ALLREDUCE=0 opts
-    out): 2 ranks whose GPUs cannot reach each other directly, so NCCL would stage
-    through host memory anyway. Decided group-wide -- every rank must take the same
-    path for a given tensor or the two mechanisms wait on each other forever."""
+def _maybe_small_allreduce(tp_info: DistributedInfo, group: torch.distributed.ProcessGroup):
+    """The 2-rank kernel for small reductions: over peer access when every rank has it
+    (FREETOKEN_P2P_ALLREDUCE=0 opts out, leaving NCCL), else through shared host memory,
+    where NCCL would stage anyway (FREETOKEN_HOST_ALLREDUCE=0 opts out). Decided group-wide
+    -- every rank must take the same path for a given tensor or the mechanisms wait on each
+    other forever."""
+    if tp_info.size != 2:
+        return None
     cur = torch.cuda.current_device()
     peer_access = any(
         torch.cuda.can_device_access_peer(cur, d) for d in range(torch.cuda.device_count()) if d != cur
     )
-    local = int(
-        tp_info.size == 2
-        and os.environ.get("FREETOKEN_HOST_ALLREDUCE", "1").strip() != "0"
-        and not peer_access
-    )
+    if peer_access:
+        local = 2 if os.environ.get("FREETOKEN_P2P_ALLREDUCE", "1").strip() != "0" else 0
+    else:
+        local = 1 if os.environ.get("FREETOKEN_HOST_ALLREDUCE", "1").strip() != "0" else 0
+    # 0 = NCCL, 1 = host, 2 = P2P; one rank lacking peer access drops the group to host or NCCL
     t = torch.tensor([local], dtype=torch.int32)
     dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
-    if not int(t.item()):
-        return None
-    from .host_allreduce import HostAllReduce
+    choice = int(t.item())
+    if choice == 2:
+        from .p2p_allreduce import P2PAllReduce
 
-    return HostAllReduce(tp_info.rank, group)
+        return P2PAllReduce(tp_info.rank, group)
+    if choice == 1:
+        from .host_allreduce import HostAllReduce
+
+        return HostAllReduce(tp_info.rank, group)
+    return None
 
 
 def destroy_distributed() -> None:

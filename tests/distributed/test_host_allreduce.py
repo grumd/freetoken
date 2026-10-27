@@ -1,7 +1,7 @@
 # Copyright (c) 2026 FreeToken contributors
-# distributed/host_allreduce.py: the 2-rank shared-host-memory all-reduce. Both ranks must
-# agree bit for bit with a plain sum (a + b == b + a), eagerly and under CUDA-graph replay,
-# where the device-side sequence counter alternates the data slots.
+# distributed/host_allreduce.py and p2p_allreduce.py: the 2-rank shared-host-memory and peer-access
+# all-reduces. Both ranks must agree bit for bit with a plain sum (a + b == b + a), eagerly and
+# under CUDA-graph replay, where the device-side sequence counter alternates the data slots.
 from __future__ import annotations
 
 import os
@@ -21,15 +21,18 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(rank: int, port: int, q) -> None:
+def _worker(rank: int, port: int, q, kind: str) -> None:
     import torch.distributed as dist
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=2)
-    from freetoken.distributed.host_allreduce import HostAllReduce
+    if kind == "p2p":
+        from freetoken.distributed.p2p_allreduce import P2PAllReduce as Impl
+    else:
+        from freetoken.distributed.host_allreduce import HostAllReduce as Impl
 
-    har = HostAllReduce(rank, dist.group.WORLD)
+    har = Impl(rank, dist.group.WORLD)
     ok = True
     for n in (8, 2560, 4 * 2560, 32768):
         for step in range(20):
@@ -61,13 +64,16 @@ def _worker(rank: int, port: int, q) -> None:
     dist.destroy_process_group()
 
 
-def test_host_allreduce_two_ranks():
+@pytest.mark.parametrize("kind", ["host", "p2p"])
+def test_small_allreduce_two_ranks(kind: str):
     import torch.multiprocessing as mp
 
+    if kind == "p2p" and not torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("needs GPU peer access")
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = _free_port()
-    procs = [ctx.Process(target=_worker, args=(r, port, q)) for r in range(2)]
+    procs = [ctx.Process(target=_worker, args=(r, port, q, kind)) for r in range(2)]
     for p in procs:
         p.start()
     for p in procs:
