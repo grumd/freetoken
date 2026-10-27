@@ -36,12 +36,16 @@ def _module():
     return load_jit(
         "p2p_allreduce",
         cuda_files=["p2p_allreduce.cuh"],
-        cuda_wrappers=[("p2p_allreduce_bf16", "p2p_allreduce_bf16")],
+        cuda_wrappers=[
+            ("p2p_allreduce_bf16", "p2p_allreduce_bf16"),
+            ("p2p_allgather_bf16", "p2p_allgather_bf16"),
+        ],
     )
 
 
 class P2PAllReduce:
     def __init__(self, rank: int, cpu_group: dist.ProcessGroup, slot_bytes: int = 128 * 1024) -> None:
+        self.rank = rank
         self.slot_bytes = slot_bytes
         size = 2 * slot_bytes  # 2 parities
         rt = _cudart()
@@ -80,6 +84,15 @@ class P2PAllReduce:
             x.view(-1).view(torch.int16), self._seq, self._mine, self._peer, self.slot_bytes,
         )
         return x
+
+    def all_gather(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """``out`` = rank 0's ``x`` then rank 1's (bf16, contiguous, ``eligible`` sizes);
+        ``x`` may be this rank's half of ``out``."""
+        _module().p2p_allgather_bf16(
+            x.view(-1).view(torch.int16), out.view(-1).view(torch.int16), self._seq, self.rank,
+            self._mine, self._peer, self.slot_bytes,
+        )
+        return out
 
 
 def _check(err: int, what: str) -> None:

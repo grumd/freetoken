@@ -212,6 +212,15 @@ def _maybe_small_allreduce(tp_info: DistributedInfo, group: torch.distributed.Pr
     return None
 
 
+def get_p2p_comm():
+    """The 2-rank peer-access communicator (``P2PAllReduce``) when it carries the small
+    reductions, else None: no TP, no peer access, or opted out."""
+    from .p2p_allreduce import P2PAllReduce
+
+    small = getattr(DistributedCommunicator.plugins[-1], "small_ar", None)
+    return small if isinstance(small, P2PAllReduce) else None
+
+
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.

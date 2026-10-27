@@ -60,8 +60,49 @@ def _worker(rank: int, port: int, q, kind: str) -> None:
         graph.replay()
         torch.cuda.synchronize()
         ok &= torch.equal(buf.cpu(), 2 * (both[0] + both[1]))
+    if kind == "p2p":
+        ok &= _check_all_gather(har, rank)
     q.put((rank, bool(ok)))
     dist.destroy_process_group()
+
+
+def _check_all_gather(har, rank: int) -> bool:
+    """P2P all-gather, alone and interleaved with all-reduces on the shared sequence counter,
+    eagerly and under graph replay: rank 0's half then rank 1's, bit for bit."""
+    ok = True
+    for n in (2, 168, 1280, 16384):
+        for step in range(6):
+            g = torch.Generator().manual_seed(7 * n + step)
+            halves = [torch.randn(n, generator=g).to(torch.bfloat16) for _ in range(2)]
+            out = torch.empty(2 * n, dtype=torch.bfloat16, device="cuda")
+            har.all_gather(halves[rank].cuda(), out)
+            ok &= torch.equal(out.cpu(), torch.cat(halves))
+            # gather in place from this rank's own half, then an all-reduce on the same counter
+            out = torch.empty(2 * n, dtype=torch.bfloat16, device="cuda")
+            out[rank * n : (rank + 1) * n] = halves[rank].cuda()
+            har.all_gather(out[rank * n : (rank + 1) * n], out)
+            ok &= torch.equal(out.cpu(), torch.cat(halves))
+            har.all_reduce(out)
+            ok &= torch.equal(out.cpu(), 2 * torch.cat(halves))
+    half = torch.empty(168, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(336, dtype=torch.bfloat16, device="cuda")
+    red = torch.empty(2560, dtype=torch.bfloat16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        har.all_gather(half, out)
+        har.all_reduce(red)
+        har.all_gather(half, out)
+    for step in range(10):
+        g = torch.Generator().manual_seed(100 + step)
+        halves = [torch.randint(-8, 8, (168,), generator=g).to(torch.bfloat16) for _ in range(2)]
+        reds = [torch.randint(-4, 4, (2560,), generator=g).to(torch.bfloat16) for _ in range(2)]
+        half.copy_(halves[rank].cuda())
+        red.copy_(reds[rank].cuda())
+        graph.replay()
+        torch.cuda.synchronize()
+        ok &= torch.equal(out.cpu(), torch.cat(halves))
+        ok &= torch.equal(red.cpu(), reds[0] + reds[1])
+    return ok
 
 
 @pytest.mark.parametrize("kind", ["host", "p2p"])
