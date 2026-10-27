@@ -20,17 +20,16 @@ case "$fmt" in
 esac
 
 : "${GPUS:=0,1}"                # nvidia-smi indices, entry i = TP rank i; TP size = count
-# ELASTIC=1: KV and the expert cache share VRAM at runtime, so the cache gets whatever the live
-# context does not need (decode +16%, output identical); it replaces MEM_RATIO. MAXLEN is the
-# longest request (and the KV reserve when ELASTIC=0). One 20 GB GPU cannot hold the full 262k KV
-# beside the 1024-slot expert-cache minimum and needs more activation headroom than a TP=2 rank;
-# elastic's prefill reserve is calibrated at TP=2 only.
 IFS=, read -ra gpu_list <<<"$GPUS"
-if [ "${#gpu_list[@]}" -ge 2 ]; then
-  : "${ELASTIC:=1}" "${MAXLEN:=262144}"
-else
-  : "${ELASTIC:=0}" "${MAXLEN:=131072}" "${MEM_RATIO:=0.84}"
+: "${ELASTIC:=1}"               # 1 = KV and the expert cache share VRAM at runtime: the cache gets
+                                # whatever the live context does not need (decode +16%, output
+                                # identical) and MAXLEN shrinks to what VRAM can hold; replaces MEM_RATIO
+if [ "$ELASTIC" = "0" ] && [ "${#gpu_list[@]}" -lt 2 ]; then
+  # one 20 GB GPU cannot hold the full 262k KV beside the 1024-slot expert-cache minimum and needs
+  # more activation headroom than a TP=2 rank
+  : "${MAXLEN:=131072}" "${MEM_RATIO:=0.84}"
 fi
+: "${MAXLEN:=262144}"           # longest request (prompt + output)
 : "${PORT:=8080}"
 : "${HOST:=127.0.0.1}"
 : "${MTP:=off}"
