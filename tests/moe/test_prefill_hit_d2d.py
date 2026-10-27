@@ -80,6 +80,26 @@ def test_batch_memcpy_roundtrip():
 @CUDA
 @JIT
 @BATCH_API
+def test_batch_memcpy_probe_passes_while_the_stream_is_busy():
+    """The probe copies on a fresh stream into a buffer zero-filled on the current one. Busy
+    current stream (engine startup): an unordered copy lands first, the late zero-fill wipes it,
+    and the probe wrongly turns hit-D2D off."""
+    from freetoken.kernel.batch_memcpy import _jit_batch_memcpy_module, _probe
+
+    fn = _jit_batch_memcpy_module().batch_memcpy
+    # the engine's own stream: unlike the legacy default stream, a new stream does not wait for it
+    with torch.cuda.stream(torch.cuda.Stream()):
+        # warm both allocators so the probe's own allocations cannot synchronize the device
+        torch.arange(16, dtype=torch.uint8).pin_memory()
+        torch.zeros(16, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        torch.cuda._sleep(100_000_000)  # ~60 ms of spin that the zero-fill queues behind
+        _probe(fn)
+
+
+@CUDA
+@JIT
+@BATCH_API
 def test_prefill_hit_d2d_matches_sources():
     cache, sources = _make_cache()
     # layer 1 residents: two real hits in the hit region, one expert stuck in a
