@@ -2,7 +2,7 @@
 
 ## `serve-qwen38.sh`: Qwen3.8-Flash-Next on consumer GPUs
 
-Serves Qwen3.8-Flash-Next from an FTW checkpoint: experts pinned in host RAM behind a VRAM expert cache that takes whatever the live context does not need, the PLE n-gram table read from disk, the vision tower on the CPU, and hybrid CPU/GPU prefill. Full 262144-token context on 2 GPUs, one request at a time.
+Serves Qwen3.8-Flash-Next from an FTW checkpoint: experts pinned in host RAM behind a VRAM expert cache that takes whatever the live context does not need, the PLE n-gram table read from disk, the vision tower on the CPU, and hybrid CPU/GPU prefill. Up to 262144 tokens of context, one request at a time; the per-setup numbers are in the [main README](../README.md#what-to-expect).
 
 The same script serves both checkpoints. It reads `quant_format` from the FTW index to pick the model name.
 
@@ -21,7 +21,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 ### Requirements
 
 - **OS / toolchain:** Linux x86_64, NVIDIA driver r580+ (CUDA 13), CUDA 13 toolkit with `nvcc` on PATH (kernels JIT-compile on first use), `g++` (the CPU prefill extension builds with `-march=native`).
-- **GPU:** tuned on 2x 20 GB. One 20 GB GPU works at 128k context. VRAM use:
+- **GPU:** one or two with 16 GB or more; tuned on 2x 20 GB. One 16 GB GPU holds 149k tokens of context, 20 GB the full 262k. VRAM use:
   - dense weights: 8.2 GiB unsplit, 5.5 GiB per GPU at TP=2
   - KV: 25 KiB/token (6.4 GiB at 262k)
   - expert cache: whatever is left.
@@ -66,7 +66,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | Var | Default | When to change it |
 |---|---|---|
 | `SNAP` | required | FTW checkpoint dir |
-| `GPUS` | `0,1` | one GPU: `GPUS=0` (picks 128k context and the one-GPU VRAM split by itself) |
+| `GPUS` | `0,1` | one GPU: `GPUS=0`; context and expert cache size themselves to its VRAM |
 | `CACHE_RAM_GB` | `0` | 128 GB of RAM: `16` keeps about 520k tokens of older conversations in RAM; going back to one reloads it (a 13.6k-token one in 27 ms instead of 6.3 s). Leave it off on 96 GB |
 | `HOST`, `PORT` | `127.0.0.1`, `8080` | listen address |
 | `EXTRA` | | extra `ft serve` flags; arguments after the script name are passed too |
@@ -77,8 +77,8 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 |---|---|---|
 | `SNAP` | required | FTW checkpoint dir |
 | `GPUS` | `0,1` | nvidia-smi indices; the count sets the TP size |
-| `MAXLEN` | `262144` (`131072` on one GPU) | longest request; also reserved as KV when `ELASTIC=0` |
-| `ELASTIC` | `1` on 2+ GPUs, `0` on one | KV and the expert cache share VRAM at runtime (`--elastic-kv`); replaces `MEM_RATIO`. Decode +16%, output identical |
+| `MAXLEN` | `262144` | longest request; lowered to what fits in VRAM, and reserved as KV when `ELASTIC=0` (`131072` on one GPU) |
+| `ELASTIC` | `1` | KV and the expert cache share VRAM at runtime (`--elastic-kv`); replaces `MEM_RATIO`. Decode +16%, output identical |
 | `KEEP_FREE_MB` | `128` | elastic: VRAM left free per GPU, also at the prefill peak |
 | `PREFILL_RESERVE_GB` | auto | elastic: VRAM per GPU kept for prefill activations (auto: 2 GiB per 8192-token chunk) |
 | `CACHE_RAM_GB` | `0` | whole GiB of pinned host RAM (all GPUs) for evicted prompt prefixes, reloaded instead of prefilled again (`--cache-ram-gb`); raises `MIN_AVAIL_GIB` and `MEM_MAX` by as much |
@@ -103,7 +103,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 
 **Other hardware:**
 
-- **Bigger cards:** on one GPU raise `MAXLEN` and re-sweep `MEM_RATIO`. On two, elastic VRAM sizes itself.
+- **Bigger cards:** nothing to set; elastic VRAM gives the extra memory to the context and the expert cache.
 - **Faster PCIe or RAM:** `CPU_PREFILL_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5. On a faster link, fetch more over PCIe and lower `ROUTED_PF`.
 
 ### Troubleshooting
