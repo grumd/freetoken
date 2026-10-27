@@ -156,7 +156,7 @@ _TARGET_PROGRAMS = 544
 _GEMV_V2 = os.environ.get("FREETOKEN_NVFP4_GEMV_V2", "1") != "0"
 
 
-def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile):
+def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0, copy=None, part=None):
     bn, bkw, warps = tile
     N, kw = packed.shape[1], packed.shape[2] // 4
     words = packed.view(torch.int32)
@@ -165,17 +165,19 @@ def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile):
     split = max(1, min(n_kb, _TARGET_PROGRAMS // max(1, R * triton.cdiv(N, bn))))
     kb_per = triton.cdiv(n_kb, split)
     split = triton.cdiv(n_kb, kb_per)
-    part = torch.empty((split, R, N), dtype=torch.float32, device=a.device)
+    if part is None:
+        part = torch.empty((split, R, N), dtype=torch.float32, device=a.device)
+    copy_slots, num_copy = copy if copy is not None else (ids, ids)
     kernel = _gemv_partials_v2_kernel if _GEMV_V2 else _gemv_partials_kernel
     kernel[(R, triton.cdiv(N, bn), split)](
-        a, words, scale, glob, part, ids,
+        a, words, scale, glob, part, ids, copy_slots, num_copy,
         R, N, kb_per * bkw, kw,
         a.stride(0),
         words.stride(0), words.stride(1),
         scale.stride(0), scale.stride(1),
         glob.stride(0),
         TOP_K=top_k, A_ROW_IS_ROUTE=a_row_is_route,
-        BLOCK_N=bn, BLOCK_KW=bkw, num_warps=warps,
+        BLOCK_N=bn, BLOCK_KW=bkw, ROUTES=routes, MAX_COPY=triton.next_power_of_2(R), num_warps=warps,
     )
     return part, split
 
@@ -190,17 +192,33 @@ def nvfp4_decode_silu(
     gate_up_packed: torch.Tensor, gate_up_scale: torch.Tensor, gate_up_global: torch.Tensor,
     down_packed: torch.Tensor, down_scale: torch.Tensor, down_global: torch.Tensor,
     topk_weights: torch.Tensor, topk_ids: torch.Tensor, gu_tile=None, dn_tile=None,
+    copy=None, join=None,
 ) -> torch.Tensor:
-    """SiLU-gated NVFP4 expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H]."""
+    """SiLU-gated NVFP4 expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H].
+
+    With ``copy = (copy_slots, num_copy)`` (this step's expert copy, still running) the routes
+    already resident go first, then ``join()`` waits for the copy and the rest follow. Every
+    route's partials come from the same programs either way, so the output is bit-identical."""
     M, H = x.shape
     top_k = topk_ids.shape[1]
     R = M * top_k
     inter = gate_up_packed.shape[1] // 2
     ids = topk_ids.reshape(-1)
-    part1, s1 = _gemv(x, gate_up_packed, gate_up_scale, gate_up_global, ids, R, top_k, False, gu_tile or _GU_TILE)
-    act = torch.empty((R, inter), dtype=x.dtype, device=x.device)
-    _reduce_silu_mul_kernel[(R, triton.cdiv(inter, 256))](part1, act, R, inter, SPLIT=s1, BLOCK=256, num_warps=2)
-    part2, s2 = _gemv(act, down_packed, down_scale, down_global, ids, R, top_k, True, dn_tile or _DN_TILE)
+    gu_tile, dn_tile = gu_tile or _GU_TILE, dn_tile or _DN_TILE
+    part1 = act = part2 = None
+    for routes in ((1, 2) if copy is not None else (0,)):
+        if routes == 2:
+            join()
+        part1, s1 = _gemv(x, gate_up_packed, gate_up_scale, gate_up_global, ids, R, top_k, False, gu_tile,
+                          routes, copy, part1)
+        if act is None:
+            act = torch.empty((R, inter), dtype=x.dtype, device=x.device)
+        masks = {} if routes == 0 else dict(ids_ptr=ids, copy_slots_ptr=copy[0], num_copy_ptr=copy[1],
+                                            ROUTES=routes, MAX_COPY=triton.next_power_of_2(R))
+        _reduce_silu_mul_kernel[(R, triton.cdiv(inter, 256))](part1, act, R, inter, SPLIT=s1, BLOCK=256,
+                                                               num_warps=2, **masks)
+        part2, s2 = _gemv(act, down_packed, down_scale, down_global, ids, R, top_k, True, dn_tile,
+                          routes, copy, part2)
     out = torch.empty((M, H), dtype=x.dtype, device=x.device)
     _reduce_topk_sum_kernel[(M, triton.cdiv(H, 512))](
         part2, topk_weights, out, R, H, topk_weights.stride(0),

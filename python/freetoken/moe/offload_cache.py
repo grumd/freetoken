@@ -872,6 +872,13 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def decode_copy_stream(self) -> torch.cuda.Stream:
+        """The side stream decode's overlapped ``copy_missing`` runs on (one per cache)."""
+        stream = getattr(self, "_decode_copy_stream", None)
+        if stream is None:
+            stream = self._decode_copy_stream = torch.cuda.Stream(device=self.device)
+        return stream
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 

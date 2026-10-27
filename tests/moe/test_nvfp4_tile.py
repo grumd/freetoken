@@ -52,6 +52,26 @@ def test_decode_matches_exact_math():
     assert _rel(nvfp4_decode_silu(x, *bk, tw, ids), _reference(x, bk, tw, ids)) < 4e-3
 
 
+@pytest.mark.parametrize("in_flight", [0, 1, 3, 8])
+def test_decode_split_around_the_copy_is_bit_identical(in_flight):
+    """Resident routes before the join, copied-in routes after it: the same bits as one pass,
+    whichever routes the copy is still filling (none, some, all)."""
+    from freetoken.moe.fused_nvfp4_tile import nvfp4_decode_silu
+
+    bk = _banks(16, seed=3)
+    x = (torch.randn(2, H, device="cuda") * 0.5).to(torch.bfloat16)
+    tw = torch.softmax(torch.randn(2, TOPK, device="cuda"), -1)
+    ids = torch.randperm(16, device="cuda")[: 2 * TOPK].view(2, TOPK).to(torch.int32)
+    copy_slots = torch.full((16,), -1, dtype=torch.int32, device="cuda")
+    copy_slots[:in_flight] = ids.view(-1)[torch.randperm(2 * TOPK, device="cuda")[:in_flight]]
+    copy_slots[in_flight : in_flight + 2] = 15  # stale entries past num_copy are never read
+    num_copy = torch.tensor([in_flight], dtype=torch.int64, device="cuda")
+    joins = []
+    got = nvfp4_decode_silu(x, *bk, tw, ids, copy=(copy_slots, num_copy), join=lambda: joins.append(1))
+    torch.testing.assert_close(got, nvfp4_decode_silu(x, *bk, tw, ids), rtol=0, atol=0)
+    assert joins == [1]
+
+
 @pytest.mark.parametrize("fuse_act", [True, False])
 @pytest.mark.parametrize("nk_tile", [True, False])
 @pytest.mark.parametrize("routed", [False, True])

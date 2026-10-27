@@ -59,8 +59,24 @@ def _gemv_partials_kernel(
 
 
 @triton.jit
-def _reduce_silu_mul_kernel(part_ptr, out_ptr, R, INTER, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+def route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY: tl.constexpr):
+    """Whether ``slot`` is one of the ``num_copy`` cache slots this step's expert copy is filling."""
+    j = tl.arange(0, MAX_COPY)
+    dst = tl.load(copy_slots_ptr + j, mask=j < tl.load(num_copy_ptr), other=-1)
+    return tl.max((dst == slot).to(tl.int32), axis=0) > 0
+
+
+@triton.jit
+def _reduce_silu_mul_kernel(
+    part_ptr, out_ptr, R, INTER, SPLIT: tl.constexpr, BLOCK: tl.constexpr,
+    ids_ptr=None, copy_slots_ptr=None, num_copy_ptr=None,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
+):
+    # ROUTES 1 / 2: only the routes whose expert slot is resident / still being copied in
     r = tl.program_id(0)
+    if ROUTES != 0:
+        if route_in_flight(tl.load(ids_ptr + r), copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
+            return
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < INTER
     gate = tl.zeros((BLOCK,), dtype=tl.float32)

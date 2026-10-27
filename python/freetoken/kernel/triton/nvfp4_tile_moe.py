@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_u8_to_f16_x128
+from freetoken.kernel.triton.wna16_decode import route_in_flight
 
 # global epilogue factor: undoes the 2^-14 (e2m1 field) * 2^7 (e4m3 x128) of the dequant
 DEQUANT_UNDO = 128.0
@@ -220,7 +221,7 @@ def _prefill_nvfp4_gate_up_silu_kernel(
 
 @triton.jit
 def _gemv_partials_kernel(
-    a_ptr, p_ptr, s_ptr, g_ptr, part_ptr, ids_ptr,
+    a_ptr, p_ptr, s_ptr, g_ptr, part_ptr, ids_ptr, copy_slots_ptr, num_copy_ptr,
     R, N, kw_per, n_kw,
     stride_a,
     stride_pe, stride_pn,
@@ -228,14 +229,19 @@ def _gemv_partials_kernel(
     stride_ge,
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
 ):
     """Split-K decode GEMV over int32 words (``p_ptr`` is the bank viewed as int32
     [S, N, K/8]: 8 codes per word, two words share a scale):
-    ``part[s, r, n] = global[n] * sum_{k in split s} a[k] * W[n, k]`` in fp32."""
+    ``part[s, r, n] = global[n] * sum_{k in split s} a[k] * W[n, k]`` in fp32.
+    ``ROUTES`` as in :func:`_gemv_partials_v2_kernel`."""
     r = tl.program_id(0)
     nb = tl.program_id(1)
     s = tl.program_id(2)
     slot = tl.load(ids_ptr + r).to(tl.int64)
+    if ROUTES != 0:
+        if route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
+            return
     a_row = r if A_ROW_IS_ROUTE else r // TOP_K
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     nmask = offs_n < N
@@ -270,7 +276,7 @@ def _half2_to_f32(h2):
 
 @triton.jit
 def _gemv_partials_v2_kernel(
-    a_ptr, p_ptr, s_ptr, g_ptr, part_ptr, ids_ptr,
+    a_ptr, p_ptr, s_ptr, g_ptr, part_ptr, ids_ptr, copy_slots_ptr, num_copy_ptr,
     R, N, kw_per, n_kw,
     stride_a,
     stride_pe, stride_pn,
@@ -278,15 +284,20 @@ def _gemv_partials_v2_kernel(
     stride_ge,
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
 ):
     """:func:`_gemv_partials_kernel` with Marlin's e2m1 unpack: with a nibble in the top four
     bits of each 16-bit half, ``(q & 0x80008000) | ((q >> 3) & 0x0E000E00)`` is two fp16
     ``value * 2^-14`` at once (sign stays at bit 15, the magnitude lands at bits 9-11), and
-    ``q << 4`` brings up the next pair. Word nibble j (k = 8w + j) pairs with j + 4."""
+    ``q << 4`` brings up the next pair. Word nibble j (k = 8w + j) pairs with j + 4.
+    ``ROUTES`` 1 / 2 runs only the routes whose slot is resident / still being copied in."""
     r = tl.program_id(0)
     nb = tl.program_id(1)
     s = tl.program_id(2)
     slot = tl.load(ids_ptr + r).to(tl.int64)
+    if ROUTES != 0:
+        if route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
+            return
     a_row = r if A_ROW_IS_ROUTE else r // TOP_K
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     nmask = offs_n < N

@@ -35,6 +35,9 @@ _ROUTED_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_ROUTED_PREFILL_TOKENS", "0
 # 2**20), so one call takes at most 1024 ids; a routed-only prefill passes it the layer's
 # unique routed experts, which is bounded by num_experts.
 _LRU_MAX_QUERIES = 1024
+# GPU decode streams a step's missing experts on a side stream while the resident ones
+# compute, where the expert kernel supports it (bit-identical). FREETOKEN_COPY_OVERLAP=0 for A/B.
+_COPY_OVERLAP = os.getenv("FREETOKEN_COPY_OVERLAP", "1") != "0"
 
 
 class MoELayer(BaseOP):
@@ -341,6 +344,8 @@ class OffloadMoELayer(MoELayer):
         if (log := route_log.current()) is not None:
             log.record_actual(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
+        if _COPY_OVERLAP and (out := self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids)) is not None:
+            return out
         cache.copy_missing()
         return self._expert_gemm(
             cache,
@@ -555,6 +560,40 @@ class OffloadMoELayer(MoELayer):
     # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
+    def _decode_overlapped(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The staged copy runs on a side stream while the resident routes compute; None when
+        the expert kernel has no overlapped decode (the caller then copies and computes)."""
+        hook = getattr(getattr(self.quant_method, "kernel", None), "decode_overlapped", None)
+        if hook is None or not hidden_states.is_cuda or cache.is_unpinned_layer(self.layer_id):
+            return None
+        main = torch.cuda.current_stream(hidden_states.device)
+        side = cache.decode_copy_stream()
+
+        def start() -> None:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                cache.copy_missing()
+
+        view = self._expert_view(cache, cache.bank_views(), None, cache.alphas_for_slots(self.layer_id), topk_ids)
+        return hook(
+            self, hidden_states, topk_weights, topk_ids, view,
+            (cache.evict_slots, cache.num_indices), start, lambda: main.wait_stream(side),
+        )
+
+    def _expert_view(self, cache, views, n, alphas, topk_ids) -> ExpertView:
+        from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+
+        return ExpertView(
+            {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+        )
+
     def _expert_gemm(
         self,
         cache: OffloadMoeCache,
@@ -568,12 +607,7 @@ class OffloadMoELayer(MoELayer):
         is_prefill: bool,
     ) -> torch.Tensor:
         if self.quant_method is not None:
-            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
-
-            view = ExpertView(
-                {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
-            )
+            view = self._expert_view(cache, views, n, alphas, topk_ids)
             return self.quant_method.apply(
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )

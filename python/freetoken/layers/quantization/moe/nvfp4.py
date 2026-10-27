@@ -108,6 +108,22 @@ class TritonNvfp4MoEKernel(MoEKernel):
             return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, act, on_input, alpha, limit)
 
+    def decode_overlapped(self, layer, x, topk_weights, topk_ids, view: ExpertView, copy, start, join):
+        """Decode while this step's expert copy runs: ``start()`` launches it, the resident routes
+        compute, ``join()`` waits for it, then the copied-in routes. None (and no ``start``) when
+        the tile decode kernels do not serve this layer."""
+        from freetoken.moe import fused_nvfp4_tile as tile
+
+        t = view.tensors
+        if not (
+            _tile_kernels() and layer.activation == "silu" and not layer.apply_router_weight_on_input
+            and tile.decode_supported(t["gate_up"], t["down"])
+        ):
+            return None
+        banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
+        start()
+        return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, copy=copy, join=join)
+
 
 # ---------------------------------------------------------------------------
 # Marlin: vLLM's fused Marlin MoE (W4A16, dequant in kernel) over Marlin-tiled banks.
