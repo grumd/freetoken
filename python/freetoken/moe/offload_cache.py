@@ -181,9 +181,9 @@ class OffloadMoeCache:
     cpu_prefill: object | None = None
     cpu_prefill_fetch: float = 0.35
     # Decode with CPU help (--moe-decode-fetch < 1, GPU decode target): the CpuMoeExecutor that
-    # computes the misses a decode step does not fetch, and the fetched share in Q16.
+    # computes the misses a decode step does not fetch (None: plain decode), and the fetched share.
     cpu_decode: object | None = None
-    cpu_decode_fetch_q16: int = 1 << 16
+    decode_fetch: float = 1.0
     # Elastic VRAM (--elastic-kv): ``bank_alloc(name, shape, dtype)`` returns each bank's slot
     # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
     # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.
@@ -253,6 +253,8 @@ class OffloadMoeCache:
         # CPU-assisted decode: per-layer fetch credit (Q16 experts) and, with collect_stats,
         # per-layer [steps, active, missing, fetched] counters
         self.fetch_credit = torch.zeros((self.num_layers,), dtype=torch.int64, device=self.device)
+        # the fetched share in Q16, read by the split kernel so a captured graph follows changes
+        self.decode_fetch_q16 = torch.full((1,), 1 << 16, dtype=torch.int64, device=self.device)
         self.split_stats = torch.zeros((self.num_layers, 4), dtype=torch.int64, device=self.device)
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
@@ -942,14 +944,24 @@ class OffloadMoeCache:
 
     def ensure_experts_split(self, layer_id: int, expert_ids: torch.Tensor, topk_weights: torch.Tensor,
                              x: torch.Tensor, io: dict) -> None:
-        """CPU-assisted decode: hits and a ``cpu_decode_fetch_q16`` share of the misses get slots
+        """CPU-assisted decode: hits and a ``decode_fetch`` share of the misses get slots
         (``expert_ids`` -> slot ids, the fetched ones staged for ``copy_missing``), the other routes
         become -1 and their inputs land in the CPU executor's pinned buffers ``io``."""
         from freetoken.moe.offload_kernels import ensure_experts_split
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts_split(self, layer_id, expert_ids, topk_weights, x, io, self.cpu_decode_fetch_q16)
+        ensure_experts_split(self, layer_id, expert_ids, topk_weights, x, io, self.decode_fetch_q16)
+
+    def set_decode_fetch(self, fetch: float) -> None:
+        """CPU-assisted decode fetches this share of its misses over PCIe from the next step on;
+        captured graphs follow, since the split kernel reads it from device memory. Between
+        forwards."""
+        if not 0.0 <= fetch <= 1.0:
+            raise ValueError(f"decode fetch share must be in [0, 1], got {fetch}")
+        self.decode_fetch = float(fetch)
+        self.decode_fetch_q16.fill_(round(fetch * (1 << 16)))
+        self.fetch_credit.zero_()
 
     def ensure_experts_capped(self, layer_id: int, expert_ids: torch.Tensor, fetch_fraction: float,
                               counts: torch.Tensor | None = None) -> None:

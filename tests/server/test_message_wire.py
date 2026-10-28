@@ -2,7 +2,7 @@
 
 Every message that crosses api -> tokenizer -> scheduler -> tokenizer -> api must survive the
 wire with its fields intact; these pin the ones carrying state a later consumer reads back
-(rebuild control, prompt admission, per-reply token deltas and KV usage).
+(rebuild and decode-tune control, prompt admission, per-reply token deltas and KV usage).
 """
 
 from __future__ import annotations
@@ -16,6 +16,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    DecodeTuneBackendMsg,
+    DecodeTuneMsg,
+    DecodeTuneReply,
+    DecodeTuneResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserReply,
@@ -51,6 +55,18 @@ def test_cache_rebuild_reply_roundtrip():
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
     assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+
+
+def test_decode_tune_msgs_roundtrip():
+    msg = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(DecodeTuneMsg(request_id="t1", decode_fetch=0.15)))
+    assert isinstance(msg, DecodeTuneMsg) and (msg.decode_fetch, msg.threads) == (0.15, None)
+    back = BaseBackendMsg.decoder(DecodeTuneBackendMsg(request_id="t1", threads=3).encoder())
+    assert isinstance(back, DecodeTuneBackendMsg) and (back.decode_fetch, back.threads) == (None, 3)
+    result = {"decode_fetch": 0.15, "threads": 3, "max_threads": 8, "isa": "avx512f"}
+    res = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(DecodeTuneResultMsg("t1", "ok", result=result)))
+    assert isinstance(res, DecodeTuneResultMsg) and res.result == result
+    reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(DecodeTuneReply("t1", "rejected", error="no")))
+    assert isinstance(reply, DecodeTuneReply) and (reply.status, reply.result, reply.error) == ("rejected", None, "no")
 
 
 def test_prompt_admitted_msg_roundtrip():

@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -1349,6 +1350,17 @@ struct CpuMoeExecutor {
   int64_t spin_ns = 2000000;
   int bar_n = 1;  // barrier participants of the current task: the workers (+ the coordinator)
   bool coord_joins = false;  // the flag coordinator computes alongside the workers
+  // Workers [0, active_workers) take tasks; the rest sleep on park_cv (set_active_workers,
+  // called only while no task is in flight). cur_active is the count the current task uses.
+  // seen_gen / parked let set_active_workers wait until every worker it activates has caught
+  // up with cur_gen: one that read cur_gen after the next submit would skip that task and
+  // strand the others in the barrier.
+  std::atomic<int> active_workers{0};
+  int cur_active = 0;
+  std::mutex park_mtx;
+  std::condition_variable park_cv;
+  std::unique_ptr<std::atomic<uint64_t>[]> seen_gen;
+  std::unique_ptr<std::atomic<int>[]> parked;
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
@@ -1490,6 +1502,14 @@ struct CpuMoeExecutor {
     }
     if (const char* v = getenv("FREETOKEN_CPU_MOE_SPIN_US")) spin_ns = int64_t(atoll(v)) * 1000;
     bar_n = num_threads;
+    active_workers.store(num_threads);
+    cur_active = num_threads;
+    seen_gen.reset(new std::atomic<uint64_t>[num_threads]);
+    parked.reset(new std::atomic<int>[num_threads]);
+    for (int t = 0; t < num_threads; ++t) {
+      seen_gen[t].store(0);
+      parked[t].store(0);
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -1610,6 +1630,10 @@ struct CpuMoeExecutor {
       stop.store(true);
     }
     task_cv.notify_all();
+    {
+      std::lock_guard<std::mutex> lk(park_mtx);
+    }
+    park_cv.notify_all();
     for (auto& th : workers)
       if (th.joinable()) th.join();
     for (MoeTask* t : owned_tasks) delete t;
@@ -1990,13 +2014,25 @@ struct CpuMoeExecutor {
     pin_self(tid);
     uint64_t my_gen = 0;
     for (;;) {
+      if (tid >= active_workers.load()) {
+        std::unique_lock<std::mutex> lk(park_mtx);
+        parked[tid].store(1);
+        park_cv.wait(lk, [&] { return stop.load() || tid < active_workers.load(); });
+        if (stop.load()) return;
+        my_gen = cur_gen.load(std::memory_order_acquire);  // never run a task from before
+        seen_gen[tid].store(my_gen);
+        parked[tid].store(0);
+        continue;
+      }
       spin_then_wait([&] { return stop.load() || cur_gen.load() != my_gen; }, task_mtx, task_cv,
                      task_sleepers);
       if (stop.load()) return;
       my_gen = cur_gen.load(std::memory_order_acquire);
+      seen_gen[tid].store(my_gen);
+      if (tid >= cur_active) continue;  // parked since its last task: not part of this one
       MoeTask* t = cur_task;
       run_task_body(t);
-      if (done_count.fetch_add(1) + 1 == num_threads) {
+      if (done_count.fetch_add(1) + 1 == cur_active) {
         completed.store(my_gen);
         if (sync_sleepers.load() > 0) {
           std::lock_guard<std::mutex> lk(sync_mtx);
@@ -2006,8 +2042,25 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Runtime pool size: workers beyond n park until raised again. With none left the joining
+  // coordinator, or else the submitting thread, computes alone. Call only while no task is in
+  // flight.
+  void set_active_workers(int n) {
+    if (n < 0 || n > num_threads)
+      throw std::runtime_error("active workers must be in [0, " + std::to_string(num_threads) + "]");
+    {
+      std::lock_guard<std::mutex> lk(park_mtx);
+      active_workers.store(n);
+    }
+    park_cv.notify_all();
+    const uint64_t g = cur_gen.load();
+    for (int t = 0; t < n; ++t)
+      while (parked[t].load() || seen_gen[t].load() != g) std::this_thread::yield();
+  }
+
   void submit(MoeTask* t, bool coordinator_joins = false) {
-    bar_n = num_threads + (coordinator_joins ? 1 : 0);
+    cur_active = active_workers.load();
+    bar_n = std::max(1, cur_active + (coordinator_joins ? 1 : 0));
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2074,6 +2127,10 @@ struct CpuMoeExecutor {
     cur_task = t;
     const uint64_t g = cur_gen.load() + 1;
     submitted.store(g);
+    if (cur_active == 0) {
+      if (!coordinator_joins) run_task_body(t);
+      completed.store(g);
+    }
     cur_gen.store(g);
     if (task_sleepers.load() > 0) {
       std::lock_guard<std::mutex> lk(task_mtx);
@@ -2270,6 +2327,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_coordinator_joins",
            [](CpuMoeExecutor& e, bool v) { e.coord_joins = v; }, py::arg("value"))
       .def("set_w4a8", &CpuMoeExecutor::set_w4a8, py::arg("value"))
+      .def("set_active_workers", &CpuMoeExecutor::set_active_workers, py::arg("n"))
+      .def("active_workers", [](CpuMoeExecutor& e) { return e.active_workers.load(); })
       .def("take_flag_stats",
            [](CpuMoeExecutor& e) {
              return py::make_tuple(e.st_tasks.exchange(0), e.st_routes.exchange(0), e.st_ns.exchange(0));

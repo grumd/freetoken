@@ -14,6 +14,8 @@ from freetoken.message import (
     BatchBackendMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
+    DecodeTuneBackendMsg,
+    DecodeTuneResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
@@ -147,6 +149,8 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # CPU-assisted decode changes (calibration) waiting for the same idle point
+        self._pending_tunes: list[DecodeTuneBackendMsg] = []
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -326,6 +330,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or bool(self._pending_tunes)
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -337,6 +342,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if self._pending_tunes and last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._execute_pending_tunes()
 
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
         # A previous PREFILL batch must be drained before the round: its prefix commit
@@ -425,6 +434,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or bool(self._pending_tunes)
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -436,6 +446,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if self._pending_tunes and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._execute_pending_tunes()
         # MTP speculative round: processes the pending tokens of eligible (greedy)
         # decode requests BEFORE plain decode scheduling -- rounds replace decode steps
         # entirely (the verify handles the pending token; no plain step in between).
@@ -899,6 +913,8 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, DecodeTuneBackendMsg):
+            self._pending_tunes.append(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -947,6 +963,26 @@ class Scheduler(SchedulerIOMixin):
                 )
             ]
         )
+
+    @torch.inference_mode()
+    def _execute_pending_tunes(self) -> None:
+        """Apply queued CPU-assisted decode changes (calibration) at the idle point, on every
+        rank in the same loop iteration."""
+        from freetoken.engine.engine import CpuDecodeTuneRejected
+
+        msgs, self._pending_tunes = self._pending_tunes, []
+        for msg in msgs:
+            try:
+                if self.config.tp_info.size > 1:
+                    self.sync_all_ranks()
+                result = self.engine.tune_cpu_decode(msg.decode_fetch, msg.threads)
+            except CpuDecodeTuneRejected as e:
+                self.send_result([DecodeTuneResultMsg(msg.request_id, "rejected", error=str(e))])
+                continue
+            logger.info_rank0(
+                f"CPU-assisted decode tuned: fetch {result['decode_fetch']}, {result['threads']} threads"
+            )
+            self.send_result([DecodeTuneResultMsg(msg.request_id, "ok", result=result)])
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

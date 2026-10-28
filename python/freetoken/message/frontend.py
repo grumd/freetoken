@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -73,4 +73,13 @@ class CacheRebuildReply(BaseFrontendMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    error: str | None = None
+
+
+@dataclass
+class DecodeTuneReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/admin/decode-tune request.
+    request_id: str
+    status: str  # "ok" | "rejected"
+    result: Dict[str, Any] | None = None
     error: str | None = None

@@ -57,3 +57,12 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class DecodeTuneBackendMsg(BaseBackendMsg):
+    # tokenizer worker -> scheduler (every rank): change the CPU-assisted decode at the next idle
+    # point (calibration only, see Engine.tune_cpu_decode). None leaves a setting as it is.
+    request_id: str
+    decode_fetch: float | None = None
+    threads: int | None = None

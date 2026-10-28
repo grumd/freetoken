@@ -259,6 +259,9 @@ class CpuMoeExecutor:
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
+        # threads that compute a task: the workers, plus the coordinator when it joins
+        self.max_threads = nthreads + int(coordinator_joins and coord_core >= 0)
+        self.active_threads = self.max_threads
         if w4a8 is not None:
             self._ext.set_w4a8(bool(w4a8))
         if coordinator_joins:
@@ -570,6 +573,14 @@ class CpuMoeExecutor:
         else:
             self._ext.sync_with_cuda_stream(stream, task)
         return self._io[bs]["y"]
+
+    def set_active_threads(self, n: int) -> None:
+        """Compute the next tasks on ``n`` of the pool's threads (the joining coordinator counts
+        as one, the last workers park). Only between forwards: no task may be in flight."""
+        if not 1 <= n <= self.max_threads:
+            raise ValueError(f"CPU decode threads must be in [1, {self.max_threads}], got {n}")
+        self._ext.set_active_workers(n - (self.max_threads - self.num_threads))
+        self.active_threads = n
 
     def take_stats(self) -> tuple[int, int, float]:
         """(tasks, routes computed, seconds from doorbell to done) of the flag coordinator since

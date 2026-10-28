@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    DecodeTuneMsg,
+    DecodeTuneReply,
     TokenizeMsg,
     UserReply,
 )
@@ -37,7 +39,7 @@ from pydantic import BaseModel
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
-from .accounting import AdmissionClosedError, register_accounting_routes
+from .accounting import AdmissionClosedError, _is_loopback, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
 from . import request_ring
@@ -147,6 +149,8 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # /v1/admin/decode-tune waiters (calibration), same correlation
+    tune_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -249,6 +253,11 @@ class FrontendManager:
             msg = await self.recv_tokenizer.get()
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
+                continue
+            if isinstance(msg, DecodeTuneReply):
+                fut = self.tune_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": msg.status, "error": msg.error, **(msg.result or {})})
                 continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
@@ -649,6 +658,39 @@ async def cache_rebuild(req: CacheRebuildRequest):
     if result["status"] == "timeout":
         return JSONResponse(result, status_code=504)
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
+
+
+class DecodeTuneRequest(BaseModel):
+    decode_fetch: float | None = None
+    threads: int | None = None
+    timeout: float = 120.0
+
+
+@app.post("/v1/admin/decode-tune", include_in_schema=False)
+async def decode_tune(request: Request, req: DecodeTuneRequest):
+    """Internal, for scripts/calibrate-qwen38.sh: change the CPU-assisted decode's fetched share
+    and CPU thread count once the engine is idle. Loopback only, and the engine refuses unless
+    it was started with FREETOKEN_CPU_DECODE_TUNABLE=1. An empty body reports the settings."""
+    if not _is_loopback(request.client.host if request.client else None):
+        return JSONResponse({"status": "rejected", "error": "loopback access required"}, status_code=403)
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse(
+            {"status": "busy", "error": f"engine is {state.maintenance_state}"}, status_code=503
+        )
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.tune_futures[request_id] = fut
+    try:
+        await state.send_one(
+            DecodeTuneMsg(request_id=request_id, decode_fetch=req.decode_fetch, threads=req.threads)
+        )
+        result = await asyncio.wait_for(fut, timeout=req.timeout)
+    except asyncio.TimeoutError:
+        return JSONResponse({"status": "timeout", "request_id": request_id}, status_code=504)
+    finally:
+        state.tune_futures.pop(request_id, None)
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
 
 
 def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -> dict:

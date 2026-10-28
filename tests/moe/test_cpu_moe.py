@@ -571,9 +571,48 @@ def test_staged_decode_fp32_with_joining_coordinator(w4a8):
         graph.replay()
         torch.cuda.synchronize()
         assert ((out[0].cpu() - want).norm() / max(want.norm(), 1e-6)) < tol
+    # the same graph after runtime thread-count changes (1 = the coordinator alone)
+    assert ex.max_threads == 3
+    for seed, n in enumerate((1, 3, 2, 1, 2), start=10):
+        ex.set_active_threads(n)
+        want = fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert ((out[0].cpu() - want).norm() / max(want.norm(), 1e-6)) < tol
     if ex._flag_sync:
-        assert ex._ext.flag_served_count(ex._flag_slots[(layer, 1)]) >= 4
+        assert ex._ext.flag_served_count(ex._flag_slots[(layer, 1)]) >= 9
         ex.raise_if_unhealthy()
+
+
+def test_active_threads_change_between_tasks():
+    """set_active_threads between eager tasks (calibration's thread sweep): parked workers never
+    take part in a task or strand the others in its barrier, at any sequence of counts."""
+    import random
+
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    E, H, I, top_k = 32, 1024, 256, 8
+    cache = _make_nvfp4_cache(1, E, H, I, seed=3)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=4, max_tokens=1, device=torch.device("cpu"), cpus=[0, 1, 2, 3],
+                        out_fp32=True, w4a8=False)
+    assert ex.max_threads == 4
+    with pytest.raises(ValueError):
+        ex.set_active_threads(5)
+    io = ex.stage(0, 1)
+    task = ex._task_for(0, 1)
+    io["x"].copy_(torch.randn(1, H).bfloat16())
+    io["w"].fill_(1.0 / top_k)
+    io["ids"].copy_(torch.randperm(E)[:top_k].view(1, -1).to(torch.int32))
+    ex._ext.run_task(task)
+    want = io["y"].clone()
+    rng = random.Random(0)
+    for i in range(600):
+        if i % 2 == 0:
+            ex.set_active_threads(rng.randint(1, 4))
+        io["y"].zero_()
+        ex._ext.run_task(task)
+        torch.testing.assert_close(io["y"], want, rtol=1e-5, atol=1e-6)
 
 
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():

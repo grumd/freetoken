@@ -64,11 +64,11 @@ def ensure_experts_hybrid(
 
 
 def ensure_experts_split(cache, layer_id: int, expert_ids: torch.Tensor, topk_weights: torch.Tensor,
-                         x: torch.Tensor, io: dict, frac_q16: int) -> None:
+                         x: torch.Tensor, io: dict, frac_q16: torch.Tensor) -> None:
     """Decode with CPU help (``--moe-decode-fetch`` < 1): hits stay on the GPU, a ``frac_q16 / 2^16``
-    share of the misses is fetched over PCIe into LRU victim slots (the most recently routed ones
-    first), and the rest are left to the CPU. ``expert_ids`` becomes slot ids, -1 for a CPU route.
-    The same launch writes the CPU's inputs straight into its pinned buffers ``io``: ``x``, the
+    share of the misses (``frac_q16``: a one-element device tensor) is fetched over PCIe into LRU
+    victim slots (the most recently routed ones first), and the rest are left to the CPU.
+    ``expert_ids`` becomes slot ids, -1 for a CPU route. The same launch writes the CPU's inputs straight into its pinned buffers ``io``: ``x``, the
     expert id of every CPU route (-1 elsewhere) and the routing weights. A per-layer credit carries
     the fractional share across steps, so the long-run fetched share is exact."""
     T = x.shape[0]
@@ -79,7 +79,7 @@ def ensure_experts_split(cache, layer_id: int, expert_ids: torch.Tensor, topk_we
         cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
         cache.evict_slots, cache.src_indices, cache.num_indices,
         cache.expert_recency, cache.fetch_credit, cache.split_stats,
-        layer_id, R, frac_q16, x.stride(0), topk_weights.stride(0),
+        frac_q16, layer_id, R, x.stride(0), topk_weights.stride(0),
         H=H, TOKENS=T, TOP_K=R // T,
         num_experts=cache.num_experts, cache_size=cache.cache_size,
         BLOCK_E=triton.next_power_of_2(cache.num_experts),
@@ -465,13 +465,13 @@ _I64_MAX = tl.constexpr(9223372036854775807)
 _I64_MIN = tl.constexpr(-1152921504606846976)
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "frac_q16", "x_stride", "w_stride"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "x_stride", "w_stride"])
 def _ensure_experts_split_kernel(
     ids_ptr, w_ptr, x_ptr, hx_ptr, hids_ptr, hw_ptr,
     slot_for_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr,
     evict_slots_ptr, src_indices_ptr, num_indices_ptr,
     recency_ptr, credit_ptr, stats_ptr,
-    layer_id, num_active, frac_q16, x_stride, w_stride,
+    frac_ptr, layer_id, num_active, x_stride, w_stride,
     H: tl.constexpr, TOKENS: tl.constexpr, TOP_K: tl.constexpr,
     num_experts: tl.constexpr, cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
@@ -492,7 +492,7 @@ def _ensure_experts_split_kernel(
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
-    credit = tl.load(credit_ptr + layer_id) + (num_missing * frac_q16).to(tl.int64)
+    credit = tl.load(credit_ptr + layer_id) + num_missing.to(tl.int64) * tl.load(frac_ptr)
     num_fetch = tl.minimum(num_missing, (credit >> 16).to(tl.int32))
     tl.store(credit_ptr + layer_id, credit - (num_fetch.to(tl.int64) << 16))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))

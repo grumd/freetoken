@@ -193,7 +193,8 @@ def test_decode_split_matches_reference(frac):
     E, S, K, H, L = 48, 64, 8, 256, 2
     cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=torch.device("cuda"),
                             quant_format="bf16")
-    cache.cpu_decode_fetch_q16 = q = round(frac * Q)
+    cache.set_decode_fetch(frac)
+    q = round(frac * Q)
     io = {"x": torch.zeros(1, H, dtype=torch.bfloat16, pin_memory=True),
           "ids": torch.zeros(1, K, dtype=torch.int32, pin_memory=True),
           "w": torch.zeros(1, K, dtype=torch.float32, pin_memory=True)}
@@ -223,3 +224,59 @@ def test_decode_split_matches_reference(frac):
         total_fetched += n
     assert cache.fetch_credit.tolist() == credit
     assert abs(total_fetched - frac * total_missing) < L
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_split_share_change_reaches_a_captured_graph():
+    """set_decode_fetch between replays of a captured split launch: the kernel reads the share
+    from device memory, so the graph fetches the new share without a re-capture."""
+    torch.manual_seed(2)
+    E, S, K, H = 48, 64, 8, 256
+    dev = torch.device("cuda")
+    cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=S, device=dev, quant_format="bf16")
+    io = {"x": torch.zeros(1, H, dtype=torch.bfloat16, pin_memory=True),
+          "ids": torch.zeros(1, K, dtype=torch.int32, pin_memory=True),
+          "w": torch.zeros(1, K, dtype=torch.float32, pin_memory=True)}
+    g = torch.zeros(1, K, dtype=torch.int32, device=dev)
+    x = torch.zeros(1, H, dtype=torch.bfloat16, device=dev)
+    w = torch.full((1, K), 1.0 / K, device=dev)
+    probs = torch.softmax(torch.randn(E) * 2, -1)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        cache.ensure_experts_split(0, g, w, x, io)  # compile outside the capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            cache.ensure_experts_split(0, g, w, x, io)
+    torch.cuda.synchronize()
+    cache.reset()
+    slot_for_id, usage, id_of_slot = [-1] * E, [0] * S, [-1] * S
+    recency, credit = [-1] * E, [0]
+    step = int(cache.step.item())
+    for frac, steps in ((0.5, 40), (0.1, 60), (1.0, 20), (0.0, 20)):
+        cache.set_decode_fetch(frac)
+        credit[0] = 0
+        for _ in range(steps):
+            ids = torch.multinomial(probs, K).to(torch.int32)
+            g.copy_(ids.view(1, K))
+            graph.replay()
+            torch.cuda.synchronize()
+            step += 1
+            want, order = _split_reference(slot_for_id, usage, id_of_slot, recency, credit, step, 0,
+                                           ids.tolist(), round(frac * Q), E)
+            assert g.view(-1).tolist() == want
+            assert cache.src_indices[: int(cache.num_indices.item())].tolist() == order
+
+
+def test_set_decode_fetch_sets_the_device_share():
+    """The share lands in the device tensor the split kernel reads and the per-layer credit
+    restarts."""
+    cache = OffloadMoeCache(num_layers=2, num_experts=8, cache_size=16, device=torch.device("cpu"),
+                            quant_format="bf16")
+    cache.fetch_credit.fill_(5)
+    cache.set_decode_fetch(0.1)
+    assert cache.decode_fetch == 0.1 and int(cache.decode_fetch_q16) == round(0.1 * Q)
+    assert cache.fetch_credit.tolist() == [0, 0]
+    cache.set_decode_fetch(0.0)
+    assert int(cache.decode_fetch_q16) == 0
+    with pytest.raises(ValueError):
+        cache.set_decode_fetch(1.5)
