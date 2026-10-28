@@ -571,6 +571,12 @@ class CpuMoeExecutor:
             self._ext.sync_with_cuda_stream(stream, task)
         return self._io[bs]["y"]
 
+    def take_stats(self) -> tuple[int, int, float]:
+        """(tasks, routes computed, seconds from doorbell to done) of the flag coordinator since
+        the last call."""
+        tasks, routes, ns = self._ext.take_flag_stats()
+        return tasks, routes, ns * 1e-9
+
     def decode(
         self,
         layer_id: int,

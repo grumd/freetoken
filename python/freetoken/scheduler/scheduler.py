@@ -195,6 +195,11 @@ class Scheduler(SchedulerIOMixin):
             )
             if cache.cpu_decode is not None:
                 seg += f", fetched {s['fetched_per_layer']:.2f}, cpu {s['cpu_per_layer']:.2f}"
+                tasks, routes, secs = cache.cpu_decode.take_stats()
+                if tasks and routes:
+                    expert = sum(t[0].nbytes for t in cache.bank_sources.values()) / cache.num_experts
+                    seg += (f" ({1e6 * secs / tasks:.0f} us/layer, {1e6 * secs / routes:.0f} us/expert, "
+                            f"{routes * expert / secs / 1e9:.0f} GB/s)")
             return seg
 
         return segment

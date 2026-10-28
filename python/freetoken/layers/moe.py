@@ -38,6 +38,9 @@ _LRU_MAX_QUERIES = 1024
 # GPU decode streams a step's missing experts on a side stream while the resident ones
 # compute, where the expert kernel supports it (bit-identical). FREETOKEN_COPY_OVERLAP=0 for A/B.
 _COPY_OVERLAP = os.getenv("FREETOKEN_COPY_OVERLAP", "1") != "0"
+# Diagnostics: prefill chunks as small as a decode step also take the CPU-assisted decode path, so
+# a --max-prefill-length 1 prompt is a teacher-forced decode (logit dumps for quality A/Bs).
+_CPU_DECODE_PREFILL = os.getenv("FREETOKEN_CPU_DECODE_PREFILL", "0") == "1"
 
 
 class MoELayer(BaseOP):
@@ -354,7 +357,8 @@ class OffloadMoELayer(MoELayer):
             run_first()
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         if (cache.cpu_decode is not None and hidden_states.size(0) <= cache.cpu_decode.max_tokens
-                and not get_global_ctx().batch.is_prefill and not cache.is_unpinned_layer(self.layer_id)):
+                and (_CPU_DECODE_PREFILL or not get_global_ctx().batch.is_prefill)
+                and not cache.is_unpinned_layer(self.layer_id)):
             return self._decode_cpu_split(cache, hidden_states, topk_weights, topk_ids, during_copy)
         if (cache.cpu_prefill is not None and hidden_states.size(0) <= cache.cpu_prefill.max_tokens
                 and get_global_ctx().batch.is_prefill):

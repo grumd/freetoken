@@ -1377,6 +1377,8 @@ struct CpuMoeExecutor {
   int coord_num_slots = 0;
   std::vector<MoeTask*> flag_task;           // slot -> task (registered lazily)
   std::vector<int64_t> flag_served;          // slot -> completed dispatch count (tests/debug)
+  // coordinator totals since the last take_flag_stats: tasks, routes computed, ns from doorbell to done
+  std::atomic<int64_t> st_tasks{0}, st_routes{0}, st_ns{0};
   std::mutex flag_task_mtx;
 
   // Portable ordering for the flag handshake: "ready observed => the DMA'd inputs that
@@ -2166,9 +2168,15 @@ struct CpuMoeExecutor {
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
           }
           if (t != nullptr) {
+            const int64_t t0 = now_ns();
             submit(t, coord_joins);
             if (coord_joins) run_task_body(t);
             sync();
+            int64_t routes = 0;
+            for (int i = 0; i < t->num_tokens * top_k; ++i) routes += t->ids[i] >= 0;
+            st_tasks.fetch_add(1, std::memory_order_relaxed);
+            st_routes.fetch_add(routes, std::memory_order_relaxed);
+            st_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -2262,6 +2270,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_coordinator_joins",
            [](CpuMoeExecutor& e, bool v) { e.coord_joins = v; }, py::arg("value"))
       .def("set_w4a8", &CpuMoeExecutor::set_w4a8, py::arg("value"))
+      .def("take_flag_stats",
+           [](CpuMoeExecutor& e) {
+             return py::make_tuple(e.st_tasks.exchange(0), e.st_routes.exchange(0), e.st_ns.exchange(0));
+           })
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
