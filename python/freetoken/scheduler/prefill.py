@@ -124,6 +124,7 @@ class PrefillAdder:
         linear_slot_idx: int | None = None,
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
+        last_track_seqlen: int | None = None,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
@@ -196,6 +197,11 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        # Intermediate chunks are never committed (see _process_last_data), so the prior chunk's
+        # x64 snapshot -- still intact in ping_pong[1 - next_track_idx] -- must ride along: a
+        # final chunk too short to track its own boundary (<= CHUNK_SIZE tokens) commits it
+        # instead of leaving nothing of this prompt resumable.
+        req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -213,6 +219,7 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )

@@ -251,6 +251,66 @@ def test_decode_snapshots_at_page_size_64():
     assert float(pool.recurrent_states[0, hit.mamba_value].max()) == 192.0
 
 
+
+def _run_prompt(cm, tm, pool, ids, max_tokens, budget):
+    """Drive one request through chunked prefill the way the scheduler does: a continuation
+    chunk is admitted from the previous ChunkedReq, intermediate chunks are never cached, the
+    forward's x64 track (attention/linear.py _build_track_metadata) is emulated on the host,
+    and a request whose output budget ends at prefill goes straight to the finish commit."""
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder
+    from freetoken.scheduler.utils import PendingReq
+
+    pending = PendingReq(0, torch.tensor(ids, dtype=torch.int32), SamplingParams(max_tokens=max_tokens))
+    while True:
+        adder = PrefillAdder(token_budget=budget, reserved_size=0, cache_manager=cm, table_manager=tm)
+        req = adder.try_add_one(pending)
+        pending.chunked_req = req if isinstance(req, ChunkedReq) else None
+        cm.allocate_paged([req])
+        if req.mamba_restore_src is not None:
+            pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+        c = (req.extend_len - 1) // CHUNK_SIZE
+        if c >= 1:  # snapshot the deepest boundary strictly inside the extend
+            boundary = req.cached_len + c * CHUNK_SIZE
+            pool.recurrent_states[:, req.mamba_ping_pong[req.mamba_next_track_idx]] = float(boundary)
+            req.mamba_last_track_seqlen = boundary
+            req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+        req.complete_one()
+        pool.recurrent_states[:, req.linear_slot_idx] = float(req.cached_len)
+        if isinstance(req, ChunkedReq):
+            continue
+        req.append_host(torch.tensor([7], dtype=torch.int32))
+        if req.can_decode:
+            cm.cache_req(req, finished=False)
+        cm.cache_req(req, finished=True)
+        tm.free(req.table_idx)
+        return
+
+
+def test_multi_chunk_prompt_with_short_final_chunk_stays_resumable():
+    """A prompt whose final prefill chunk is <= CHUNK_SIZE tokens tracks no boundary of its
+    own. Intermediate chunks are never committed, so unless the previous chunk's snapshot is
+    carried into the final chunk nothing of the prompt is resumable -- and the next turn, which
+    re-renders the prompt's last token, falls back to the previous turn's prefix."""
+    from freetoken.scheduler.table import TableManager
+
+    for max_tokens in (1, 4):  # finish at prefill (fill request) / commit at prefill, then decode
+        pool = _pool()
+        pt = torch.zeros(2, 2048, dtype=torch.int32)
+        cm = CacheManager(32, 64, pt, "hybrid_radix", linear_state_pool=pool)
+        tm = TableManager(max_running_reqs=2, page_table=pt)
+        first = list(range(1, 129))
+        _run_prompt(cm, tm, pool, first, max_tokens, budget=256)
+        # each turn re-renders the previous prompt's last token (diverges at len - 1)
+        assert cm.match_req(_pend(first[:-1] + [9, 9])).cuda_handle.cached_len == 64
+        # 64 cached + chunks of 256, 256, 64: the last chunk tracks no boundary
+        second = first[:-1] + list(range(1000, 1513))
+        _run_prompt(cm, tm, pool, second, max_tokens, budget=256)
+        hit = cm.match_req(_pend(second[:-1] + [9, 9]))
+        assert hit.cuda_handle.cached_len == 512, (max_tokens, hit.cuda_handle.cached_len)
+        assert float(pool.recurrent_states[0, hit.mamba_value].max()) == 512.0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
