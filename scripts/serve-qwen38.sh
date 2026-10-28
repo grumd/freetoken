@@ -46,12 +46,27 @@ fi
                                 # rest; 0 = GPU only (bit-reproducible with DECODE_FETCH=1, use both for A/B runs)
 : "${CPU_PREFILL_FETCH:=0.35}"  # share of the misses fetched over PCIe (the most-routed ones)
 : "${PRECISE_PREFILL:=1}"       # W4A16: apply group scales after the dot, gate/up in fp32 (no cost)
+# CPU-assisted decode: explicit env > this machine's calibration for this GPU set
+# (calibrate-qwen38.sh) > the defaults below
+: "${CALIBRATION:=${XDG_CONFIG_HOME:-$HOME/.config}/freetoken/calibration-gpus-$(echo "$GPUS" | tr -c '0-9\n' '-').env}"
+decode_src=env
+if [ "$fmt" = nvfp4 ] && [ -z "${DECODE_FETCH:-}" ] && [ -r "$CALIBRATION" ]; then
+  cal_fetch=$(sed -n 's/^DECODE_FETCH=\([0-9.]*\)$/\1/p' "$CALIBRATION" | tail -1)
+  cal_threads=$(sed -n 's/^CPU_DECODE_THREADS=\([0-9]*\)$/\1/p' "$CALIBRATION" | tail -1)
+  if [ -n "$cal_fetch" ]; then
+    DECODE_FETCH=$cal_fetch decode_src="calibration $CALIBRATION"
+    [ -n "$cal_threads" ] && : "${CPU_DECODE_THREADS:=$cal_threads}"
+  fi
+fi
+[ -z "${DECODE_FETCH:-}" ] && decode_src=default
 # FP4 on one GPU: decode computes most expert-cache misses on the CPU (28 -> 53 tok/s at 4k, 20 -> 46
 # at 261k); two GPUs miss too rarely for it to pay (93 -> 89 tok/s at 0.5)
 [ "${#gpu_list[@]}" -lt 2 ] && [ "$fmt" = nvfp4 ] && : "${DECODE_FETCH:=0.1}"
 : "${DECODE_FETCH:=1}"          # FP4: share of decode's expert-cache misses fetched over PCIe into the cache;
                                 # the CPU computes the rest from the pinned banks (1 = all over PCIe, 0 = all
                                 # on the CPU, and the cache then only changes during prefill)
+: "${CPU_DECODE_THREADS:=}"     # DECODE_FETCH < 1: CPU threads per GPU; empty = all physical cores but one
+                                # on one GPU, the GPU's share of them with several
 : "${CPU_DECODE_ACT:=fp32}"     # DECODE_FETCH < 1: CPU expert activations, fp32 (exact) or int8 (W4A8, no
                                 # faster here: the CPU GEMV is memory-bound either way)
 if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1280}"; fi
@@ -114,6 +129,10 @@ export FREETOKEN_WNA16_CPU_PREFILL_FETCH="$CPU_PREFILL_FETCH"
 export FREETOKEN_WNA16_PREFILL_PRECISE="$PRECISE_PREFILL"
 export FREETOKEN_MOE_DECODE_FETCH="$DECODE_FETCH"
 export FREETOKEN_CPU_DECODE_ACT="$CPU_DECODE_ACT"
+[ -n "$CPU_DECODE_THREADS" ] && export FREETOKEN_CPU_DECODE_THREADS="$CPU_DECODE_THREADS"
+if [ "$fmt" = nvfp4 ]; then
+  echo "serve-qwen38: DECODE_FETCH=$DECODE_FETCH CPU_DECODE_THREADS=${CPU_DECODE_THREADS:-auto} ($decode_src)" >&2
+fi
 
 unit="ft-serve-$$"
 if [ "$CGROUP" = "1" ] && command -v systemd-run >/dev/null; then

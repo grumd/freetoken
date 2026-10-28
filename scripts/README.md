@@ -89,7 +89,9 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | `ROUTED_PF` | `3072` (`1280` without CPU prefill) | prefill chunks up to this many tokens load only their routed experts |
 | `PRECISE_PREFILL` | `1` | W4A16 exact-dequant prefill (no speed cost) |
 | `HIT_D2D` | `1` | prefill chunks above `ROUTED_PF` copy VRAM-cached experts device-side and stream only the misses over PCIe |
-| `DECODE_FETCH` | `0.1` for FP4 on one GPU, else `1` | FP4: share of decode's expert-cache misses fetched over PCIe into the cache (`--moe-decode-fetch`); the CPU computes the rest from the pinned banks. One GPU: 28 -> 53 tok/s at 4k, 20 -> 46 at 261k. `1` = every miss over PCIe (output identical to before), `0` = every miss on the CPU (the cache then only changes during prefill: 41 tok/s) |
+| `DECODE_FETCH` | calibration file, else `0.1` for FP4 on one GPU, else `1` | FP4: share of decode's expert-cache misses fetched over PCIe into the cache (`--moe-decode-fetch`); the CPU computes the rest from the pinned banks. One GPU: 28 -> 53 tok/s at 4k, 20 -> 46 at 261k. `1` = every miss over PCIe (output identical to before), `0` = every miss on the CPU (the cache then only changes during prefill: 41 tok/s) |
+| `CPU_DECODE_THREADS` | calibration file, else all physical cores but one on one GPU | `DECODE_FETCH < 1`: CPU threads per GPU (`--moe-cpu-decode-threads`) |
+| `CALIBRATION` | `~/.config/freetoken/calibration-gpus-<GPUS>.env` | `calibrate-qwen38.sh` result read for `DECODE_FETCH` / `CPU_DECODE_THREADS` when they are not set |
 | `CPU_DECODE_ACT` | `fp32` | `DECODE_FETCH < 1`: activations of the CPU expert GEMV; `int8` (W4A8) is no faster here, the GEMV is memory-bound either way |
 | `BALANCED` | `1` | W4A16 at TP=2: even 320/320 expert split |
 | `DENSE_FP8` | `0` | fp8 dense linears: faster decode, lossy |
@@ -107,8 +109,57 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 **Other hardware:**
 
 - **Bigger cards:** nothing to set; elastic VRAM gives the extra memory to the context and the expert cache.
-- **Faster PCIe or RAM:** `CPU_PREFILL_FETCH`, `DECODE_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5 (the CPU decode reaches ~50 GB/s of expert reads, ~57 us per expert). On a faster link, fetch more over PCIe and lower `ROUTED_PF`.
+- **Faster PCIe or RAM:** `CPU_PREFILL_FETCH`, `DECODE_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5 (the CPU decode reaches ~50 GB/s of expert reads, ~57 us per expert). On a faster link, fetch more over PCIe and lower `ROUTED_PF`. For `DECODE_FETCH` and the CPU thread count, run `calibrate-qwen38.sh` once instead (see below).
 - **One GPU decode:** with `--moe-collect-stats` the status line shows how decode splits its misses (`fetched`, `cpu`) and the CPU's time per layer and per expert.
+
+### Calibrating CPU-assisted decode (FP4)
+
+How much of decode's expert-cache misses the CPU should compute depends on the CPU, the RAM, the GPUs and the PCIe link. `calibrate-qwen38.sh` measures this machine once, with the `SNAP` and `GPUS` you serve with. `serve-qwen38.sh` then reads the result at every start; it never measures anything itself.
+
+```bash
+SNAP=~/models/ftw/q38-fp4 GPUS=0   scripts/calibrate-qwen38.sh   # one GPU
+SNAP=~/models/ftw/q38-fp4 GPUS=0,1 scripts/calibrate-qwen38.sh   # two GPUs: a separate result
+```
+
+It needs idle GPUs and the same free RAM as the server. On 2x RTX 3080 it takes about 12 min with one GPU and 6 min with two, both model loads included; two GPUs skip the thread and confirmation runs when CPU help does not pay. Steps:
+
+1. **Probe, without the server (~5 s):**
+   - pinned host->device bandwidth per GPU, and of all of them at once;
+   - the CPU's ISA;
+   - the CPU expert kernel's time per expert at a few thread counts, on one layer of the checkpoint's real experts.
+
+   With an INT4 checkpoint, or a CPU without AVX2 (scalar kernel), it stops here and writes `DECODE_FETCH=1`.
+2. **Reference load:** `serve-qwen38.sh` on port `CAL_PORT` (18080) with `DECODE_FETCH=1` (plain decode). Three greedy streaming decodes each at about 4k and about 100k tokens of context (capped to what fits).
+3. **Sweep load:** the server restarts with CPU help and `FREETOKEN_CPU_DECODE_TUNABLE=1`, under which an internal, loopback-only endpoint changes the settings between requests:
+   - `DECODE_FETCH`: 0.5, 0.25, 0.15, 0.1 and 0.05, at both context lengths;
+   - CPU threads: two more counts at the best share, at the long context, where the expert cache is smallest and the CPU does the most work.
+
+   The decode path itself is fixed per load (the CUDA graphs are captured at start), which is why plain decode gets a load of its own.
+4. **Pick:**
+   - among the shares that lose nowhere, the highest one within 2% of the fastest; a higher share means less CPU work and less change from plain decode;
+   - the fewest threads within 2% of the fastest;
+   - `DECODE_FETCH=1` (off) unless the pick beats it by 5% at every context length;
+   - then the pick and the fastest share (when they differ) run twice more per context; the pick is made again from the means of three runs, which must still beat the reference's three.
+
+It writes `~/.config/freetoken/calibration-gpus-<GPUS>.env` (`calibration-gpus-0.env`, `calibration-gpus-0-1.env`, under `$XDG_CONFIG_HOME` if set). The file holds `DECODE_FETCH` and `CPU_DECODE_THREADS`, with comments recording the date, the hardware and the measured speeds. The full report (tables, choice, reasons) is next to it as `.txt`, the raw numbers as `.json`.
+
+`serve-qwen38.sh` picks the values in this order:
+
+1. `DECODE_FETCH` / `CPU_DECODE_THREADS` set in the environment;
+2. the calibration file for the current `GPUS` (FP4 only; `CALIBRATION=<file>` points elsewhere, `CALIBRATION=/dev/null` ignores it);
+3. the defaults: `0.1` on one GPU, `1` on two.
+
+It logs the values and where they came from, e.g. `serve-qwen38: DECODE_FETCH=0.15 CPU_DECODE_THREADS=7 (calibration ...)`. An explicit `DECODE_FETCH` also skips the file's thread count. Calibrate again after changing the CPU, RAM, GPUs, PCIe slots or the BIOS memory settings.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SNAP`, `GPUS`, `FT` | as for `serve-qwen38.sh` | checkpoint, GPU set and `ft` binary; other `serve-qwen38.sh` variables pass through |
+| `LONG_CTX` | `100000` | long-context length; `0` skips it (about half the time on one GPU) |
+| `SHORT_CTX` | `4096` | short-context length |
+| `CAL_TOKENS`, `CAL_SKIP` | `192`, `48` | measured decode tokens per prompt, after this many unmeasured warm-up tokens |
+| `THREADS` | | fix the CPU thread count instead of sweeping it |
+| `CAL_PORT` | `18080` | the calibration server's port |
+| `CAL_DIR` | `~/.config/freetoken` | where the result goes |
 
 ### Troubleshooting
 
@@ -123,6 +174,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | Script | Purpose |
 |---|---|
 | `memguard.sh` | RAM watchdog used by `serve-qwen38.sh` (`PAT`, `FLOOR`, `LOG`) |
+| `calibrate-qwen38.sh`, `calibrate_qwen38.py` | one-time CPU-assisted decode calibration read by `serve-qwen38.sh` (see above) |
 | `run-tests.sh` | fresh-venv install + unit tests + serve/chat smoke test (comments in German) |
 | `mtp_bench.py` | MTP speculative-decoding throughput and acceptance against a running server |
 | `dspark_greedy_identity.py`, `dspark_verify_diff.py` | DSpark (DeepSeek-V4.1) greedy-identity and verify-vs-decode harnesses |
