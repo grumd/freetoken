@@ -180,6 +180,10 @@ class OffloadMoeCache:
     # over PCIe instead (see OffloadMoELayer._prefill_cpu_hybrid).
     cpu_prefill: object | None = None
     cpu_prefill_fetch: float = 0.35
+    # Decode with CPU help (--moe-decode-fetch < 1, GPU decode target): the CpuMoeExecutor that
+    # computes the misses a decode step does not fetch, and the fetched share in Q16.
+    cpu_decode: object | None = None
+    cpu_decode_fetch_q16: int = 1 << 16
     # Elastic VRAM (--elastic-kv): ``bank_alloc(name, shape, dtype)`` returns each bank's slot
     # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
     # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.
@@ -246,6 +250,10 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        # CPU-assisted decode: per-layer fetch credit (Q16 experts) and, with collect_stats,
+        # per-layer [steps, active, missing, fetched] counters
+        self.fetch_credit = torch.zeros((self.num_layers,), dtype=torch.int64, device=self.device)
+        self.split_stats = torch.zeros((self.num_layers, 4), dtype=torch.int64, device=self.device)
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
@@ -558,6 +566,8 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.fetch_credit.zero_()
+        self.split_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -930,6 +940,17 @@ class OffloadMoeCache:
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
 
+    def ensure_experts_split(self, layer_id: int, expert_ids: torch.Tensor, topk_weights: torch.Tensor,
+                             x: torch.Tensor, io: dict) -> None:
+        """CPU-assisted decode: hits and a ``cpu_decode_fetch_q16`` share of the misses get slots
+        (``expert_ids`` -> slot ids, the fetched ones staged for ``copy_missing``), the other routes
+        become -1 and their inputs land in the CPU executor's pinned buffers ``io``."""
+        from freetoken.moe.offload_kernels import ensure_experts_split
+
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        ensure_experts_split(self, layer_id, expert_ids, topk_weights, x, io, self.cpu_decode_fetch_q16)
+
     def ensure_experts_capped(self, layer_id: int, expert_ids: torch.Tensor, fetch_fraction: float,
                               counts: torch.Tensor | None = None) -> None:
         """``ensure_experts_hybrid`` with an explicit fetch share (hybrid routed prefill):
@@ -964,6 +985,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.fetch_credit.zero_()
 
     def _apply_fence(self) -> None:
         if self.active_slots < self.cache_size:
@@ -1032,6 +1054,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
+        self.split_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1066,13 +1089,17 @@ class OffloadMoeCache:
         self.stat_steps_layer[layer_id] += 1
 
     def decode_miss_stats(self) -> dict:
+        fetched = int(self.stat_fetched.item())
         if self.decode_target == "hybrid":
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
+        elif self.cpu_decode is not None:
+            # CPU-assisted decode: the split kernel's counters, plus the GPU path's (prefill-sized
+            # extends that take the routed fetch)
+            calls, active, missing, fetched = (int(x) for x in self.split_stats.sum(0))
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,

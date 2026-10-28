@@ -46,6 +46,9 @@ fi
                                 # rest; 0 = GPU only (bit-reproducible, use it for A/B runs)
 : "${CPU_PREFILL_FETCH:=0.35}"  # share of the misses fetched over PCIe (the most-routed ones)
 : "${PRECISE_PREFILL:=1}"       # W4A16: apply group scales after the dot, gate/up in fp32 (no cost)
+: "${DECODE_FETCH:=1}"          # FP4: share of decode's expert-cache misses fetched over PCIe; the CPU
+                                # computes the rest from the pinned banks (1 = all over PCIe, 0 = all on CPU)
+: "${CPU_DECODE_ACT:=fp32}"     # DECODE_FETCH < 1: CPU expert activations, fp32 (exact) or int8 (W4A8)
 if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1280}"; fi
                                 # prefill chunks <= ROUTED_PF tokens load only their routed experts
                                 # instead of streaming every expert over PCIe (~2.4 s per chunk at
@@ -104,6 +107,8 @@ export FREETOKEN_WNA16_BALANCED_TP="$BALANCED"
 export FREETOKEN_WNA16_CPU_PREFILL="$CPU_PREFILL"
 export FREETOKEN_WNA16_CPU_PREFILL_FETCH="$CPU_PREFILL_FETCH"
 export FREETOKEN_WNA16_PREFILL_PRECISE="$PRECISE_PREFILL"
+export FREETOKEN_MOE_DECODE_FETCH="$DECODE_FETCH"
+export FREETOKEN_CPU_DECODE_ACT="$CPU_DECODE_ACT"
 
 unit="ft-serve-$$"
 if [ "$CGROUP" = "1" ] && command -v systemd-run >/dev/null; then

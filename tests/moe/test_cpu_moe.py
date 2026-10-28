@@ -509,6 +509,73 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+
+@pytest.mark.parametrize("w4a8", [False, True])
+def test_staged_decode_fp32_with_joining_coordinator(w4a8):
+    """The CPU-assisted decode's executor setup: explicit cpus (the coordinator computes too), fp32
+    output and both nvfp4 GEMVs, driven by stage / signal / wait inside a CUDA graph; each replay
+    computes the routes the pinned ids hold then (-1 = a GPU route, skipped)."""
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    L, E, H, I, top_k, layer = 2, 16, 1024, 256, 4, 1
+    dev = torch.device("cuda")
+    cache = _make_nvfp4_cache(L, E, H, I, seed=7)
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=3, max_tokens=1, device=dev, cpus=[1, 2, 3],
+                        coordinator_joins=True, out_fp32=True, w4a8=w4a8)
+    assert ("vnni" in ex.isa) == (w4a8 and "vnni" in ex._ext.isa_name())
+    b = cache.bank_sources
+    slots = torch.arange(E, device=dev, dtype=torch.int32)
+    gu = dequant_nvfp4(b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
+                       b["gate_up_global"][layer].to(dev), slots, dtype=torch.float32).cpu()
+    dn = dequant_nvfp4(b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
+                       b["down_global"][layer].to(dev), slots, dtype=torch.float32).cpu()
+
+    def reference(x, ids, w):
+        out = torch.zeros(H)
+        for e, wk in zip(ids.tolist(), w.tolist()):
+            if e >= 0:
+                h = gu[e] @ x.float()
+                out += wk * (dn[e] @ (Fn.silu(h[:I]) * h[I:]).bfloat16().float())
+        return out
+
+    io = ex.stage(layer, 1)
+    out = torch.empty(1, H, device=dev)
+
+    def step():
+        ex.signal(layer, 1)
+        out.copy_(ex.wait(layer, 1), non_blocking=True)
+
+    def fill(seed):
+        g = torch.Generator().manual_seed(seed)
+        io["x"].copy_(torch.randn(1, H, generator=g).bfloat16())
+        ids = torch.randperm(E, generator=g)[:top_k].to(torch.int32)
+        ids[torch.rand(top_k, generator=g) < 0.4] = -1
+        io["ids"].copy_(ids.view(1, -1))
+        io["w"].copy_(torch.rand(1, top_k, generator=g))
+        return reference(io["x"][0], io["ids"][0], io["w"][0])
+
+    want = fill(0)
+    step()
+    torch.cuda.synchronize()
+    tol = 3e-2 if w4a8 else 2e-3
+    assert ((out[0].cpu() - want).norm() / want.norm()) < tol
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+    for seed in range(1, 4):
+        want = fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert ((out[0].cpu() - want).norm() / max(want.norm(), 1e-6)) < tol
+    if ex._flag_sync:
+        assert ex._ext.flag_served_count(ex._flag_slots[(layer, 1)]) >= 4
+        ex.raise_if_unhealthy()
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""

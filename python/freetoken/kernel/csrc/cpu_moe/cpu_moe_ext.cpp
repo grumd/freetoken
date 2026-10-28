@@ -1055,6 +1055,47 @@ inline void deinterleave_bf16_f32(const bf16_t* src, float* even, float* odd, in
   }
 }
 
+#if CPU_MOE_X86
+__attribute__((target("avx512f")))
+static void deinterleave_bf16_f32_avx512(const bf16_t* src, float* even, float* odd, int K) {
+  // a 32-bit lane holds one (even, odd) bf16 pair: even in the low half
+  const __m512i hi_mask = _mm512_set1_epi32(int(0xffff0000u));
+  int m = 0;
+  for (; m + 16 <= K / 2; m += 16) {
+    const __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(src + 2 * m));
+    _mm512_storeu_ps(even + m, _mm512_castsi512_ps(_mm512_slli_epi32(v, 16)));
+    _mm512_storeu_ps(odd + m, _mm512_castsi512_ps(_mm512_and_si512(v, hi_mask)));
+  }
+  for (; m < K / 2; ++m) {
+    even[m] = bf16_to_f32(src[2 * m]);
+    odd[m] = bf16_to_f32(src[2 * m + 1]);
+  }
+}
+
+// quant_i8_pg16 with AVX-512: one 16-block per iteration, round to nearest even.
+__attribute__((target("avx512f,avx512bw,avx512dq")))
+static void quant_i8_pg16_avx512(const float* xe, const float* xo, int K, int8_t* asi8, float* asb) {
+  const int nb = K / 16;
+  const __m512 lim = _mm512_set1_ps(127.0f);
+  for (int b = 0; b < nb; ++b) {
+    const __m512 v = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_loadu_ps(xe + (size_t)b * 8)),
+                                        _mm256_loadu_ps(xo + (size_t)b * 8), 1);
+    const float amax = _mm512_reduce_max_ps(_mm512_abs_ps(v));
+    const float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
+    asb[b] = sc;
+    __m512 q = _mm512_mul_ps(v, _mm512_set1_ps(1.0f / sc));
+    q = _mm512_min_ps(_mm512_max_ps(q, _mm512_sub_ps(_mm512_setzero_ps(), lim)), lim);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(asi8 + (size_t)b * 16),
+                     _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(q)));
+  }
+}
+
+static bool cpu_has_avx512_prep() {
+  return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+         __builtin_cpu_supports("avx512dq");
+}
+#endif
+
 // DeepSeek-V4 activation FP8 round-trip (bf16 in/out): per 128-block,
 // s = 2^ceil(log2(max(|x|,1e-4)/448)); y = round_e4m3(clamp(x/s,+-448)) * s.
 void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K) {
@@ -1084,6 +1125,9 @@ struct MoeTask {
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
   bf16_t* y;           // [num_tokens, H]
+  // fp32 output instead of y (bf16, q4_0 and nvfp4 only): the hybrid decode adds this partial
+  // to the GPU routes before rounding once
+  float* y32 = nullptr;
 };
 
 // Output-row tiling. Small enough to give every worker independent work even at
@@ -1257,6 +1301,8 @@ struct CpuMoeExecutor {
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  bool simd_prep = false;      // AVX-512 deinterleave / int8 quant of the activations
+  std::string isa_base;
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
@@ -1290,11 +1336,19 @@ struct CpuMoeExecutor {
   std::mutex sync_mtx;
   std::condition_variable sync_cv;
 
-  bool stop = false;
-  uint64_t cur_gen = 0;
-  MoeTask* cur_task = nullptr;
+  std::atomic<bool> stop{false};
+  // Task generation: workers spin on it for spin_ns after their last task, then sleep on
+  // task_cv. A futex wake per decode layer cost ~10 us of pool start-up on the critical path.
+  std::atomic<uint64_t> cur_gen{0};
+  MoeTask* cur_task = nullptr;  // published before cur_gen
+  const int32_t* cur_task_ids = nullptr;  // routing of the task being prepared (prep_g_row)
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
+  std::atomic<int> task_sleepers{0};
+  std::atomic<int> sync_sleepers{0};
+  int64_t spin_ns = 2000000;
+  int bar_n = 1;  // barrier participants of the current task: the workers (+ the coordinator)
+  bool coord_joins = false;  // the flag coordinator computes alongside the workers
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
@@ -1390,6 +1444,10 @@ struct CpuMoeExecutor {
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
     isa = c.name;
+    isa_base = c.name;
+#if CPU_MOE_X86
+    simd_prep = cpu_has_avx512_prep();
+#endif
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
@@ -1428,6 +1486,8 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
+    if (const char* v = getenv("FREETOKEN_CPU_MOE_SPIN_US")) spin_ns = int64_t(atoll(v)) * 1000;
+    bar_n = num_threads;
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -1457,6 +1517,9 @@ struct CpuMoeExecutor {
   // [even(8),odd(8)] layout the VNNI dot expects. Done once per token/route (amortized over
   // every output row), so a scalar pass is fine relative to the GEMV.
   void quant_i8_pg16(const float* xe, const float* xo, int K, int8_t* asi8, float* asb) {
+#if CPU_MOE_X86
+    if (simd_prep) return quant_i8_pg16_avx512(xe, xo, K, asi8, asb);
+#endif
     const int nb = K / 16;
     for (int b = 0; b < nb; ++b) {
       const float* xeb = xe + (size_t)b * 8;
@@ -1542,7 +1605,7 @@ struct CpuMoeExecutor {
     if (coord_thread.joinable()) coord_thread.join();
     {
       std::lock_guard<std::mutex> lk(task_mtx);
-      stop = true;
+      stop.store(true);
     }
     task_cv.notify_all();
     for (auto& th : workers)
@@ -1551,14 +1614,17 @@ struct CpuMoeExecutor {
   }
 
   uintptr_t create_task(int layer_id, int num_tokens, uintptr_t x_ptr,
-                        uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr) {
+                        uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr, bool y_fp32) {
+    if (y_fp32 && (fmt == WF_MXFP4 || fmt == WF_DSFP4))
+      throw std::runtime_error("fp32 CPU MoE output is implemented for bf16, nvfp4 and q4_0 only");
     MoeTask* t = new MoeTask{this,
                              layer_id,
                              num_tokens,
                              reinterpret_cast<const bf16_t*>(x_ptr),
                              reinterpret_cast<const int32_t*>(ids_ptr),
                              reinterpret_cast<const float*>(w_ptr),
-                             reinterpret_cast<bf16_t*>(y_ptr)};
+                             y_fp32 ? nullptr : reinterpret_cast<bf16_t*>(y_ptr)};
+    if (y_fp32) t->y32 = reinterpret_cast<float*>(y_ptr);
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
   }
@@ -1567,7 +1633,7 @@ struct CpuMoeExecutor {
 
   void barrier(int& local_sense) {
     local_sense ^= 1;
-    if (bar_count.fetch_add(1) + 1 == num_threads) {
+    if (bar_count.fetch_add(1) + 1 == bar_n) {
       bar_count.store(0);
       bar_sense.store(local_sense);
     } else {
@@ -1673,7 +1739,10 @@ struct CpuMoeExecutor {
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
                          gas) * w_out;
       }
-      y_row[h] = f32_to_bf16(acc);
+      if (t->y32)
+        t->y32[(size_t)tok * H + h] = acc;
+      else
+        y_row[h] = f32_to_bf16(acc);
     }
   }
 
@@ -1796,7 +1865,30 @@ struct CpuMoeExecutor {
   // Prepare one intermediate row (token,route) for the down GEMV: ds_fp4 first FP8
   // round-trips it (DSV4 act_quant), then both formats deinterleave to fp32 even/odd
   // (reused across every down output row).
+  void deinterleave(const bf16_t* src, float* even, float* odd, int K) {
+#if CPU_MOE_X86
+    if (simd_prep) return deinterleave_bf16_f32_avx512(src, even, odd, K);
+#endif
+    deinterleave_bf16_f32(src, even, odd, K);
+  }
+
+  // Switch the nvfp4 GEMV between W4A8 (int8 activations, VNNI) and the fp32-activation dot.
+  // Call before the first task.
+  void set_w4a8(bool on) {
+    const bool want = on && fmt == WF_NVFP4 && nvi8dot != nullptr;
+    use_vnni = want;
+    if (want) {
+      xi8_scratch.resize(xe_scratch.size() * 2);
+      xas_scratch.resize(xe_scratch.size() / 8);
+      gi8_scratch.resize(ge_scratch.size() * 2);
+      gas_scratch.resize(ge_scratch.size() / 8);
+    }
+    isa_str = isa_base + (use_vnni ? (cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)") : "");
+    isa = isa_str.c_str();
+  }
+
   void prep_g_row(int64_t r) {
+    if (cur_task_ids && cur_task_ids[r] < 0) return;  // a route this task skips
     bf16_t* g = g_scratch.data() + (size_t)r * I;
     if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
@@ -1806,7 +1898,7 @@ struct CpuMoeExecutor {
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
     float* ge = ge_scratch.data() + (size_t)r * (I / 2);
     float* go = go_scratch.data() + (size_t)r * (I / 2);
-    deinterleave_bf16_f32(g, ge, go, I);
+    deinterleave(g, ge, go, I);
     if (use_vnni)
       quant_i8_pg16(ge, go, I, gi8_scratch.data() + (size_t)r * I,
                     gas_scratch.data() + (size_t)r * (I / 16));
@@ -1866,30 +1958,54 @@ struct CpuMoeExecutor {
     }
   }
 
+  static int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  // Spin until pred() for spin_ns, then sleep on cv (sleepers counts the sleepers so the
+  // notifier only takes the lock when someone sleeps; seq_cst on both sides closes the race).
+  template <class Pred>
+  void spin_then_wait(Pred pred, std::mutex& mtx, std::condition_variable& cv,
+                      std::atomic<int>& sleepers) {
+    if (pred()) return;
+    const int64_t t0 = now_ns();
+    for (unsigned n = 1;; ++n) {
+#if CPU_MOE_X86
+      _mm_pause();
+#endif
+      if (pred()) return;
+      if ((n & 255u) == 0 && now_ns() - t0 > spin_ns) break;
+    }
+    std::unique_lock<std::mutex> lk(mtx);
+    sleepers.fetch_add(1);
+    cv.wait(lk, pred);
+    sleepers.fetch_sub(1);
+  }
+
   void worker_loop(int tid) {
     pin_self(tid);
     uint64_t my_gen = 0;
     for (;;) {
-      MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
-      }
+      spin_then_wait([&] { return stop.load() || cur_gen.load() != my_gen; }, task_mtx, task_cv,
+                     task_sleepers);
+      if (stop.load()) return;
+      my_gen = cur_gen.load(std::memory_order_acquire);
+      MoeTask* t = cur_task;
       run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
-        completed.store(my_gen, std::memory_order_release);
-        {
+        completed.store(my_gen);
+        if (sync_sleepers.load() > 0) {
           std::lock_guard<std::mutex> lk(sync_mtx);
+          sync_cv.notify_all();
         }
-        sync_cv.notify_all();
       }
     }
   }
 
-  void submit(MoeTask* t) {
+  void submit(MoeTask* t, bool coordinator_joins = false) {
+    bar_n = num_threads + (coordinator_joins ? 1 : 0);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -1900,6 +2016,7 @@ struct CpuMoeExecutor {
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    cur_task_ids = t->ids;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -1933,7 +2050,7 @@ struct CpuMoeExecutor {
         }
         float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
         float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
-        deinterleave_bf16_f32(src, xe, xo, H);
+        deinterleave(src, xe, xo, H);
         if (use_vnni)
           quant_i8_pg16(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
                         xas_scratch.data() + (size_t)tok * (H / 16));
@@ -1952,19 +2069,19 @@ struct CpuMoeExecutor {
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
     }
-    {
+    cur_task = t;
+    const uint64_t g = cur_gen.load() + 1;
+    submitted.store(g);
+    cur_gen.store(g);
+    if (task_sleepers.load() > 0) {
       std::lock_guard<std::mutex> lk(task_mtx);
-      cur_task = t;
-      ++cur_gen;
-      submitted.store(cur_gen, std::memory_order_release);
+      task_cv.notify_all();
     }
-    task_cv.notify_all();
   }
 
   void sync() {
-    const uint64_t target = submitted.load(std::memory_order_acquire);
-    std::unique_lock<std::mutex> lk(sync_mtx);
-    sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
+    const uint64_t target = submitted.load();
+    spin_then_wait([&] { return completed.load() >= target; }, sync_mtx, sync_cv, sync_sleepers);
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
@@ -2049,7 +2166,8 @@ struct CpuMoeExecutor {
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
           }
           if (t != nullptr) {
-            submit(t);
+            submit(t, coord_joins);
+            if (coord_joins) run_task_body(t);
             sync();
           }
           // Release: the workers' y stores are visible before the GPU sees done.
@@ -2128,7 +2246,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("core_ids"))
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
-           py::arg("y_ptr"))
+           py::arg("y_ptr"), py::arg("y_fp32") = false)
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("sync_with_cuda_stream", &CpuMoeExecutor::sync_with_cuda_stream,
@@ -2141,6 +2259,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
+      .def("set_coordinator_joins",
+           [](CpuMoeExecutor& e, bool v) { e.coord_joins = v; }, py::arg("value"))
+      .def("set_w4a8", &CpuMoeExecutor::set_w4a8, py::arg("value"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))

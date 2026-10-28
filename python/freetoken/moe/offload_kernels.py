@@ -63,6 +63,33 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, rank)
 
 
+def ensure_experts_split(cache, layer_id: int, expert_ids: torch.Tensor, topk_weights: torch.Tensor,
+                         x: torch.Tensor, io: dict, frac_q16: int) -> None:
+    """Decode with CPU help (``--moe-decode-fetch`` < 1): hits stay on the GPU, a ``frac_q16 / 2^16``
+    share of the misses is fetched over PCIe into LRU victim slots (the most recently routed ones
+    first), and the rest are left to the CPU. ``expert_ids`` becomes slot ids, -1 for a CPU route.
+    The same launch writes the CPU's inputs straight into its pinned buffers ``io``: ``x``, the
+    expert id of every CPU route (-1 elsewhere) and the routing weights. A per-layer credit carries
+    the fractional share across steps, so the long-run fetched share is exact."""
+    T = x.shape[0]
+    R = expert_ids.numel()
+    H = x.shape[1]
+    _ensure_experts_split_kernel[(1,)](
+        expert_ids, topk_weights, x, io["x"], io["ids"], io["w"],
+        cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
+        cache.evict_slots, cache.src_indices, cache.num_indices,
+        cache.expert_recency, cache.fetch_credit, cache.split_stats,
+        layer_id, R, frac_q16, x.stride(0), topk_weights.stride(0),
+        H=H, TOKENS=T, TOP_K=R // T,
+        num_experts=cache.num_experts, cache_size=cache.cache_size,
+        BLOCK_E=triton.next_power_of_2(cache.num_experts),
+        BLOCK_C=triton.next_power_of_2(cache.cache_size),
+        BLOCK_R=triton.next_power_of_2(R), BLOCK_H=triton.next_power_of_2(H),
+        STATS=cache.collect_stats,
+        num_warps=8 if cache.cache_size >= 2048 else 4,
+    )
+
+
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
@@ -432,3 +459,88 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+_I64_MAX = tl.constexpr(9223372036854775807)
+_I64_MIN = tl.constexpr(-1152921504606846976)
+
+
+@triton.jit(do_not_specialize=["layer_id", "num_active", "frac_q16", "x_stride", "w_stride"])
+def _ensure_experts_split_kernel(
+    ids_ptr, w_ptr, x_ptr, hx_ptr, hids_ptr, hw_ptr,
+    slot_for_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr,
+    evict_slots_ptr, src_indices_ptr, num_indices_ptr,
+    recency_ptr, credit_ptr, stats_ptr,
+    layer_id, num_active, frac_q16, x_stride, w_stride,
+    H: tl.constexpr, TOKENS: tl.constexpr, TOP_K: tl.constexpr,
+    num_experts: tl.constexpr, cache_size: tl.constexpr,
+    BLOCK_E: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+    STATS: tl.constexpr,
+):
+    """See :func:`ensure_experts_split`. The slot rewrite reads the slots from registers, never
+    back from the tables this launch just wrote."""
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+    base = layer_id * num_experts
+
+    off_e = tl.arange(0, BLOCK_E)
+    e_mask = off_e < num_experts
+    off_r = tl.arange(0, BLOCK_R)
+    r_mask = off_r < num_active
+    e_r = tl.load(ids_ptr + off_r, mask=r_mask, other=-1)
+    is_active = tl.max((e_r[:, None] == off_e[None, :]).to(tl.int32), axis=0) > 0
+    slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
+    is_missing = is_active & (slot == -1) & e_mask
+    num_missing = tl.sum(is_missing.to(tl.int32))
+    credit = tl.load(credit_ptr + layer_id) + (num_missing * frac_q16).to(tl.int64)
+    num_fetch = tl.minimum(num_missing, (credit >> 16).to(tl.int32))
+    tl.store(credit_ptr + layer_id, credit - (num_fetch.to(tl.int64) << 16))
+    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
+    is_hit = is_active & (slot >= 0)
+    tl.store(usage_ptr + slot, step, mask=is_hit)
+
+    # fetch order: most recently routed miss first (ties -> lower id); a miss the CPU computed
+    # a step ago ranks above one never seen
+    rec = tl.load(recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+    score = tl.where(is_missing, rec * num_experts + (num_experts - 1 - off_e), _I64_MIN).to(tl.int64)
+    new_slot = slot
+    if num_fetch > 0:
+        off_c = tl.arange(0, BLOCK_C)
+        c_mask = off_c < cache_size
+        oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
+        u = tl.load(usage_ptr + off_c, mask=c_mask, other=_I64_MAX).to(tl.int64)
+        owner_active = c_mask & False
+        for i in tl.range(num_active):
+            owner_active = owner_active | (oid == base + tl.load(ids_ptr + i))
+        u = tl.where(owner_active | (~c_mask), _I64_MAX, u)
+        for i in tl.range(num_fetch):
+            victim = tl.argmin(u, axis=0).to(tl.int32)
+            old_id = tl.sum(tl.where(off_c == victim, oid, 0))
+            if old_id >= 0:
+                tl.store(slot_for_id_ptr + old_id, -1)
+            e = tl.argmax(score, axis=0).to(tl.int32)
+            score = tl.where(off_e == e, _I64_MIN, score)
+            tl.store(id_of_slot_ptr + victim, base + e)
+            tl.store(slot_for_id_ptr + base + e, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(evict_slots_ptr + i, victim)
+            tl.store(src_indices_ptr + i, e)  # layer-local row
+            u = tl.where(off_c == victim, _I64_MAX, u)
+            new_slot = tl.where(off_e == e, victim, new_slot)
+
+    s_r = tl.sum(tl.where(e_r[:, None] == off_e[None, :], new_slot[None, :], 0), axis=1)
+    tl.store(ids_ptr + off_r, s_r, mask=r_mask)
+    tl.store(hids_ptr + off_r, tl.where(s_r < 0, e_r, -1), mask=r_mask)
+    w_off = (off_r // TOP_K) * w_stride + off_r % TOP_K
+    tl.store(hw_ptr + off_r, tl.load(w_ptr + w_off, mask=r_mask, other=0.0), mask=r_mask)
+    off_h = tl.arange(0, BLOCK_H)
+    h_mask = off_h < H
+    for t in tl.static_range(TOKENS):
+        tl.store(hx_ptr + t * H + off_h, tl.load(x_ptr + t * x_stride + off_h, mask=h_mask), mask=h_mask)
+    tl.store(recency_ptr + base + off_e, tl.zeros((BLOCK_E,), dtype=tl.int64) + step, mask=is_active & e_mask)
+    if STATS:
+        row = stats_ptr + layer_id * 4
+        tl.atomic_add(row, 1)
+        tl.atomic_add(row + 1, tl.sum(is_active.to(tl.int64)))
+        tl.atomic_add(row + 2, num_missing.to(tl.int64))
+        tl.atomic_add(row + 3, num_fetch.to(tl.int64))

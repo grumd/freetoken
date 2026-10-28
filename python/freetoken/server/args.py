@@ -90,6 +90,9 @@ _ENV_FLAG_VALUE = {
     "glm5_max_layers": "FREETOKEN_GLM5_MAX_LAYERS",
     "engram_backend": "FREETOKEN_ENGRAM_BACKEND",
     "moe_routed_prefill_tokens": "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS",
+    "moe_decode_fetch": "FREETOKEN_MOE_DECODE_FETCH",
+    "moe_cpu_decode_act": "FREETOKEN_CPU_DECODE_ACT",
+    "moe_cpu_decode_threads": "FREETOKEN_CPU_DECODE_THREADS",
 }
 
 
@@ -1103,6 +1106,39 @@ def parse_args(
             "every layer over PCIe. Cuts the fixed per-chunk stream on PCIe-bound boxes; "
             "past ~1-1.5k tokens nearly every expert is routed and the overlapped stream "
             "wins again. Default 0 (only extends under tokens * top_k < num_experts)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-decode-fetch",
+        type=float,
+        default=None,
+        dest="moe_decode_fetch",
+        help=(
+            "With --moe-strategy offload and NVFP4 experts: the share (0-1) of each decode step's "
+            "expert-cache misses fetched over PCIe into the cache; the CPU computes the rest from "
+            "the pinned banks while the GPU runs the hits. 1 (default) = every miss over PCIe, "
+            "0 = every miss on the CPU (the cache then only changes during prefill)."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cpu-decode-act",
+        choices=["fp32", "int8"],
+        default=None,
+        dest="moe_cpu_decode_act",
+        help=(
+            "--moe-decode-fetch < 1: activations of the CPU expert GEMV. fp32 (default) keeps "
+            "them exact; int8 quantizes them per 16 values for the VNNI dot (W4A8)."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cpu-decode-threads",
+        type=int,
+        default=None,
+        dest="moe_cpu_decode_threads",
+        help=(
+            "--moe-decode-fetch < 1: CPU threads per GPU, one per physical core. Default: all "
+            "physical cores but one on one GPU, the GPU's share of them with several."
         ),
     )
 

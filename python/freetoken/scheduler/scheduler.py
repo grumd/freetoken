@@ -189,10 +189,13 @@ class Scheduler(SchedulerIOMixin):
             cache.reset_stats()
             if not s["layer_calls"]:
                 return ""
-            return (
+            seg = (
                 f"miss {s['miss_rate']:.2f} "
                 f"({s['missing_per_layer']:.1f}/{s['active_per_layer']:.1f} experts/layer/step)"
             )
+            if cache.cpu_decode is not None:
+                seg += f", fetched {s['fetched_per_layer']:.2f}, cpu {s['cpu_per_layer']:.2f}"
+            return seg
 
         return segment
 

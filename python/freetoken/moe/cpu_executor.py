@@ -158,7 +158,15 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        cpus: list[int] | None = None,
+        coordinator_joins: bool = False,
+        out_fp32: bool = False,
+        w4a8: bool | None = None,
     ) -> None:
+        """``cpus`` (logical CPUs, one thread each) replaces the auto sizing: with the flag
+        handshake the first is the coordinator's, which with ``coordinator_joins`` also computes.
+        ``out_fp32`` returns the expert sum unrounded (fp32 ``y``). ``w4a8`` picks the nvfp4 GEMV:
+        int8 activations (VNNI) or fp32 activations; None keeps the build's default."""
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
@@ -218,9 +226,15 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        self.out_fp32 = bool(out_fp32)
+        if cpus:
+            nthreads, core_ids = len(cpus), list(cpus)
+        else:
+            nthreads, core_ids = resolve_threads_and_affinity(num_threads)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
+        if cpus and self._flag_sync and nthreads > 1:
+            coord_core, core_ids, nthreads = core_ids[0], core_ids[1:], nthreads - 1
+        elif self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
             # oversubscribing (workers drop from N to N-1).
             coord_core = core_ids[-1]
@@ -245,11 +259,15 @@ class CpuMoeExecutor:
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
+        if w4a8 is not None:
+            self._ext.set_w4a8(bool(w4a8))
+        if coordinator_joins:
+            self._ext.set_coordinator_joins(True)
         self.isa = self._ext.isa_name()
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
-        if clamp < torch.get_num_threads():
+        if clamp < torch.get_num_threads() and not cpus:
             logger.info_rank0(
                 f"torch intra-op threads: {torch.get_num_threads()} -> {clamp} "
                 "(cores reserved for the pinned CPU MoE pool)"
@@ -497,7 +515,7 @@ class CpuMoeExecutor:
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.float32 if self.out_fp32 else torch.bfloat16),
             }
             self._io[bs] = io
         return io
@@ -514,6 +532,7 @@ class CpuMoeExecutor:
                 io["ids"].data_ptr(),
                 io["w"].data_ptr(),
                 io["y"].data_ptr(),
+                self.out_fp32,
             )
             self._tasks[key] = task
             # Allocate this (layer, bs) combo a flag slot and register its task with the
@@ -524,6 +543,33 @@ class CpuMoeExecutor:
                     self._flag_slots[key] = slot
                     self._ext.register_flag_task(slot, task)
         return task
+
+    def stage(self, layer_id: int, bs: int) -> dict[str, torch.Tensor]:
+        """The pinned buffers (x, ids, w, y) a kernel fills directly for (layer, bs): the
+        :meth:`signal` / :meth:`wait` pair then runs the task without any copy nodes."""
+        self._task_for(layer_id, bs)
+        return self._io[bs]
+
+    def signal(self, layer_id: int, bs: int) -> None:
+        """Start (layer, bs)'s task once the stream gets here (its inputs staged before)."""
+        task = self._task_for(layer_id, bs)
+        stream = torch.cuda.current_stream().cuda_stream
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        if slot is not None:
+            self._cpu_moe.memop_submit(stream, self._done.data_ptr(), self._ready.data_ptr(), slot)
+        else:
+            self._ext.submit_with_cuda_stream(stream, task)
+
+    def wait(self, layer_id: int, bs: int) -> torch.Tensor:
+        """Hold the stream until (layer, bs)'s task is done; returns its pinned output ``y``."""
+        task = self._task_for(layer_id, bs)
+        stream = torch.cuda.current_stream().cuda_stream
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        if slot is not None:
+            self._cpu_moe.memop_sync(stream, self._done.data_ptr(), slot)
+        else:
+            self._ext.sync_with_cuda_stream(stream, task)
+        return self._io[bs]["y"]
 
     def decode(
         self,

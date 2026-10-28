@@ -952,6 +952,7 @@ class Engine:
         if cache.decode_target in ("cpu", "hybrid") or verify_cpu:
             self._init_cpu_moe_executor(config, cache, layers)
         self._maybe_init_wna16_cpu_prefill(cache, layers)
+        self._maybe_init_cpu_decode(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         logger.info_rank0(
@@ -1091,6 +1092,68 @@ class Engine:
         fetch = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_FETCH", "")
         if fetch.strip():
             cache.cpu_prefill_fetch = float(fetch)
+
+    def _maybe_init_cpu_decode(self, config: EngineConfig, cache, layers) -> None:
+        """FREETOKEN_MOE_DECODE_FETCH (--moe-decode-fetch) < 1: decode fetches that share of its
+        expert-cache misses over PCIe and computes the rest on this rank's CPU cores, straight
+        from the pinned banks (OffloadMoELayer._decode_cpu_split)."""
+        raw = os.environ.get("FREETOKEN_MOE_DECODE_FETCH", "").strip()
+        if not raw:
+            return
+        fetch = float(raw)
+        if not 0.0 <= fetch <= 1.0:
+            raise ValueError(f"--moe-decode-fetch must be in [0, 1], got {fetch}")
+        if fetch >= 1.0:
+            return
+        sample = layers[0]
+        kernel = getattr(sample.quant_method, "kernel", None)
+        reason = None
+        if cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
+            reason = "it needs --moe-strategy offload with GPU decode"
+        elif getattr(kernel, "cpu_format", None) != "nvfp4" or not hasattr(kernel, "decode_overlapped"):
+            reason = "it serves NVFP4 experts on the triton kernels only"
+        elif sample.activation != "silu" or sample.apply_router_weight_on_input:
+            reason = "the CPU kernel computes silu(gate) * up with the router weight after down"
+        elif cache._unpinned_layers:
+            reason = "every expert layer must be pinned"
+        if reason:
+            logger.warning_rank0(f"--moe-decode-fetch ignored: {reason}")
+            return
+        from freetoken.moe.cpu_executor import CpuMoeExecutor, physical_core_cpus
+
+        act = os.environ.get("FREETOKEN_CPU_DECODE_ACT", "fp32").strip().lower()
+        if act not in ("fp32", "int8"):
+            raise ValueError(f"FREETOKEN_CPU_DECODE_ACT must be fp32 or int8, got {act!r}")
+        tp = config.tp_info
+        cores = physical_core_cpus()
+        per = max(1, len(cores) // tp.size)
+        mine = cores[tp.rank * per:(tp.rank + 1) * per]
+        # one GPU: leave a core to the process feeding it; two: each rank's half of the cores
+        default = per - 1 if tp.size == 1 and per > 2 else per
+        threads = int(os.environ.get("FREETOKEN_CPU_DECODE_THREADS", "") or default)
+        cpus = mine[len(mine) - threads:] if threads <= len(mine) else mine
+        executor = CpuMoeExecutor(
+            cache,
+            top_k=sample.top_k,
+            activation=sample.activation,
+            apply_router_weight_on_input=False,
+            num_threads=len(cpus),
+            max_tokens=max(config.max_running_req, 1),
+            device=self.device,
+            fmt="nvfp4",
+            cpus=cpus,
+            coordinator_joins=True,
+            out_fp32=True,
+            w4a8=act == "int8",
+        )
+        cache.cpu_decode = executor
+        cache.cpu_decode_fetch_q16 = round(fetch * (1 << 16))
+        if self.cpu_moe_executor is None:
+            self.cpu_moe_executor = executor  # its flag watchdog is checked after every forward
+        logger.info_rank0(
+            f"--moe-decode-fetch {fetch}: decode fetches {fetch:.0%} of its expert-cache misses over "
+            f"PCIe and computes the rest on cpus {cpus} ({executor.isa}, {act} activations)"
+        )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).

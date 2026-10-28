@@ -108,10 +108,11 @@ class TritonNvfp4MoEKernel(MoEKernel):
             return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, act, on_input, alpha, limit)
 
-    def decode_overlapped(self, layer, x, topk_weights, topk_ids, view: ExpertView, copy, start, join):
+    def decode_overlapped(self, layer, x, topk_weights, topk_ids, view: ExpertView, copy, start, join, **cpu):
         """Decode while this step's expert copy runs: ``start()`` launches it, the resident routes
         compute, ``join()`` waits for it, then the copied-in routes. None (and no ``start``) when
-        the tile decode kernels do not serve this layer."""
+        the tile decode kernels do not serve this layer. ``cpu`` (``cpu_y``, ``cpu_wait``): the
+        routes with slot -1 are computed on the CPU, see :func:`nvfp4_decode_silu`."""
         from freetoken.moe import fused_nvfp4_tile as tile
 
         t = view.tensors
@@ -122,7 +123,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
             return None
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         start()
-        return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, copy=copy, join=join)
+        return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, copy=copy, join=join, **cpu)
 
 
 # ---------------------------------------------------------------------------

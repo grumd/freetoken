@@ -70,10 +70,14 @@ def route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY: tl.constexpr):
 def _reduce_silu_mul_kernel(
     part_ptr, out_ptr, R, INTER, SPLIT: tl.constexpr, BLOCK: tl.constexpr,
     ids_ptr=None, copy_slots_ptr=None, num_copy_ptr=None,
-    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16, SKIP_NEG: tl.constexpr = False,
 ):
-    # ROUTES 1 / 2: only the routes whose expert slot is resident / still being copied in
+    # ROUTES 1 / 2: only the routes whose expert slot is resident / still being copied in;
+    # SKIP_NEG: not the routes whose slot is -1 (computed on the CPU)
     r = tl.program_id(0)
+    if SKIP_NEG:
+        if tl.load(ids_ptr + r) < 0:
+            return
     if ROUTES != 0:
         if route_in_flight(tl.load(ids_ptr + r), copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
             return
@@ -93,17 +97,25 @@ def _reduce_silu_mul_kernel(
 def _reduce_topk_sum_kernel(
     part_ptr, w_ptr, out_ptr, R, H, stride_wm,
     TOP_K: tl.constexpr, SPLIT: tl.constexpr, BLOCK: tl.constexpr,
+    ids_ptr=None, cpu_ptr=None, SKIP_NEG: tl.constexpr = False, HAS_CPU: tl.constexpr = False,
 ):
+    # SKIP_NEG: routes whose slot is -1 have no GPU partial; HAS_CPU adds the CPU's fp32 sum
+    # over those routes ([M, H], may live in pinned host memory) before the one rounding
     t = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < H
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for k in tl.static_range(TOP_K):
         r = t * TOP_K + k
+        mk = m
+        if SKIP_NEG:
+            mk = m & (tl.load(ids_ptr + r) >= 0)
         part = tl.zeros((BLOCK,), dtype=tl.float32)
         for s in tl.static_range(SPLIT):
-            part += tl.load(part_ptr + (s * R + r) * H + offs, mask=m, other=0.0)
+            part += tl.load(part_ptr + (s * R + r) * H + offs, mask=mk, other=0.0)
         acc += tl.load(w_ptr + t * stride_wm + k).to(tl.float32) * part
+    if HAS_CPU:
+        acc += tl.load(cpu_ptr + t * H + offs, mask=m, other=0.0)
     tl.store(out_ptr + t * H + offs, acc.to(out_ptr.dtype.element_ty), mask=m)
 
 

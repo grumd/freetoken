@@ -229,7 +229,7 @@ def _gemv_partials_kernel(
     stride_ge,
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
-    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16, SKIP_NEG: tl.constexpr = False,
 ):
     """Split-K decode GEMV over int32 words (``p_ptr`` is the bank viewed as int32
     [S, N, K/8]: 8 codes per word, two words share a scale):
@@ -239,6 +239,9 @@ def _gemv_partials_kernel(
     nb = tl.program_id(1)
     s = tl.program_id(2)
     slot = tl.load(ids_ptr + r).to(tl.int64)
+    if SKIP_NEG:
+        if slot < 0:  # a route the CPU computes
+            return
     if ROUTES != 0:
         if route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
             return
@@ -284,17 +287,21 @@ def _gemv_partials_v2_kernel(
     stride_ge,
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
-    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16, SKIP_NEG: tl.constexpr = False,
 ):
     """:func:`_gemv_partials_kernel` with Marlin's e2m1 unpack: with a nibble in the top four
     bits of each 16-bit half, ``(q & 0x80008000) | ((q >> 3) & 0x0E000E00)`` is two fp16
     ``value * 2^-14`` at once (sign stays at bit 15, the magnitude lands at bits 9-11), and
     ``q << 4`` brings up the next pair. Word nibble j (k = 8w + j) pairs with j + 4.
-    ``ROUTES`` 1 / 2 runs only the routes whose slot is resident / still being copied in."""
+    ``ROUTES`` 1 / 2 runs only the routes whose slot is resident / still being copied in.
+    ``SKIP_NEG`` skips routes whose slot is -1 (computed on the CPU)."""
     r = tl.program_id(0)
     nb = tl.program_id(1)
     s = tl.program_id(2)
     slot = tl.load(ids_ptr + r).to(tl.int64)
+    if SKIP_NEG:
+        if slot < 0:  # a route the CPU computes
+            return
     if ROUTES != 0:
         if route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
             return

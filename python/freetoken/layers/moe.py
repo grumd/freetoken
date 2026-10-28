@@ -353,6 +353,9 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             run_first()
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if (cache.cpu_decode is not None and hidden_states.size(0) <= cache.cpu_decode.max_tokens
+                and not get_global_ctx().batch.is_prefill and not cache.is_unpinned_layer(self.layer_id)):
+            return self._decode_cpu_split(cache, hidden_states, topk_weights, topk_ids, during_copy)
         if (cache.cpu_prefill is not None and hidden_states.size(0) <= cache.cpu_prefill.max_tokens
                 and get_global_ctx().batch.is_prefill):
             run_first()
@@ -385,6 +388,43 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_cpu_split(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        during_copy: Callable[[], None] | None = None,
+    ) -> torch.Tensor:
+        """Decode with CPU help (``--moe-decode-fetch`` < 1): the CPU starts on the misses it was
+        left as soon as the routing is known, the GPU meanwhile fetches its share of the misses
+        (side stream), runs ``during_copy`` and the resident routes, then the fetched ones, and
+        last waits for the CPU's fp32 partial, which joins the route sum before the one rounding.
+        Capturable: the split, the staging writes and the handshake are all stream operations."""
+        cpu = cache.cpu_decode
+        T = hidden_states.size(0)
+        io = cpu.stage(self.layer_id, T)
+        cache.ensure_experts_split(self.layer_id, topk_ids, topk_weights, hidden_states, io)
+        cpu.signal(self.layer_id, T)
+        main = torch.cuda.current_stream(hidden_states.device)
+        side = cache.decode_copy_stream()
+
+        def start() -> None:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                cache.copy_missing()
+            if during_copy is not None:
+                during_copy()
+
+        view = self._expert_view(cache, cache.bank_views(), None, cache.alphas_for_slots(self.layer_id), topk_ids)
+        out = self.quant_method.kernel.decode_overlapped(
+            self, hidden_states, topk_weights, topk_ids, view, (cache.evict_slots, cache.num_indices),
+            start, lambda: main.wait_stream(side),
+            cpu_y=io["y"], cpu_wait=lambda: cpu.wait(self.layer_id, T),
+        )
+        assert out is not None, "CPU-assisted decode needs the NVFP4 tile decode kernels"
+        return out
 
     def _prefill_fetch_routed(
         self,

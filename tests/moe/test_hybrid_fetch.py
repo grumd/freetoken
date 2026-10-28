@@ -155,3 +155,71 @@ def test_prefill_capped_fetch_takes_the_heaviest_misses():
         tokens = dict(zip(routed.view(-1).tolist(), counts.tolist()))
         misses = [e for e in slot if e in src or slot[e] < 0]
         assert sorted(src) == sorted(sorted(misses, key=lambda e: -tokens[e])[:fetched])
+
+
+def _split_reference(slot_for_id, usage, id_of_slot, recency, credit, step, layer, ids, frac_q16, E):
+    """Python model of ensure_experts_split for one layer: returns (slot per route, fetched experts)."""
+    base = layer * E
+    active = list(dict.fromkeys(ids))
+    missing = [e for e in active if slot_for_id[base + e] < 0]
+    credit[layer] += len(missing) * frac_q16
+    n_fetch = min(len(missing), credit[layer] >> 16)
+    credit[layer] -= n_fetch << 16
+    for e in active:
+        if slot_for_id[base + e] >= 0:
+            usage[slot_for_id[base + e]] = step
+    order = sorted(missing, key=lambda e: (-recency[base + e], e))[:n_fetch]
+    owners = {slot_for_id[base + e] for e in active if slot_for_id[base + e] >= 0}
+    for e in order:
+        victim = min((s for s in range(len(usage)) if s not in owners), key=lambda s: (usage[s], s))
+        owners.add(victim)
+        if id_of_slot[victim] >= 0:
+            slot_for_id[id_of_slot[victim]] = -1
+        id_of_slot[victim] = base + e
+        slot_for_id[base + e] = victim
+        usage[victim] = step
+    for e in active:
+        recency[base + e] = step
+    return [slot_for_id[base + e] for e in ids], order
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("frac", [0.0, 0.1, 0.5, 1.0])
+def test_decode_split_matches_reference(frac):
+    """CPU-assisted decode's ensure: fetched share by per-layer credit (exact in the long run),
+    most recently routed misses first, LRU victims never among this step's routed slots, and the
+    CPU's inputs (x, expert ids of the unfetched misses, weights) staged in pinned memory."""
+    torch.manual_seed(1)
+    E, S, K, H, L = 48, 64, 8, 256, 2
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=torch.device("cuda"),
+                            quant_format="bf16")
+    cache.cpu_decode_fetch_q16 = q = round(frac * Q)
+    io = {"x": torch.zeros(1, H, dtype=torch.bfloat16, pin_memory=True),
+          "ids": torch.zeros(1, K, dtype=torch.int32, pin_memory=True),
+          "w": torch.zeros(1, K, dtype=torch.float32, pin_memory=True)}
+    slot_for_id, usage, id_of_slot = [-1] * (L * E), [0] * S, [-1] * S
+    recency, credit = [-1] * (L * E), [0] * L
+    total_missing = total_fetched = 0
+    # a skewed routing so experts recur
+    probs = torch.softmax(torch.randn(L, E) * 2, -1)
+    for step in range(1, 301):
+        layer = step % L
+        ids = torch.multinomial(probs[layer], K).to(torch.int32)
+        x = torch.randn(1, H, device="cuda").to(torch.bfloat16)
+        w = torch.softmax(torch.randn(1, K, device="cuda"), -1)
+        g = ids.view(1, K).cuda()
+        cache.ensure_experts_split(layer, g, w, x, io)
+        torch.cuda.synchronize()
+        want, order = _split_reference(slot_for_id, usage, id_of_slot, recency, credit, step, layer,
+                                       ids.tolist(), q, E)
+        assert g.view(-1).tolist() == want
+        n = int(cache.num_indices.item())
+        assert cache.src_indices[:n].tolist() == order
+        assert cache.id_of_slot.tolist() == id_of_slot
+        on_cpu = [e if s < 0 else -1 for e, s in zip(ids.tolist(), want)]
+        assert io["ids"].view(-1).tolist() == on_cpu
+        assert torch.equal(io["x"], x.cpu()) and torch.equal(io["w"], w.cpu())
+        total_missing += sum(1 for e in dict.fromkeys(ids.tolist()) if e in order or e in on_cpu)
+        total_fetched += n
+    assert cache.fetch_credit.tolist() == credit
+    assert abs(total_fetched - frac * total_missing) < L

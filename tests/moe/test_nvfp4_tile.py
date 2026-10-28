@@ -92,3 +92,32 @@ def test_prefill_matches_exact_math(fuse_act, nk_tile, routed, monkeypatch):
     else:
         out = ft.fused_experts_nvfp4_tile(x, *bk, tw, ids, E, fuse_act=fuse_act)
     assert _rel(out, ref) < (4e-3 if fuse_act else 8e-3)
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_decode_with_cpu_routes(copy):
+    """Routes with slot -1 belong to the CPU: the GPU skips them (their slot is never read) and adds
+    the CPU's fp32 partial before the one rounding, after cpu_wait()."""
+    from freetoken.moe.fused_nvfp4_tile import nvfp4_decode_silu
+
+    bk = _banks(12, seed=5)
+    x = (torch.randn(2, H, device="cuda") * 0.5).to(torch.bfloat16)
+    tw = torch.softmax(torch.randn(2, TOPK, device="cuda"), -1)
+    ids = torch.stack([torch.randperm(12, device="cuda")[:TOPK] for _ in range(2)]).to(torch.int32)
+    on_cpu = torch.zeros_like(ids, dtype=torch.bool)
+    on_cpu[0, 1] = on_cpu[1, 0] = on_cpu[1, 3] = True
+    cpu_part = _reference(x, bk, tw.masked_fill(~on_cpu, 0), ids)
+    slots = ids.masked_fill(on_cpu, -1)
+    waits = []
+    kw = {}
+    if copy:
+        copy_slots = torch.full((16,), -1, dtype=torch.int32, device="cuda")
+        copy_slots[0] = ids[0, 0]
+        kw = dict(copy=(copy_slots, torch.tensor([1], dtype=torch.int64, device="cuda")), join=lambda: None)
+    got = nvfp4_decode_silu(x, *bk, tw, slots, cpu_y=cpu_part.cpu().pin_memory(),
+                            cpu_wait=lambda: waits.append(1), **kw)
+    assert waits == [1]
+    assert _rel(got, _reference(x, bk, tw, ids)) < 4e-3
+    # GPU part alone (CPU partial 0) == the GPU kernel over only the GPU routes
+    alone = nvfp4_decode_silu(x, *bk, tw, slots, cpu_y=torch.zeros(2, H, device="cuda"), cpu_wait=lambda: None)
+    torch.testing.assert_close(alone, nvfp4_decode_silu(x, *bk, tw.masked_fill(on_cpu, 0), ids), rtol=0, atol=0)
