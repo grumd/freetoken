@@ -1,42 +1,40 @@
-# FreeToken fork: Qwen3.8-Flash-Next on consumer GPUs
+# FreeToken fork for Qwen3.8-Flash-Next on 1-2 GPUs
 
-A fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0), by way of [anon761/freetoken](https://github.com/anon761/freetoken), tuned to serve **Qwen3.8-Flash-Next** on one or two 16-20 GB GPUs. The experts live in host RAM; whatever VRAM the live context does not need becomes an expert cache. It is optimized for both of the model's 4-bit checkpoints: NVIDIA's quantization-aware [FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), the default here, and Intel's [INT4 W4A16](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound).
+Optimized for **Qwen3.8-Flash-Next** if you have 96GB+ RAM and 1-2 GPUs.
 
-## What to expect
+Recommended to use with Nvidia's [QAD FP4 quant](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local). But it also supports Intel's [INT4 W4A16](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
 
-FP4 with the default settings: RTX 3080s on PCIe 4.0 x8, a Ryzen 7 9800X3D, 96 GB of DDR5. Decode is greedy chat; prefill is one fresh 16k-token prompt. The 16 GB numbers are 20 GB cards with 4 GiB held back.
+MoE experts are pinned to host RAM. There's no setting for context length. As a session's used context grows, it dynamically allocates more KV cache. All the remaining free VRAM is used for MoE expert cache to speed up decode. 
 
-**One 16 GB GPU**
+## Benchmarks
 
-| Prefill chunk | Decode | 16k prefill | Max context |
-|---|---|---|---|
-| 8192 (default) | 27 tok/s | 1,520 tok/s | 147k |
-| 4096 | 27 tok/s | 790 tok/s | 186k |
-| 2048 | 27 tok/s | 880 tok/s | 205k |
+FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tests I just limited my 3080 20GB to max 16GB used. Both 3080s have unlocked ReBAR and P2P.
 
-**One 20 GB GPU**
+### **One GPU at PCIe 4.0 x8**
 
-| Prefill chunk | Decode | 16k prefill | Max context |
-|---|---|---|---|
-| 8192 (default) | 34 tok/s | 1,580 tok/s | 262k |
-| 4096 | 34 tok/s | 830 tok/s | 262k |
+| GPU | Prefill batch | Decode | 16k prefill | Max context (F16) |
+|---|---|---|---|---|
+| 16 GB | **8192** | 27 tok/s | **1,520 tok/s** | 147k |
+| 16 GB | 4096 | 27 tok/s | 790 tok/s | 186k |
+| 16 GB | 2048 | 27 tok/s | 880 tok/s | **205k** |
+| 20 GB | **8192** | 34 tok/s | **1,580 tok/s** | **262k** |
+| 20 GB | 4096 | 34 tok/s | 830 tok/s | 262k |
 
-**Two GPUs**
+### **Two GPUs at PCIe 4.0 x8**
 
-| GPUs | Decode | 16k prefill | Max context |
-|---|---|---|---|
-| 2x 16 GB | 82 tok/s | 2,760 tok/s | 262k |
-| 2x 20 GB | 93 tok/s | 3,030 tok/s | 262k |
+| GPU | Prefill batch | Decode | 16k prefill | Max context (F16) |
+|---|---|---|---|---|
+| 2x 16 GB | 8192 | 82 tok/s | 2,760 tok/s | 262k |
+| 2x 20 GB | 8192 | 93 tok/s | 3,030 tok/s | 262k |
 
-- **Prefill chunk** (`PREFILL_CHUNK`): smaller chunks need less VRAM while a prompt is read, which leaves more for context, at about half the prefill speed. Each max context above was checked with a prompt that fills it.
-- **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. Every setup needs a 96 GB machine.
+- **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
 - **INT4** decodes about 11% slower and downloads 169 GB instead of 96 GB.
-- **Two GPUs** were measured with P2P between them (patched driver); without it, expect roughly 8% less decode.
-- **PCIe:** every card had a x8 link. Experts stream over it on every cache miss, so a card on x16 should decode and prefill faster (not measured).
+- **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
+- **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
 
 ## Quick start
 
-Linux, CUDA 13 with `nvcc`, 96 GB of RAM and an NVMe SSD; an AVX-512 BF16 CPU speeds up prefill ([details](scripts/README.md#requirements)).
+Linux, CUDA 13 with `nvcc`, 96 GB of RAM; an AVX-512 BF16 CPU speeds up prefill ([details](scripts/README.md#requirements)).
 
 ```bash
 git clone https://github.com/grumd/freetoken && cd freetoken
@@ -48,16 +46,15 @@ ft checkpoint --model ~/models/q38-fp4-hf --out ~/models/ftw/q38-fp4   # one-tim
 SNAP=~/models/ftw/q38-fp4 scripts/serve-qwen38.sh                      # API on :8080, chat page at /
 ```
 
-For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead; the same script serves both. The API is OpenAI- and Anthropic-compatible at `http://127.0.0.1:8080/v1`.
+For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead.
 
-The defaults are the fastest settings measured, and the context and expert cache size themselves to your VRAM. Set something else only if:
+The default settings should already be optimized, and the context size and expert cache size automatically match your free VRAM.
 
 - you have one GPU: `GPUS=0`
-- you need more than 147k tokens on one 16 GB GPU: `PREFILL_CHUNK=4096` (186k, half the prefill speed)
-- you have 128 GB of RAM: `CACHE_RAM_GB=16` keeps older conversations in RAM, so going back to one skips its prefill
-- you need another address: `HOST=0.0.0.0 PORT=8000`
+- you need more than 147k tokens on one 16 GB GPU: `PREFILL_CHUNK=4096` or 2048 (see benchmarks above)
+- you have 128 GB of RAM: `CACHE_RAM_GB=16` keeps older chat sessions in RAM, so going back to an old chat can skip prefilling from scratch
 
-The remaining knobs are in [`scripts/README.md`](scripts/README.md).
+See [`scripts/README.md`](scripts/README.md) for more details about options.
 
 ## What this fork adds
 
