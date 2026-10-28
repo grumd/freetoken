@@ -66,7 +66,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | Var | Default | When to change it |
 |---|---|---|
 | `SNAP` | required | FTW checkpoint dir |
-| `GPUS` | `0,1` | one GPU: `GPUS=0`; context and expert cache size themselves to its VRAM |
+| `GPUS` | every GPU `nvidia-smi` lists, at most two | only to pick GPUs, e.g. `GPUS=1` to serve on the second card of two; context and expert cache size themselves to their VRAM |
 | `CACHE_RAM_GB` | `0` | 128 GB of RAM: `16` keeps about 520k tokens of older conversations in RAM; going back to one reloads it (a 13.6k-token one in 27 ms instead of 6.3 s). Leave it off on 96 GB |
 | `HOST`, `PORT` | `127.0.0.1`, `8080` | listen address |
 | `EXTRA` | | extra `ft serve` flags; arguments after the script name are passed too |
@@ -76,7 +76,7 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | Var | Default | Meaning |
 |---|---|---|
 | `SNAP` | required | FTW checkpoint dir |
-| `GPUS` | `0,1` | nvidia-smi indices; the count sets the TP size |
+| `GPUS` | every GPU `nvidia-smi` lists, at most two | nvidia-smi indices; the count sets the TP size |
 | `MAXLEN` | `262144` | longest request; lowered to what fits in VRAM, and reserved as KV when `ELASTIC=0` (`131072` on one GPU) |
 | `ELASTIC` | `1` | KV and the expert cache share VRAM at runtime (`--elastic-kv`); replaces `MEM_RATIO`. Decode +16%, output identical |
 | `KEEP_FREE_MB` | `128` | elastic: VRAM left free per GPU, also at the prefill peak |
@@ -117,9 +117,10 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 How much of decode's expert-cache misses the CPU should compute depends on the CPU, the RAM, the GPUs and the PCIe link. `calibrate-qwen38.sh` measures this machine once, with the `SNAP` and `GPUS` you serve with. `serve-qwen38.sh` then reads the result at every start; it never measures anything itself.
 
 ```bash
-SNAP=~/models/ftw/q38-fp4 GPUS=0   scripts/calibrate-qwen38.sh   # one GPU
-SNAP=~/models/ftw/q38-fp4 GPUS=0,1 scripts/calibrate-qwen38.sh   # two GPUs: a separate result
+SNAP=~/models/ftw/q38-fp4 scripts/calibrate-qwen38.sh   # the GPUs serve-qwen38.sh would use
 ```
+
+Each GPU setup gets its own result. To calibrate one GPU of a two-GPU machine, pass `GPUS=0` to both scripts.
 
 It needs idle GPUs and the same free RAM as the server. On 2x RTX 3080 it takes about 12 min with one GPU and 6 min with two, both model loads included; two GPUs skip the thread and confirmation runs when CPU help does not pay. Steps:
 

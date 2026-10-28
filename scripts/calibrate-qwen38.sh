@@ -9,7 +9,11 @@ HERE=$(dirname "$(readlink -f "$0")")
 REPO=$(dirname "$HERE")
 
 : "${SNAP:?set SNAP to the FTW checkpoint dir, as for serve-qwen38.sh}"
-: "${GPUS:=0,1}"
+if [ -z "${GPUS:-}" ]; then        # nvidia-smi indices, entry i = TP rank i; TP size = count
+  GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | head -2 | paste -sd,)
+  : "${GPUS:=0}"
+  echo "calibrate-qwen38: GPUS=$GPUS (detected; set GPUS to choose)" >&2
+fi
 : "${FT:=$REPO/.venv/bin/ft}"
 [ -x "$FT" ] || FT=$(command -v ft) || { echo "ft not found: install the repo or set FT" >&2; exit 1; }
 : "${PY:=$(dirname "$(readlink -f "$FT")")/python}"

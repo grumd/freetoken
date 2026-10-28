@@ -19,7 +19,11 @@ case "$fmt" in
   *) : "${NAME:=$(basename "$SNAP")}" ;;
 esac
 
-: "${GPUS:=0,1}"                # nvidia-smi indices, entry i = TP rank i; TP size = count
+if [ -z "${GPUS:-}" ]; then        # nvidia-smi indices, entry i = TP rank i; TP size = count
+  GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | head -2 | paste -sd,)
+  : "${GPUS:=0}"
+  echo "serve-qwen38: GPUS=$GPUS (detected; set GPUS to choose)" >&2
+fi
 IFS=, read -ra gpu_list <<<"$GPUS"
 : "${ELASTIC:=1}"               # 1 = KV and the expert cache share VRAM at runtime: the cache gets
                                 # whatever the live context does not need (decode +16%, output
