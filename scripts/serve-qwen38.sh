@@ -43,12 +43,17 @@ fi
                                 # after a full 262k prefill.
 : "${CPU_PREFILL:=1}"           # 1 = routed prefill computes most VRAM-cache misses on the CPU
                                 # (AVX-512 BF16, 4 physical cores per rank) while the GPU fetches the
-                                # rest; 0 = GPU only (bit-reproducible, use it for A/B runs)
+                                # rest; 0 = GPU only (bit-reproducible with DECODE_FETCH=1, use both for A/B runs)
 : "${CPU_PREFILL_FETCH:=0.35}"  # share of the misses fetched over PCIe (the most-routed ones)
 : "${PRECISE_PREFILL:=1}"       # W4A16: apply group scales after the dot, gate/up in fp32 (no cost)
-: "${DECODE_FETCH:=1}"          # FP4: share of decode's expert-cache misses fetched over PCIe; the CPU
-                                # computes the rest from the pinned banks (1 = all over PCIe, 0 = all on CPU)
-: "${CPU_DECODE_ACT:=fp32}"     # DECODE_FETCH < 1: CPU expert activations, fp32 (exact) or int8 (W4A8)
+# FP4 on one GPU: decode computes most expert-cache misses on the CPU (28 -> 53 tok/s at 4k, 20 -> 46
+# at 261k); two GPUs miss too rarely for it to pay (93 -> 89 tok/s at 0.5)
+[ "${#gpu_list[@]}" -lt 2 ] && [ "$fmt" = nvfp4 ] && : "${DECODE_FETCH:=0.1}"
+: "${DECODE_FETCH:=1}"          # FP4: share of decode's expert-cache misses fetched over PCIe into the cache;
+                                # the CPU computes the rest from the pinned banks (1 = all over PCIe, 0 = all
+                                # on the CPU, and the cache then only changes during prefill)
+: "${CPU_DECODE_ACT:=fp32}"     # DECODE_FETCH < 1: CPU expert activations, fp32 (exact) or int8 (W4A8, no
+                                # faster here: the CPU GEMV is memory-bound either way)
 if [ "$CPU_PREFILL" = "1" ]; then : "${ROUTED_PF:=3072}"; else : "${ROUTED_PF:=1280}"; fi
                                 # prefill chunks <= ROUTED_PF tokens load only their routed experts
                                 # instead of streaming every expert over PCIe (~2.4 s per chunk at
