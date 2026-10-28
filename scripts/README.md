@@ -26,7 +26,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
   - KV: 25 KiB/token (6.4 GiB at 262k)
   - expert cache: whatever is left.
 - **RAM:** 96 GB class. The script refuses to start under 75 GiB `MemAvailable`. Pinned memory cannot swap. With 128 GB, see `CACHE_RAM_GB` under Settings.
-- **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for `CPU_PREFILL=1`. Without it the server logs `FREETOKEN_WNA16_CPU_PREFILL ignored` and prefills on the GPU only.
+- **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for `CPU_PREFILL=1`. Without it the server logs `FREETOKEN_WNA16_CPU_PREFILL ignored` and prefills on the GPU only. One-GPU decode computes most expert-cache misses on the CPU too (`DECODE_FETCH`); its speed follows RAM bandwidth (~50 GB/s of expert reads on dual-channel DDR5).
 - **Disk:** NVMe. PLE rows are read on every token.
 - **Optional:** a systemd user session for the RAM-capped scope (`CGROUP=0` skips it).
 
@@ -89,6 +89,8 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 | `ROUTED_PF` | `3072` (`1280` without CPU prefill) | prefill chunks up to this many tokens load only their routed experts |
 | `PRECISE_PREFILL` | `1` | W4A16 exact-dequant prefill (no speed cost) |
 | `HIT_D2D` | `1` | prefill chunks above `ROUTED_PF` copy VRAM-cached experts device-side and stream only the misses over PCIe |
+| `DECODE_FETCH` | `0.1` for FP4 on one GPU, else `1` | FP4: share of decode's expert-cache misses fetched over PCIe into the cache (`--moe-decode-fetch`); the CPU computes the rest from the pinned banks. One GPU: 28 -> 53 tok/s at 4k, 20 -> 46 at 261k. `1` = every miss over PCIe (output identical to before), `0` = every miss on the CPU (the cache then only changes during prefill: 41 tok/s) |
+| `CPU_DECODE_ACT` | `fp32` | `DECODE_FETCH < 1`: activations of the CPU expert GEMV; `int8` (W4A8) is no faster here, the GEMV is memory-bound either way |
 | `BALANCED` | `1` | W4A16 at TP=2: even 320/320 expert split |
 | `DENSE_FP8` | `0` | fp8 dense linears: faster decode, lossy |
 | `MTP` | `off` | `--mtp` mode (`off`, `on`, `auto`, `file`) |
@@ -105,14 +107,15 @@ The defaults are the fastest settings measured on this hardware; usually only `S
 **Other hardware:**
 
 - **Bigger cards:** nothing to set; elastic VRAM gives the extra memory to the context and the expert cache.
-- **Faster PCIe or RAM:** `CPU_PREFILL_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5. On a faster link, fetch more over PCIe and lower `ROUTED_PF`.
+- **Faster PCIe or RAM:** `CPU_PREFILL_FETCH`, `DECODE_FETCH` and `ROUTED_PF` were tuned for PCIe 4.0 x8 per GPU and ~72 GB/s of DDR5 (the CPU decode reaches ~50 GB/s of expert reads, ~57 us per expert). On a faster link, fetch more over PCIe and lower `ROUTED_PF`.
+- **One GPU decode:** with `--moe-collect-stats` the status line shows how decode splits its misses (`fetched`, `cpu`) and the CPU's time per layer and per expert.
 
 ### Troubleshooting
 
 - **`REFUSING TO START`:** free RAM first. Lowering `MIN_AVAIL_GIB` can freeze the host.
 - **CUDA OOM on the first decode after a long prompt:** with `ELASTIC=1` raise `PREFILL_RESERVE_GB` (or `KEEP_FREE_MB`); with `ELASTIC=0` lower `MEM_RATIO` by 0.01-0.02.
 - **Load peak too high:** `FREETOKEN_FTW_READ_CONCURRENCY=1` (about -5 GiB).
-- **Runs differ with `CPU_PREFILL=1`:** expected. Which misses the CPU computes depends on the cache state. Compare builds with `CPU_PREFILL=0`.
+- **Runs differ with `CPU_PREFILL=1` or `DECODE_FETCH` < 1:** expected. Which misses the CPU computes depends on the cache state. Compare builds with `CPU_PREFILL=0 DECODE_FETCH=1`.
 - **Per-prefill CPU/GPU split timing:** `FREETOKEN_WNA16_CPU_PREFILL_STATS=1`.
 
 ## Other scripts
