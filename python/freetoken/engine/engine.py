@@ -1136,7 +1136,7 @@ class Engine:
         default = per - 1 if tp.size == 1 and per > 2 else per
         threads = int(os.environ.get("FREETOKEN_CPU_DECODE_THREADS", "") or default)
         cpus = mine[len(mine) - threads:] if threads <= len(mine) else mine
-        # calibration (scripts/calibrate-qwen38.sh): tune_cpu_decode changes the share and the
+        # calibration (scripts/calibrate.sh): tune_cpu_decode changes the share and the
         # thread count at runtime
         tunable = os.environ.get("FREETOKEN_CPU_DECODE_TUNABLE", "0").strip() == "1"
         if tunable:

@@ -668,7 +668,7 @@ class DecodeTuneRequest(BaseModel):
 
 @app.post("/v1/admin/decode-tune", include_in_schema=False)
 async def decode_tune(request: Request, req: DecodeTuneRequest):
-    """Internal, for scripts/calibrate-qwen38.sh: change the CPU-assisted decode's fetched share
+    """Internal, for scripts/calibrate.sh: change the CPU-assisted decode's fetched share
     and CPU thread count once the engine is idle. Loopback only, and the engine refuses unless
     it was started with FREETOKEN_CPU_DECODE_TUNABLE=1. An empty body reports the settings."""
     if not _is_loopback(request.client.host if request.client else None):

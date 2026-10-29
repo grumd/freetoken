@@ -1,6 +1,5 @@
-"""scripts/calibrate_qwen38.py's recommendation rule and env file, and how serve-qwen38.sh picks
-DECODE_FETCH / CPU_DECODE_THREADS: explicit env > the calibration file for this GPU set > defaults.
-CPU only: the server is a stub that records the environment it was started with."""
+"""scripts/calibrate.py's recommendation rule and report, and serve.sh's CPU-assisted decode default.
+CPU only: the server is a stub that records its command line."""
 
 import importlib.util
 import json
@@ -14,7 +13,7 @@ SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
 def _calibrate_module():
-    spec = importlib.util.spec_from_file_location("calibrate_qwen38", SCRIPTS / "calibrate_qwen38.py")
+    spec = importlib.util.spec_from_file_location("calibrate", SCRIPTS / "calibrate.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -56,76 +55,32 @@ def _snap(tmp_path, fmt="nvfp4"):
     return snap
 
 
-def _serve(tmp_path, gpus, env_extra=None, fmt="nvfp4"):
-    """Run serve-qwen38.sh against a stub ``ft``; return (its FREETOKEN_* env, stderr)."""
-    out = tmp_path / "ft-env.txt"
+def _serve(tmp_path, gpus, fmt="nvfp4", flags=()):
+    """Run serve.sh against a stub ``ft``; return its decode flags (the last one wins, as in argparse)."""
+    out = tmp_path / "ft-args.txt"
     stub = tmp_path / "ft"
-    stub.write_text(f"#!/bin/bash\nenv | grep '^FREETOKEN_\\(MOE_DECODE_FETCH\\|CPU_DECODE_THREADS\\)=' > {out}\n")
+    stub.write_text(f"#!/bin/bash\nprintf '%s\\n' \"$@\" > {out}\n")
     stub.chmod(0o755)
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("DECODE_FETCH", "CPU_DECODE_THREADS", "CALIBRATION", "XDG_CONFIG_HOME")}
-    env.update(SNAP=str(_snap(tmp_path, fmt)), FT=str(stub), GPUS=gpus, CGROUP="0", MEMGUARD="0",
-               MIN_AVAIL_GIB="0", PORT="1", XDG_CONFIG_HOME=str(tmp_path / "config"))
-    env.update(env_extra or {})
-    r = subprocess.run(["bash", str(SCRIPTS / "serve-qwen38.sh")], env=env, capture_output=True,
-                       text=True, timeout=60)
-    got = dict(line.split("=", 1) for line in out.read_text().split())
-    return got, r.stderr
+    env = dict(os.environ, MODEL=str(_snap(tmp_path, fmt)), FT_BIN=str(stub), GPUS=gpus, REQUIRED_FREE_RAM_GB="0",
+               MIN_FREE_RAM_GB="0", PORT="1")
+    subprocess.run(["bash", str(SCRIPTS / "serve.sh"), *flags], env=env, capture_output=True, timeout=60)
+    args = out.read_text().splitlines()
+    decode = ("--moe-decode-fetch", "--moe-cpu-decode-threads")
+    return {a: args[i + 1] for i, a in enumerate(args) if a in decode}
 
 
-def _write_calibration(tmp_path, gpus_key, fetch, threads):
-    """The env file the calibrator writes (its writer, fed a minimal result)."""
-    hw = {"date": "2026-10-28T20:00", "gpus_arg": gpus_key.replace("-", ","),
-          "gpus": [{"name": "GPU", "pcie_gen": "1", "pcie_gen_max": "4", "pcie_width": "8", "h2d_gbps": 13.4}],
-          "cpu": {"model": "CPU", "physical_cores": 8}, "cpu_kernel": {}}
-    res = {"hw": hw, "depths": {"short": 4096}, "confirm": {"base": {"short": 35.0}, "shares": {fetch: {"short": 56.0}}},
-           "decode_fetch": fetch, "threads": threads, "why": "test"}
-    path = tmp_path / "config" / "freetoken" / f"calibration-gpus-{gpus_key}.env"
-    cal.write_outputs(res, "report", path)
-    return path
+@pytest.mark.parametrize("gpus,fmt,want", [("0", "nvfp4", {"--moe-decode-fetch": "0.1"}),
+                                           ("0,1", "nvfp4", {}), ("0", "w4a16", {})])
+def test_cpu_assisted_decode_default(tmp_path, gpus, fmt, want):
+    assert _serve(tmp_path, gpus, fmt) == want
 
 
-def test_serve_reads_the_calibration_of_its_gpu_set(tmp_path):
-    _write_calibration(tmp_path, "0", 0.15, 6)
-    _write_calibration(tmp_path, "0-1", 1.0, 4)
-    got, err = _serve(tmp_path, "0")
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "0.15", "FREETOKEN_CPU_DECODE_THREADS": "6"}
-    assert "DECODE_FETCH=0.15 CPU_DECODE_THREADS=6 (calibration " in err
-    got, _ = _serve(tmp_path, "0,1")
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "1", "FREETOKEN_CPU_DECODE_THREADS": "4"}
+def test_flags_override_the_default(tmp_path):
+    got = _serve(tmp_path, "0", flags=["--moe-decode-fetch", "0.15", "--moe-cpu-decode-threads", "7"])
+    assert got == {"--moe-decode-fetch": "0.15", "--moe-cpu-decode-threads": "7"}
 
 
-def test_explicit_env_overrides_the_calibration(tmp_path):
-    _write_calibration(tmp_path, "0", 0.15, 6)
-    got, err = _serve(tmp_path, "0", {"DECODE_FETCH": "0.3"})
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "0.3"} and "(env)" in err
-    got, _ = _serve(tmp_path, "0", {"CPU_DECODE_THREADS": "3"})
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "0.15", "FREETOKEN_CPU_DECODE_THREADS": "3"}
-
-
-@pytest.mark.parametrize("gpus,want", [("0", "0.1"), ("0,1", "1")])
-def test_defaults_without_a_calibration(tmp_path, gpus, want):
-    got, err = _serve(tmp_path, gpus)
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": want} and "(default)" in err
-
-
-def test_int4_ignores_the_calibration(tmp_path):
-    _write_calibration(tmp_path, "0", 0.15, 6)
-    got, err = _serve(tmp_path, "0", fmt="w4a16")
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "1"} and "DECODE_FETCH" not in err
-
-
-def test_calibration_file_is_parsed_not_sourced(tmp_path):
-    path = tmp_path / "config" / "freetoken" / "calibration-gpus-0.env"
-    path.parent.mkdir(parents=True)
-    canary = tmp_path / "canary"
-    path.write_text(f"DECODE_FETCH=$(touch {canary})\nCPU_DECODE_THREADS=6; touch {canary}\n")
-    got, err = _serve(tmp_path, "0")
-    assert not canary.exists()
-    assert got == {"FREETOKEN_MOE_DECODE_FETCH": "0.1"} and "(default)" in err
-
-
-def test_report_and_env_from_a_full_result(tmp_path):
+def test_report_from_a_full_result(tmp_path):
     hw = {"date": "2026-10-28T20:00", "host": "box", "gpus_arg": "0",
           "gpus": [{"index": 0, "name": "GPU", "memory_mib": 20480, "pcie_gen": "4", "pcie_width": "8",
                     "pcie_gen_max": "4", "pcie_width_max": "16", "h2d_gbps": 13.4}],
@@ -144,10 +99,5 @@ def test_report_and_env_from_a_full_result(tmp_path):
            "decode_fetch": 0.15, "threads": 7, "why": "confirmation runs: 0.15 is +62%",
            "screen_threads": 7, "sweep_s": 600, "out_tokens": 192, "skip": 48}
     report = cal.render_report(res, 5)
-    assert "Recommendation: DECODE_FETCH=0.15 CPU_DECODE_THREADS=7" in report and "PCIe gen4 x8" in report
-    assert "0.15            55.0            51.9  <- pick" in report
-    env = tmp_path / "calibration-gpus-0.env"
-    cal.write_outputs(res, report, env)
-    text = env.read_text()
-    assert text.endswith("DECODE_FETCH=0.15\nCPU_DECODE_THREADS=7\n")
-    assert "DECODE_FETCH=1 35.3 / 31.2, picked 55.0 / 51.9" in text and "54 us/expert at 7 threads" in text
+    assert "Recommendation: scripts/serve.sh --moe-decode-fetch 0.15 --moe-cpu-decode-threads 7" in report
+    assert "PCIe gen4 x8" in report and "0.15            55.0            51.9  <- pick" in report

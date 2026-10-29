@@ -1,4 +1,4 @@
-"""Engine.tune_cpu_decode, the runtime control calibrate-qwen38.sh drives: only on a server
+"""Engine.tune_cpu_decode, the runtime control calibrate.sh drives: only on a server
 started for it, only shares below 1 (the decode path is fixed at startup), threads in range."""
 
 import pytest

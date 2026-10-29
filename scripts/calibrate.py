@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""One-time machine calibration of CPU-assisted decode for serve-qwen38.sh (run through
-calibrate-qwen38.sh, which starts and stops the server).
+"""One-time machine calibration of CPU-assisted decode for serve.sh (run through
+calibrate.sh, which starts and stops the server).
 
 probe  (no server, GPUs idle): GPU / PCIe / CPU facts, pinned host->device bandwidth per GPU, and
        the CPU expert kernel's time per expert on one layer of the checkpoint's real NVFP4 experts.
-run    two loads of serve-qwen38.sh: DECODE_FETCH=1 (plain decode, the reference), then CPU-assisted
+run    two loads of serve.sh: --moe-decode-fetch 1 (plain decode, the reference), then CPU-assisted
        decode with FREETOKEN_CPU_DECODE_TUNABLE=1, where the internal /v1/admin/decode-tune
        endpoint switches the share and the CPU thread count between requests. Greedy streaming
-       decodes at a short and a long context; picks the recommendation, confirms it and writes
-       the env file and the report.
+       decodes at a short and a long context; picks the recommendation, confirms it and prints
+       the report, ending with the serve.sh flags to use.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from pathlib import Path
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # torch ordinals = nvidia-smi indices
 GRID = (1.0, 0.5, 0.25, 0.15, 0.1, 0.05)
 TIE = 0.02      # results this close to the best count as the same (noise of a short run)
-MARGIN = 0.05   # CPU help must beat DECODE_FETCH=1 by this much at every depth to be recommended
+MARGIN = 0.05   # CPU help must beat plain decode (fetch 1) by this much at every depth to be recommended
 QUESTIONS = (
     "Using the material above, write a long and detailed technical walkthrough of how its main "
     "components fit together, with examples, trade-offs and possible improvements.",
@@ -318,12 +318,12 @@ def choose_fetch(table: dict[float, dict[str, float]], depths: list[str]) -> tup
     pick = max(p for p in score if score[p] >= best * (1 - TIE))
     if pick < 1.0 and min(speedup[pick]) < 1 + MARGIN:
         worst = min(speedup[pick])
-        return 1.0, (f"the best share ({pick:g}) is only {(worst - 1) * 100:+.1f}% against DECODE_FETCH=1 "
+        return 1.0, (f"the best share ({pick:g}) is only {(worst - 1) * 100:+.1f}% against plain decode "
                      f"at its weakest depth (needs +{MARGIN:.0%}): CPU help does not pay on this machine")
     if pick == 1.0:
-        return 1.0, "no share beats DECODE_FETCH=1: CPU help does not pay on this machine"
+        return 1.0, "no share beats plain decode: CPU help does not pay on this machine"
     best_p = max(score, key=score.get)
-    why = (f"{pick:g} is {(score[pick] - 1) * 100:+.0f}% over DECODE_FETCH=1 (geometric mean over depths)")
+    why = (f"{pick:g} is {(score[pick] - 1) * 100:+.0f}% over plain decode (geometric mean over depths)")
     if best_p != pick:
         why += (f"; {best_p:g} measured {(score[best_p] / score[pick] - 1) * 100:+.1f}% more, within "
                 f"the {TIE:.0%} noise, and the higher share keeps the CPU less busy")
@@ -338,18 +338,18 @@ def choose_threads(table: dict[int, dict[str, float]], depths: list[str]) -> int
 
 
 class Serve:
-    """serve-qwen38.sh in the background, on the calibration port; stopped with the script's TERM
+    """serve.sh in the background, on the calibration port; stopped with the script's TERM
     trap, which also clears its systemd scope."""
 
-    def __init__(self, args, tag: str, env: dict[str, str]):
+    def __init__(self, args, tag: str, flags: list[str], env: dict[str, str] | None = None):
         self.log = Path(args.work) / f"serve-{tag}.log"
-        full = {**os.environ, "SNAP": args.snap, "GPUS": args.gpus, "PORT": str(args.port),
-                "HOST": "127.0.0.1", "CALIBRATION": "/dev/null", **env}
+        full = {**os.environ, "MODEL": args.snap, "GPUS": args.gpus, "PORT": str(args.port),
+                "HOST": "127.0.0.1", **(env or {})}
         print(f"loading the model ({tag}, log: {self.log})", flush=True)
         self.avail0 = _mem_available_gib()
         t0 = time.perf_counter()
         with open(self.log, "w") as log:
-            self.proc = subprocess.Popen(["bash", str(Path(__file__).resolve().parent / "serve-qwen38.sh")],
+            self.proc = subprocess.Popen(["bash", str(Path(__file__).resolve().parent / "serve.sh"), *flags],
                                          env=full, stdout=log, stderr=subprocess.STDOUT)
         deadline = t0 + args.load_timeout
         while True:
@@ -386,7 +386,7 @@ def _mem_available_gib() -> float:
 
 
 def run(args) -> None:
-    """Load 1: DECODE_FETCH=1 (plain decode, the reference). Load 2: CPU-assisted decode,
+    """Load 1: --moe-decode-fetch 1 (plain decode, the reference). Load 2: CPU-assisted decode,
     runtime-tunable, for the share and thread sweep. The decode path is fixed per load."""
     from tokenizers import Tokenizer
 
@@ -422,7 +422,7 @@ def run(args) -> None:
         note(f"{name} context: {r['prompt_tokens']} tokens (prefill + warm-up {time.perf_counter() - t0:.0f} s)")
 
     # load 1: the reference
-    serve = Serve(args, "plain", {"DECODE_FETCH": "1"})
+    serve = Serve(args, "plain", ["--moe-decode-fetch", "1"])
     try:
         srv = Server(args.port)
         ctx_max = srv.max_context()
@@ -444,10 +444,10 @@ def run(args) -> None:
     base = {n: sum(v) / len(v) for n, v in base_runs.items()}
 
     # load 2: CPU help, share and threads switched at runtime
-    env = {"DECODE_FETCH": f"{GRID[1]:g}", "FREETOKEN_CPU_DECODE_TUNABLE": "1"}
+    flags = ["--moe-decode-fetch", f"{GRID[1]:g}"]
     if args.threads:
-        env["CPU_DECODE_THREADS"] = str(args.threads)
-    serve = Serve(args, "cpu-assisted", env)
+        flags += ["--moe-cpu-decode-threads", str(args.threads)]
+    serve = Serve(args, "cpu-assisted", flags, {"FREETOKEN_CPU_DECODE_TUNABLE": "1"})
     try:
         srv = Server(args.port)
         state = srv.tune()
@@ -460,7 +460,7 @@ def run(args) -> None:
             for p in GRID[1:]:
                 screen.setdefault(p, {})[name] = measure(srv, name, "screen", p, threads0)
         fetch, why = choose_fetch(screen, names)
-        note(f"screen pick: DECODE_FETCH={fetch:g} - {why}")
+        note(f"screen pick: --moe-decode-fetch {fetch:g} - {why}")
 
         # Threads at the long context only (the smallest expert cache, the most CPU work), then
         # the confirmation of the pick and the fastest share, each context once, the cached one
@@ -500,7 +500,12 @@ def run(args) -> None:
     json.dump(res, open(args.out, "w"), indent=1)
     report = render_report(res, args.total_s)
     print("\n" + report)
-    write_outputs(res, report, Path(args.env))
+
+
+def recommendation(fetch: float, threads: int) -> str:
+    if fetch >= 1:
+        return "--moe-decode-fetch 1"
+    return f"--moe-decode-fetch {fetch:g} --moe-cpu-decode-threads {threads}"
 
 
 def render_report(res: dict, total_s: float | None = None) -> str:
@@ -510,9 +515,9 @@ def render_report(res: dict, total_s: float | None = None) -> str:
     lines = [f"FreeToken CPU-assisted decode calibration, {hw['date']} on {hw['host']}, GPUS={hw['gpus_arg']}",
              "", render_hw(hw), "",
              f"Decode tok/s ({res['out_tokens']} greedy tokens after {res['skip']} warm-up, mean of "
-             f"{len(QUESTIONS)} prompts), CPU threads {res['screen_threads']}; DECODE_FETCH=1 is a "
+             f"{len(QUESTIONS)} prompts), CPU threads {res['screen_threads']}; fetch 1 is a "
              "separate load (plain decode), mean of 3:",
-             f"  DECODE_FETCH   {head}   vs 1"]
+             f"  fetch share    {head}   vs 1"]
     base = res["screen"][1.0]
     for p, row in sorted(res["screen"].items(), key=lambda kv: -float(kv[0])):
         sp = geomean([row[n] / base[n] for n in names])
@@ -524,12 +529,12 @@ def render_report(res: dict, total_s: float | None = None) -> str:
             lines.append(f"  {int(n):>12}   {v:13.1f}")
     if res["confirm"].get("shares"):
         c = res["confirm"]
-        lines.append(f"Confirmation at {res['threads']} threads (DECODE_FETCH=1 and each share: mean of 3 runs):")
+        lines.append(f"Confirmation at {res['threads']} threads (fetch 1 and each share: mean of 3 runs):")
         lines.append(f"  {1:>12}   " + "   ".join(f"{c['base'][n]:13.1f}" for n in names))
         for p, row in sorted(c["shares"].items(), key=lambda kv: -float(kv[0])):
             mark = "  <- pick" if float(p) == res["decode_fetch"] else ""
             lines.append(f"  {float(p):>12g}   " + "   ".join(f"{row[n]:13.1f}" for n in names) + mark)
-    lines += ["", f"Recommendation: DECODE_FETCH={res['decode_fetch']:g} CPU_DECODE_THREADS={res['threads']}",
+    lines += ["", f"Recommendation: scripts/serve.sh {recommendation(res['decode_fetch'], res['threads'])}",
               f"  {res['why']}"]
     t = f"two loads and the sweep {res['sweep_s'] / 60:.1f} min"
     if total_s:
@@ -538,48 +543,13 @@ def render_report(res: dict, total_s: float | None = None) -> str:
     return "\n".join(lines)
 
 
-def write_outputs(res: dict, report: str, env_path: Path) -> None:
-    hw = res["hw"]
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    gpus = "; ".join(f"{g['name']} PCIe gen{g['pcie_gen_max']} x{g['pcie_width']} {g['h2d_gbps']:.1f} GB/s"
-                     for g in hw["gpus"])
-    k = hw.get("cpu_kernel", {})
-    cpu = f"{hw['cpu']['model']}, {hw['cpu']['physical_cores']} cores"
-    if k:
-        t = k["threads"].get(str(res["threads"])) or k["threads"].get(res["threads"])
-        if t:
-            cpu += f", {t['us_per_expert']:.0f} us/expert at {res['threads']} threads ({k['isa']})"
-    names = list(res["depths"])
-    c = res["confirm"]
-    speeds = " / ".join(f"{c['base'][n]:.1f}" for n in names)
-    pick = c.get("shares", {}).get(res["decode_fetch"])
-    if pick:
-        speeds = f"DECODE_FETCH=1 {speeds}, picked {' / '.join(f'{pick[n]:.1f}' for n in names)}"
-    depths = " / ".join(f"{res['depths'][n] // 1000}k" for n in names)
-    env_path.write_text(
-        f"# FreeToken CPU-assisted decode calibration (scripts/calibrate-qwen38.sh), {hw['date']}\n"
-        f"# GPUS={hw['gpus_arg']}: {gpus}\n"
-        f"# CPU: {cpu}\n"
-        f"# decode tok/s at {depths} context: {speeds}\n"
-        f"# {res['why']}\n"
-        f"DECODE_FETCH={res['decode_fetch']:g}\n"
-        f"CPU_DECODE_THREADS={res['threads']}\n"
-    )
-    env_path.with_suffix(".txt").write_text(report + "\n")
-    print(f"\nwrote {env_path} (and the report next to it, {env_path.with_suffix('.txt').name})")
-
-
 def write_skip(args) -> None:
-    """No sweep: the feature cannot run here (INT4 checkpoint, no SIMD CPU kernel)."""
+    """No sweep: CPU-assisted decode cannot run here (INT4 checkpoint, no SIMD CPU kernel)."""
     hw = json.load(open(args.hw))
-    res = {"hw": hw, "depths": {}, "screen": {}, "threads_table": {}, "confirm": {"base": {}},
-           "decode_fetch": 1.0, "threads": hw.get("default_threads", 1), "why": args.why,
-           "sweep_s": 0, "out_tokens": 0, "skip": 0}
     report = "\n".join([f"FreeToken CPU-assisted decode calibration, {hw['date']} on {hw['host']}, "
                         f"GPUS={hw['gpus_arg']}", "", render_hw(hw), "",
-                        "Recommendation: DECODE_FETCH=1 (off)", f"  {args.why}"])
+                        f"Recommendation: scripts/serve.sh {recommendation(1.0, 0)}", f"  {args.why}"])
     print("\n" + report)
-    write_outputs(res, report, Path(args.env))
 
 
 def main() -> None:
@@ -595,7 +565,6 @@ def main() -> None:
     s.add_argument("--gpus", required=True)
     s.add_argument("--port", type=int, required=True)
     s.add_argument("--work", required=True, help="scratch dir for the server logs")
-    s.add_argument("--env", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--short", type=int, default=4096)
     s.add_argument("--long", type=int, default=100000)
@@ -606,7 +575,6 @@ def main() -> None:
     s.add_argument("--total-s", type=float, default=None)
     k = sub.add_parser("skip")
     k.add_argument("--hw", required=True)
-    k.add_argument("--env", required=True)
     k.add_argument("--why", required=True)
     args = ap.parse_args()
     {"probe": probe, "run": run, "skip": write_skip}[args.cmd](args)

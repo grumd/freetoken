@@ -28,7 +28,7 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 | 2x 20 GB | 8192 | 93 tok/s | 3,030 tok/s | 262k |
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
-- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`DECODE_FETCH=0.15`, 7 CPU threads); the 16 GB rows reuse the 20 GB card's calibration. With `DECODE_FETCH=1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
+- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
 - **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs, and gets no CPU-assisted decode on one GPU.
 - **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
 - **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
@@ -53,7 +53,7 @@ FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) 
 </picture>
 
 **Settings**
-- **FreeToken:** `scripts/serve-qwen38.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `DECODE_FETCH=0.15` and 7 CPU threads.
+- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`.
 - **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`.
   - `-ub 2048` with a 20 GB cache decoded about 20% faster but prefilled 37% slower.
   - Without moe-cache-mib, decode was 16 tok/s.
@@ -74,18 +74,17 @@ uv pip install -e ".[accel]"
 
 hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --local-dir ~/models/q38-fp4-hf
 ft checkpoint --model ~/models/q38-fp4-hf --out ~/models/ftw/q38-fp4   # one-time fast-load conversion
-SNAP=~/models/ftw/q38-fp4 scripts/calibrate-qwen38.sh                  # one GPU only: once per machine, ~12 min
-SNAP=~/models/ftw/q38-fp4 scripts/serve-qwen38.sh                      # API on :8080, chat page at /
+MODEL=~/models/ftw/q38-fp4 scripts/serve.sh                      # API on :8080, chat page at /
 ```
 
-Both scripts use every GPU they find, up to two. On one GPU the CPU computes most of the experts missing from VRAM while the GPU runs the rest. `calibrate-qwen38.sh` finds the best split for your CPU, RAM and PCIe link and saves it; `serve-qwen38.sh` reads it at every start. Without calibration it uses `DECODE_FETCH=0.1`. Two GPUs can skip calibration: there the CPU doesn't help ([details](scripts/README.md#calibrating-cpu-assisted-decode-fp4)).
+`serve.sh` uses every GPU it finds, up to two. On one GPU the CPU computes most of the experts missing from VRAM while the GPU runs the rest (`--moe-decode-fetch 0.1`). `scripts/calibrate.sh` measures the best split for your CPU, RAM and PCIe link (~12 min) and prints the flags to pass to `serve.sh`. Two GPUs don't need it: there the CPU doesn't help ([details](scripts/README.md#calibratesh-cpu-assisted-decode-fp4)).
 
 For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead.
 
 The default settings should already be optimized, and the context size and expert cache size automatically match your free VRAM.
 
-- you need more than 147k tokens on one 16 GB GPU: `PREFILL_CHUNK=4096` or 2048 (see benchmarks above)
-- you have 128 GB of RAM: `CACHE_RAM_GB=16` keeps older chat sessions in RAM, so going back to an old chat can skip prefilling from scratch
+- you need more than 147k tokens on one 16 GB GPU: pass `--max-prefill-length 4096` (or 2048) after the script name (see benchmarks above)
+- you have 128 GB of RAM: `PREFIX_CACHE_RAM_GB=16` keeps older chat sessions in RAM, so going back to an old chat can skip prefilling from scratch
 
 See [`scripts/README.md`](scripts/README.md) for more details about options.
 
@@ -104,7 +103,7 @@ Each change with its commit and measured effect: [`docs/fork-changes.md`](docs/f
 
 - Read [`AGENTS.md`](AGENTS.md) first; its "Caveats to revisit for new models" lists what the CPU prefill kernels hardcode.
 - Tests: `uv run pytest tests/ -m "not slow"`. About 19 tests (DeepSeek-V4/Engram, rotary, GLM, QSA chunked prefill, scheduler accounting) already failed before the FP4 commits, and some are order-dependent, so compare whole-suite runs.
-- A/B with `CPU_PREFILL=0`: CPU prefill is not bit-reproducible.
+- A/B with `FREETOKEN_WNA16_CPU_PREFILL=0` and `--moe-decode-fetch 1`: CPU prefill and CPU-assisted decode are not bit-reproducible.
 - After editing `kernel/csrc/`, run `python setup.py build_ext --inplace`. Re-run `ft checkpoint` after changing a quant format.
 
 ## Citation & Acknowledgment
