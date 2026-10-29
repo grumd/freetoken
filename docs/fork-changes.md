@@ -8,6 +8,7 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 - **W4A16 tile-dequant prefill kernel:** exact-dequant mode with fp32 gate/up, `FREETOKEN_WNA16_PREFILL_PRECISE` (`17c97b7`, `82026cf`).
 - **NVFP4 kernels:** tile-dequant prefill and fused-epilogue decode, tuned for sm_86. `FREETOKEN_NVFP4_TILE` (`8c40fb0`).
 - **Decode-time GDN state snapshots:** taken every 64 tokens, so an agent's next turn reuses the previous reply. `FREETOKEN_DECODE_SNAPSHOT_INTERVAL` (`9017dfd`).
+- **Image prompts:** a prompt with images is chunked like any other (it used to crash the server past one 8192-token chunk), and its prefix is cached, keyed on each image's pixels. The vision tower runs only for images past the cache hit. 1080p frame in a 20k-token conversation: the next turn 0.57 s with no vision-tower run instead of a full re-prefill plus 12 s of ViT per image (`ccd4a03`).
 - **Hit-D2D on by default:** longer chunks copy VRAM-cached experts device-side and stream only the misses, pp16384 -14% (`34204eb`). A probe race that randomly disabled it at startup is fixed (`9d188f9`).
 
 **Decode**
