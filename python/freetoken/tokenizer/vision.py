@@ -4,7 +4,7 @@ count the vision tower will emit.
 
 The processor runs in the tokenizer worker (where ``input_ids`` are produced); the raw
 processor outputs travel to the scheduler, which owns the vision tower on the GPU and
-turns them into ``mm_embeds`` (see ``scheduler._process_one_msg``).
+turns them into soft tokens at admission (see ``Scheduler._embed_images``).
 """
 
 from __future__ import annotations

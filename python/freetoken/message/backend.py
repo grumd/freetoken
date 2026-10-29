@@ -38,7 +38,7 @@ class UserMsg(BaseBackendMsg):
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
     # Online image input: raw image-processor outputs (CPU tensors) shipped from the
-    # tokenizer worker. The scheduler runs the vision tower on them and fills mm_embeds.
+    # tokenizer worker. The scheduler runs the vision tower on them at admission.
     pixel_values: torch.Tensor | None = None  # [num_patches, C*T*P*P]
     image_grid_thw: torch.Tensor | None = None  # [num_images, 3]
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from .cache import CacheManager
     from .decode import DecodeManager
+    from .mm import MMImage, MMInputs
     from .table import TableManager
 
 logger = init_logger(__name__)
@@ -47,6 +48,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Gives images their soft tokens; returns an error string instead of raising.
+    embed_images: Callable[[List[MMImage]], str | None] | None = None
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -87,6 +90,15 @@ class PrefillAdder:
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
+                return self.cache_manager.unlock(handle)
+
+        # Only now, with the prefix hit known and the request certain to be admitted, embed
+        # the images it will forward; ones inside the hit never reach the vision tower.
+        if req.mm is not None and (missing := req.mm.missing(cached_len)):
+            error = (self.embed_images(missing) if self.embed_images is not None
+                     else "image inputs need the scheduler's vision tower")
+            if error is not None:
+                req.error = error
                 return self.cache_manager.unlock(handle)
 
         if self.cache_manager.elastic is not None:
@@ -177,11 +189,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -190,7 +197,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=pending_req.mm_embeds,
+            mm=pending_req.mm,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -236,6 +243,11 @@ class PrefillAdder:
                 next_track_idx=0,
                 restore_src=restore_src,
             )
+            if req is not None and req.mm is not None:
+                # admitted: every image past the hit has its soft tokens and the rest are in
+                # the locked prefix, so the pixels (~48 MiB per 1080p image) are dead weight
+                for img in req.mm.images:
+                    img.pixel_values = img.grid_thw = None
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
                 # resources -- they belong to the prior chunk's Req)
@@ -253,12 +265,13 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    embed_images: Callable[[List[MMImage]], str | None] | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
+    # (uid, error) of requests dropped at admission; the scheduler replies and clears it
+    failed: List[Tuple[int, str]] = field(default_factory=list)
 
-    def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
-        )
+    def add_one_req(self, req: UserMsg, mm: MMInputs | None = None) -> None:
+        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params, mm=mm))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -270,6 +283,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            embed_images=self.embed_images,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -298,10 +312,14 @@ class PrefillManager:
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
+                if pending_req.error is not None:
+                    self.failed.append((pending_req.uid, pending_req.error))
                 break  # We cannot add more requests
+        rest = [p for p in self.pending_list[len(reqs) :] if p.error is None]
         if len(reqs) == 0:
+            self.pending_list = rest
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self.pending_list = chunked_list + rest
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens

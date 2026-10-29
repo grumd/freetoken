@@ -138,7 +138,7 @@ class Qwen4ExpModel(BaseOP):
         mm_embeds = getattr(batch, "mm_embeds", None)
         if mm_embeds is not None and self._image_token_id is not None:
             # Replace the image-token placeholder rows with the vision soft tokens; the
-            # scheduler guarantees they are not split across prefill chunks.
+            # scheduler passes only the rows of the placeholders in this chunk.
             mask = input_ids == self._image_token_id
             hidden = hidden.masked_scatter(mask.unsqueeze(-1), mm_embeds.reshape(-1, hidden.shape[-1]))
         hidden = hidden.repeat(1, self.hc_count)

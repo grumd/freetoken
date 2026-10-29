@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -37,6 +38,7 @@ from .mtp import MTPManager
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
+from .mm import MMImage, MMInputs, image_digests, mm_cache_key, nonce_digest
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
@@ -122,7 +124,8 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager, self.table_manager, self.decode_manager,
+            embed_images=self._embed_images,
         )
         # Speculative decoding (no-op unless the served model ships an enabled draft head;
         # asserts non-overlap mode when active). qwen4-exp uses the EAGLE-style MTPManager
@@ -754,10 +757,23 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
-    def _encode_images(
-        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
-    ) -> torch.Tensor:
-        """Vision soft tokens for an incoming image request, on this rank's GPU.
+    def _run_tower(self, images: List[MMImage]) -> torch.Tensor:
+        """``images``' soft tokens concatenated, on the engine device, in one vision batch."""
+        t0 = time.perf_counter()
+        out = self.engine.encode_images(
+            torch.cat([img.pixel_values for img in images]),
+            torch.cat([img.grid_thw for img in images]),
+        )
+        n = sum(img.count for img in images)
+        if out.shape[0] != n:
+            raise RuntimeError(f"the vision tower produced {out.shape[0]} soft tokens for "
+                               f"{n} image placeholders")
+        logger.info_rank0(f"vision: encoded {len(images)} image(s), {n} soft tokens in "
+                          f"{(time.perf_counter() - t0) * 1e3:.0f} ms")
+        return out
+
+    def _encode_images(self, images: List[MMImage]) -> torch.Tensor:
+        """Vision soft tokens for ``images``, concatenated, on this rank's GPU.
 
         With a host-resident tower (``--vision-on-cpu``) only the primary rank owns the
         weights: it encodes on the CPU and hands the result to the sibling ranks over the
@@ -768,12 +784,12 @@ class Scheduler(SchedulerIOMixin):
         bf16 -> fp32 is exact and keeps the collective on a dtype gloo knows."""
         engine = self.engine
         if engine.vision_device.type != "cpu" or self.config.tp_info.size == 1:
-            return engine.encode_images(pixel_values, image_grid_thw)
+            return self._run_tower(images)
         group = self.tp_cpu_group
         payload = None
         if self.config.tp_info.is_primary():
             try:
-                emb = engine.encode_images(pixel_values, image_grid_thw)
+                emb = self._run_tower(images)
             except Exception:
                 # the siblings are parked on this broadcast; tell them to abort the request
                 # too, then let it surface as the usual request error
@@ -838,24 +854,18 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            # Online image input: run the vision tower here (this process owns the model)
-            # and hand the scheduler the soft-token embeddings.
-            if getattr(msg, "pixel_values", None) is not None:
-                try:
-                    msg.mm_embeds = self._encode_images(msg.pixel_values, msg.image_grid_thw)
-                except Exception as exc:  # noqa: BLE001 — surface as a request error, never crash
-                    logger.warning_rank0(f"image encoding failed for request {msg.uid}: {exc!r}")
+            # Image input: only key the images here. The vision tower runs at admission, for
+            # the images past the prefix-cache hit (see _embed_images).
+            mm = None
+            if msg.pixel_values is not None or msg.mm_embeds is not None:
+                mm, error = self._build_mm(msg)
+                if error is not None:
+                    logger.warning_rank0(f"request {msg.uid} rejected: {error}")
                     self.send_result(
-                        [
-                            ErrorReplyMsg(
-                                uid=msg.uid,
-                                error=f"image encoding failed: {exc}",
-                                code="invalid_request_error",
-                            )
-                        ]
+                        [ErrorReplyMsg(uid=msg.uid, error=error, code="invalid_request_error")]
                     )
                     return
-            self.prefill_manager.add_one_req(msg)
+            self.prefill_manager.add_one_req(msg, mm)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
@@ -1175,13 +1185,70 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _build_mm(self, msg: UserMsg) -> Tuple[MMInputs | None, str | None]:
+        """Split an image request into per-image placeholder spans and content digests and
+        build its prefix-cache key; returns the error to send instead when they disagree."""
+        tok = self.config.model_config.image_token_id
+        if tok is None:
+            return None, "this model does not accept image inputs"
+        positions = (msg.input_ids == tok).nonzero().view(-1)
+        n_tokens = positions.numel()
+        images: List[MMImage] = []
+        if msg.pixel_values is not None:
+            grid = msg.image_grid_thw
+            split = None if grid is None else image_digests(msg.pixel_values, grid, n_tokens)
+            if split is None:
+                return None, (f"prompt has {n_tokens} image placeholder tokens, which do not "
+                              f"match the image patch grids")
+            first = 0
+            for (digest, row, count), thw in zip(split, grid):
+                rows = int(thw.prod())
+                images.append(MMImage(digest, first, count,
+                                      pixel_values=msg.pixel_values[row : row + rows],
+                                      grid_thw=thw.view(1, -1)))
+                first += count
+        else:
+            # precomputed soft tokens (offline path): no content to key on, so a key no other
+            # request shares. Every rank sees the same messages in the same order.
+            emb = msg.mm_embeds.reshape(-1, msg.mm_embeds.shape[-1])
+            if emb.shape[0] != n_tokens:
+                return None, (f"prompt has {n_tokens} image placeholder tokens but "
+                              f"{emb.shape[0]} soft tokens were given")
+            self._mm_nonce = getattr(self, "_mm_nonce", 0) + 1
+            images.append(MMImage(nonce_digest(self._mm_nonce), 0, n_tokens, embeds=emb))
+        key = mm_cache_key(msg.input_ids, positions, [(i.digest, i.count) for i in images])
+        return MMInputs(images, positions, key), None
+
+    def _embed_images(self, images: List[MMImage]) -> str | None:
+        """Give ``images`` their soft tokens on this rank's device, at admission. Called on
+        every rank in the same order, so the vision-on-cpu hand-off lines up. Returns the
+        error to fail the request with instead of raising."""
+        try:
+            flat = self._encode_images(images)
+        except Exception as exc:  # noqa: BLE001 -- a request error, never a scheduler crash
+            logger.warning_rank0(f"image encoding failed: {exc!r}")
+            return f"image encoding failed: {exc}"
+        for img, rows in zip(images, torch.split(flat, [i.count for i in images])):
+            img.embeds = rows
+        return None
+
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        """Concatenate, in request order, the vision soft tokens of the image placeholders
+        each request forwards in this chunk, so the model can scatter them at image-token
+        positions. A chunk boundary may fall anywhere, even inside an image."""
+        parts = []
+        for req in batch.reqs:
+            mm = req.mm
+            if mm is None:
+                continue
+            for img in mm.images:
+                lo, hi = mm.span(img, req.cached_len, req.device_len)
+                if lo == hi:
+                    continue
+                assert img.embeds is not None, "image forwarded without soft tokens"
+                parts.append(img.embeds[lo:hi])
+                if hi == img.count:
+                    img.embeds = None  # fully forwarded: free the VRAM
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
 
@@ -1191,10 +1258,15 @@ class Scheduler(SchedulerIOMixin):
             # a prefill needs its activation workspace back, and admission may reload from RAM
             elastic.reclaim()
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        failed = getattr(self.prefill_manager, "failed", None)
+        if failed:
+            self.send_result([
+                ErrorReplyMsg(uid=uid, error=error, code="invalid_request_error")
+                for uid, error in failed
+            ])
+            failed.clear()
+        batch = batch or self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
         if elastic is not None and not batch.is_prefill:

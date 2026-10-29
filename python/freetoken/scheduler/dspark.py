@@ -107,7 +107,7 @@ class DSparkManager:
             and (latch is None or not latch.drafter_disabled())
             and req.table_idx in self._aux
             and not req.aborted
-            and req.mm_embeds is None
+            and req.mm is None
             and req.device_len == req.cached_len + 1
             and req.remain_len >= self.k + 1
         )

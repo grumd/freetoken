@@ -197,7 +197,7 @@ class MTPManager:
             self.enabled
             and req.table_idx != -1
             and not req.aborted
-            and req.mm_embeds is None
+            and req.mm is None
             and req.mtp_streams_row is not None
             # Greedy always; sampled only with FREETOKEN_MTP_SAMPLED=1 (Phase 1 is
             # correct but currently a net slowdown, so it is opt-in).
@@ -236,7 +236,7 @@ class MTPManager:
         offsets = torch.zeros(len(batch.reqs) + 1, dtype=torch.int64)
         zero_row = torch.zeros(self.width, dtype=streams.dtype, device=eng.device)
         for i, (r, (s, e)) in enumerate(zip(batch.reqs, pre_lens)):
-            if r.mm_embeds is not None or r.table_idx == -1:
+            if r.mm is not None or r.table_idx == -1:
                 offsets[i + 1] = offsets[i]
                 continue
             if e <= s:
