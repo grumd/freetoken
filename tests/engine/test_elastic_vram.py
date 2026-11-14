@@ -188,10 +188,14 @@ def test_compact_small_weights_releases_interleaved_holes():
     from freetoken.engine.engine import _compact_small_weights
     from freetoken.layers.base import BaseOP
 
+    # just over 1 MiB: blocks of <= 1 MiB come from the small pool, which packs them away from
+    # the freed 3 MiB blocks and leaves no hole to release
+    kept_bytes = (1 << 20) + 4096
+
     class Layer(BaseOP):
         def __init__(self, i):
             self.freed = torch.full((3 << 20,), i % 251, dtype=torch.uint8, device="cuda")
-            self.kept = torch.full((1 << 20,), i % 7, dtype=torch.uint8, device="cuda")
+            self.kept = torch.full((kept_bytes,), i % 7, dtype=torch.uint8, device="cuda")
 
     class Root(BaseOP):
         def __init__(self):
@@ -208,7 +212,7 @@ def test_compact_small_weights_releases_interleaved_holes():
     before = torch.cuda.memory_reserved() - base
     moved = _compact_small_weights(root)
     after = torch.cuda.memory_reserved() - base
-    assert moved == 62 << 20
+    assert moved == 62 * kept_bytes
     # how much comes back depends on the allocator config (the engine runs expandable segments)
     assert after < before, (before, after)
     assert root.layers[3].kept is alias
