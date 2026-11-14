@@ -1,12 +1,12 @@
 # What this fork changes
 
-Every change against [anon761/freetoken](https://github.com/anon761/freetoken), with its commit and measured effect. The env vars are runtime switches for A/B runs; the defaults, and [`scripts/serve.sh`](../scripts/serve.sh), already take the fast path.
+Every change against [anon761/freetoken](https://github.com/anon761/freetoken), with its commit and measured effect. Lossless changes have no switch; lossy options are `ft serve` flags, off by default. The settings that remain are listed under [Configuration](#configuration).
 
 **Prefill**
 - **Routed-only prefill:** chunks up to `--moe-routed-prefill-tokens` load only their routed experts instead of streaming all 24,576 (`e88b3ff`).
 - **Hybrid CPU prefill:** AVX-512 BF16 kernels compute VRAM-cache misses straight from the pinned host banks while the GPU fetches the most-routed ones. Works for W4A16 and NVFP4. `FREETOKEN_WNA16_CPU_PREFILL`, `..._FETCH`, `..._THREADS` (`9017dfd`, `c19c6b5`).
 - **W4A16 tile-dequant prefill kernel:** exact-dequant mode with fp32 gate/up, `FREETOKEN_WNA16_PREFILL_PRECISE` (`17c97b7`, `82026cf`).
-- **NVFP4 kernels:** tile-dequant prefill and fused-epilogue decode, tuned for sm_86. `FREETOKEN_NVFP4_TILE` (`8c40fb0`).
+- **NVFP4 kernels:** tile-dequant prefill and fused-epilogue decode, tuned for sm_86; the inline-dequant kernels stay as the fallback for other shapes (`8c40fb0`).
 - **Decode-time GDN state snapshots:** taken every 64 tokens, so an agent's next turn reuses the previous reply. `FREETOKEN_DECODE_SNAPSHOT_INTERVAL` (`9017dfd`).
 - **Image prompts:** a prompt with images is chunked like any other (it used to crash the server past one 8192-token chunk), and its prefix is cached, keyed on each image's pixels. The vision tower runs only for images past the cache hit. 1080p frame in a 20k-token conversation: the next turn 0.57 s with no vision-tower run instead of a full re-prefill plus 12 s of ViT per image (`ccd4a03`).
 - **Hit-D2D on by default:** longer chunks copy VRAM-cached experts device-side and stream only the misses, pp16384 -14% (`34204eb`). A probe race that randomly disabled it at startup is fixed (`9d188f9`).
@@ -19,10 +19,10 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 - Triton streaming GEMV for single-token bf16 linears, plus one launch for the router and shared-expert front (`d715465`, `5234afe`).
 - Two-rank all-reduce through shared pinned host memory, so no P2P is needed (`45c2556`).
 - With P2P between the GPUs, an LL all-reduce and all-gather that push straight into the peer's VRAM instead, +4.9% decode. `FREETOKEN_P2P_ALLREDUCE` (`3290db0`, `6b5846c`).
-- Hyper-connection mix fused into one kernel and, over P2P, split across both GPUs. `FREETOKEN_HC_FUSE`, `FREETOKEN_HC_SHARD` (`9d8d75c`).
-- NVFP4 decode overlaps the expert-miss copy with the routes already in VRAM, and scores the router first so the shared expert runs during the copy. `FREETOKEN_COPY_OVERLAP`, `FREETOKEN_EARLY_ROUTER` (`2878d5c`, `9c4a0f2`).
+- Hyper-connection mix fused into one kernel and, over P2P, split across both GPUs, bit-identical (`9d8d75c`).
+- NVFP4 decode overlaps the expert-miss copy with the routes already in VRAM, and scores the router first so the shared expert runs during the copy, bit-identical (`2878d5c`, `9c4a0f2`).
 - Together: FP4 decode 72.9 -> 78.4 tok/s, greedy output token-identical.
-- FP4-Local's MXFP8 dense linears are re-encoded losslessly instead of served as bf16. `FREETOKEN_DENSE_MXFP8` (`744ff21`).
+- FP4-Local's MXFP8 dense linears are re-encoded losslessly instead of served as bf16 (`744ff21`).
 - **More MXFP8 dense groups (opt-in, off by default):** `--dense-mxfp8-groups lm_head,hc,shared|all` also serves the lm_head, the hyper-connection mixes and the shared experts as MXFP8. FP4-Local ships the shared experts in MXFP8, so `shared` is lossless; `lm_head` and `hc` are rounded. Small survivors are repacked after load so the freed bf16 is really released. One RTX 3080, FP4: `lm_head` 5.75 -> 5.17 GiB resident, +228 expert slots, decode 54.7 -> 57.6 tok/s, KLD within run-to-run noise (0.095 vs 0.094-0.098); `all` 4.37 GiB, 60.3 tok/s, KLD 0.102. Recommended: `lm_head` (`3d52107`, `10f046d`).
 - **Prompt-lookup speculative decoding:** `--ngram-spec` drafts the continuation of an earlier repeat of the request's own context (>= 3 tokens, up to 7) and checks it in one verify window; no draft model. A cost policy drafts only where a round beats a plain step; at TP=2 rank 0's decisions ride the per-iteration message broadcast. On in `serve.sh`. FP4, a code edit that copies a 351-line file back: one RTX 3080 52.2 -> 84.0 tok/s (+61%), two 81.9 -> 126.7 (+55%); prose +1% on one GPU, -2% on two (the verify graphs' VRAM). Also fixes rollback in the shared MTP verify path (PLE conv state, QSA pending ring, verify batches on the CPU prefill path, the PLE verify buffer captured at bs=1) (`f642314`).
 - **CPU-assisted decode (FP4):** decode fetches only a share of its expert-cache misses over PCIe; the CPU computes the rest straight from the pinned banks (~57 us and ~50 GB/s per expert on 7 Zen 5 cores) while the GPU runs the hits, and its fp32 partial joins the route sum before the one rounding. Every routed expert still runs, on one side or the other. One RTX 3080 at PCIe 4.0 x8: decode 28 -> 53 tok/s at 4k context, 26 -> 50 at 131k, 20 -> 46 at 261k; prefill unchanged. Per MoE layer the fp32 CPU path is as close to exact W4 math as the GPU kernel (2.19e-3 rel-RMS both); int8 activations (W4A8) were no faster and 3.6x further off, so only fp32 is kept. Output is not token-identical to the GPU path: teacher-forced KLD vs it is 0.035-0.040, the same as a GPU-only change of summation order (0.029). On two GPUs only ~4% of routes miss and it does not pay. `--moe-decode-fetch` (the fetched share; 1 = off, 0.1 in `serve.sh` on one GPU), `--moe-cpu-decode-threads` (`fca53ea`).
@@ -47,6 +47,28 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 - Single-file chat page at `/` (`3663bdf`).
 - Decode profiler, routing log, decode and prefill logit dumps (`4ad6fca`).
 - `scripts/serve.sh`, with a RAM check, a capped systemd scope and a RAM watchdog.
+
+## Configuration
+
+The fork's rules: one code path for every supported setup; behavior from measured hardware or a cost model rather than fixed thresholds; no switch for a lossless change; lossy options as documented `ft serve` flags, off by default. Environment variables are left for debugging, diagnostics and builds.
+
+**`ft serve` flags the fork adds** ([`docs/cli.md`](cli.md)): `--elastic-kv` and its tuning (`--vram-keep-free-mb`, `--expert-cache-min-slots`, `--elastic-kv-min-tokens`, `--elastic-kv-step-tokens`, `--elastic-keep-requests`, `--elastic-lend-after`, `--prefill-reserve-gb`, `--prefill-reserve-tokens`), `--cache-ram-gb`, `--moe-routed-prefill-tokens`, `--moe-decode-fetch`, `--moe-cpu-decode-threads`, `--ngram-spec` (with `--ngram-spec-max-draft`, `--ngram-spec-min-match`, `--ngram-spec-policy`), `--vision-on-cpu`, `--vision-threads`. Lossy, off by default: `--dense-mxfp8-groups` (and upstream's `--dense-fp8`).
+
+**Engine switches still read from the environment** (set by `serve.sh`, pending a decision on whether they become defaults or flags):
+
+| Var | `serve.sh` | Meaning |
+|---|---|---|
+| `FREETOKEN_WNA16_CPU_PREFILL` | `1` | hybrid CPU prefill, W4A16 and NVFP4 despite the name; not bit-reproducible |
+| `FREETOKEN_WNA16_CPU_PREFILL_FETCH` | `0.35` | share of the CPU prefill's misses fetched over PCIe instead |
+| `FREETOKEN_WNA16_CPU_PREFILL_THREADS` | | CPU prefill threads per GPU (default: the GPU's share of the physical cores) |
+| `FREETOKEN_WNA16_PREFILL_PRECISE` | `1` | INT4: exact-dequant tile prefill, fp32 gate/up |
+| `FREETOKEN_WNA16_BALANCED_TP` | `1` | INT4 at TP=2: 320/320 expert split |
+
+**Troubleshooting:** `FREETOKEN_P2P_ALLREDUCE=0` (NCCL instead of the P2P all-reduce), `FREETOKEN_HOST_ALLREDUCE=0` (NCCL instead of the host all-reduce), `FREETOKEN_DECODE_SNAPSHOT_INTERVAL` (decode tokens between GDN snapshots, default 64, `0` off), `FREETOKEN_FTW_READ_CONCURRENCY` (lower load peak on low-RAM hosts).
+
+**Diagnostics:** `FREETOKEN_DUMP_PREFILL_LOGITS`, `FREETOKEN_DUMP_DECODE_LOGITS` (logit dumps for KLD), `FREETOKEN_CPU_DECODE_PREFILL=1` (prefill chunks as small as a decode step take CPU-assisted decode, for teacher-forced dumps), `FREETOKEN_ROUTE_LOG`, `FREETOKEN_PROFILE_PREFILL_DIR` / `_MIN`, `FREETOKEN_PROFILE_DECODE_DIR` / `_SKIP` / `_STEPS`, `FREETOKEN_PREFIX_DEBUG`, `FREETOKEN_WNA16_CPU_PREFILL_STATS`, `FREETOKEN_NGRAM_SPEC_DEBUG`, `FREETOKEN_NGRAM_SPEC_MODE_FILE`, `FREETOKEN_NGRAM_SPEC_OFF_FILE`, `FREETOKEN_CPU_DECODE_TUNABLE` (calibration only).
+
+**Removed in the 2026-11-14 cleanup** (they only turned off a default path, picked a superseded kernel, or retuned a measured constant): `FREETOKEN_MXFP8_PAD_SLICES`, `FREETOKEN_PLE_ASYNC_PREFILL`, `FREETOKEN_HC_FUSE`, `FREETOKEN_HC_SHARD`, `FREETOKEN_COPY_OVERLAP`, `FREETOKEN_EARLY_ROUTER`, `FREETOKEN_DECODE_FRONT_FUSE`, `FREETOKEN_TRITON_GEMV`, `FREETOKEN_EMBED_ON_HOST`, `FREETOKEN_NGRAM_SPEC_GRAPH`, `FREETOKEN_NVFP4_TILE`, `FREETOKEN_NVFP4_NK_TILE`, `FREETOKEN_NVFP4_GEMV_V2`, `FREETOKEN_WNA16_DECODE_V2`, `FREETOKEN_WNA16_PREFILL_LEGACY`, `FREETOKEN_DENSE_MXFP8`, `FREETOKEN_CPU_MOE_SPIN_US`, `FREETOKEN_PLE_QUEUE_DEPTH`, and `--moe-cpu-decode-act` (int8 was no faster and 3.6x less accurate).
 
 ## Inherited from anon761/freetoken
 

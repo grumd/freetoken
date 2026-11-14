@@ -109,6 +109,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--moe-routed-prefill-tokens` | 0 | Prefill chunks up to N tokens load only their routed experts via the expert cache instead of streaming whole layers (`FREETOKEN_MOE_ROUTED_PREFILL_TOKENS`) |
+| `--moe-decode-fetch` | 1 | With NVFP4 or W4A16 experts: the share (0-1) of each decode step's expert-cache misses fetched over PCIe; the CPU computes the rest straight from the pinned banks while the GPU runs the hits. `1` = every miss over PCIe. `scripts/calibrate.sh` measures the best value per machine |
+| `--moe-cpu-decode-threads` | auto | With `--moe-decode-fetch` below 1: CPU threads per GPU, one per physical core; default all physical cores but one on one GPU, the GPU's share of them with several |
 | `--moe-collect-stats` | off | Decode: count expert-cache misses; the status line shows the miss rate |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--expert-load` | auto | How expert banks are read into host RAM: `auto` (parallel for scattered experts, serial when RAM is tight), `serial`, `parallel` |
@@ -153,7 +155,7 @@ With `--elastic-kv`, KV pages and MoE expert slots share one pool of VRAM at run
 | `--[no-]mtp-head-fp8` | on | Quantize the bf16 MTP draft head to fp8 per row at load |
 | `--dspark-verify` | decode | DeepSeek-V4.1 DSpark verify path: `decode` aligns the attention reduction with plain decode; `prefill` keeps the ascending-window extend. Inert without the DSpark draft head |
 | `--dspark-k` | draft block size | DSpark draft chain length |
-| `--[no-]ngram-spec` | off | Prompt-lookup speculative decoding without a draft head: verify the continuation of an earlier repeat of the request's context (code edits, quoted input, tool-call JSON) where the measured round cost and acceptance say it pays. Lossless: every emitted token is the target's argmax (greedy) or a sample of the target distribution, computed by the verify window (not bit-identical to plain decode). Verify CUDA graphs per window width cost ~240 MB of VRAM (`FREETOKEN_NGRAM_SPEC_GRAPH=0` runs them eager) |
+| `--[no-]ngram-spec` | off | Prompt-lookup speculative decoding without a draft head: verify the continuation of an earlier repeat of the request's context (code edits, quoted input, tool-call JSON) where the measured round cost and acceptance say it pays. Lossless: every emitted token is the target's argmax (greedy) or a sample of the target distribution, computed by the verify window (not bit-identical to plain decode). Verify CUDA graphs per window width cost ~240 MB of VRAM |
 | `--ngram-spec-max-draft` | 7 | Longest `--ngram-spec` draft (the verify window is one token longer) |
 | `--ngram-spec-min-match` | 3 | Shortest context repeat, in tokens, a draft is taken from |
 | `--ngram-spec-policy` | adaptive | `adaptive`: draft only where the expected tokens per ms beat a plain decode step; `always`: verify every proposal; `fixed` / `fixed-null`: a full-width window every step, lookup drafts / padding only (diagnostics) |
