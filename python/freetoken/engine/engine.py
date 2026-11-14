@@ -397,15 +397,10 @@ def _compact_small_weights(root, max_bytes: int = 64 << 20) -> int:
 
 
 def _dense_mxfp8_enabled(hf_config) -> bool:
-    """FREETOKEN_DENSE_MXFP8 (auto|1|0): serve the dense linears of an MXFP8 checkpoint
-    (ModelOpt FP4-Local) as MXFP8 instead of the bf16 they were exactly dequantized to.
-    auto = on when the checkpoint's quantization_config uses MXFP8 anywhere (only weights
-    that round-trip exactly are re-encoded, so a non-MXFP8 layer is never touched)."""
-    mode = os.environ.get("FREETOKEN_DENSE_MXFP8", "auto").lower()
-    if mode in ("0", "off", "false", "no"):
-        return False
-    if mode in ("1", "on", "true", "yes"):
-        return True
+    """Serve the dense linears of an MXFP8 checkpoint (ModelOpt FP4-Local) as MXFP8 instead of
+    the bf16 they were exactly dequantized to: on when the checkpoint's quantization_config uses
+    MXFP8 anywhere (only weights that round-trip exactly are re-encoded, so a non-MXFP8 layer is
+    never touched)."""
     q = getattr(hf_config, "quantization_config", None) or {}
     if not isinstance(q, dict):
         q = getattr(q, "to_dict", lambda: {})()

@@ -34,11 +34,12 @@ def _expert_bank(S, N, K, dev):
 @pytest.mark.parametrize("split", [None, 1])
 @pytest.mark.parametrize("v2", [True, False])
 def test_decode_matches_dequant_reference(M, split, v2, monkeypatch):
-    """Both decode paths: the fused-epilogue one (kernel/triton/wna16_decode.py, default)
-    and the per-op split-K one it replaces (FREETOKEN_WNA16_DECODE_V2=0)."""
+    """Both decode paths: the fused-epilogue one (kernel/triton/wna16_decode.py, wherever it
+    serves the shape) and the per-op split-K fallback."""
     from freetoken.moe import fused_wna16
 
-    monkeypatch.setattr(fused_wna16, "_DECODE_V2", v2)
+    if not v2:
+        monkeypatch.setattr(fused_wna16.wna16_decode, "supported", lambda *a, **k: False)
     if split == 1:  # pin the pre-split tiles to cover the SPLIT_K=1 path too
         monkeypatch.setattr(fused_wna16, "_decode_config", lambda r, n, k: dict(
             BLOCK_SIZE_N=64, BLOCK_SIZE_KW=8, num_warps=1, num_stages=2, SPLIT_K=1))
@@ -71,7 +72,8 @@ def test_decode_matches_dequant_reference(M, split, v2, monkeypatch):
 def test_prefill_matches_dequant_reference(M, legacy, precise, monkeypatch):
     from freetoken.moe import fused_wna16
 
-    monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_LEGACY", "1" if legacy else "")
+    if legacy:  # the per-nibble fallback of shapes the tile kernels do not divide
+        monkeypatch.setattr(fused_wna16, "_tile_ok", lambda *a, **k: False)
     monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
     torch.manual_seed(0)
     dev = "cuda"
@@ -130,7 +132,8 @@ def test_balanced_tp_bands_sum_to_full(prefill, precise, v2, monkeypatch):
 
     monkeypatch.setenv("FREETOKEN_WNA16_BALANCED_TP", "1")
     monkeypatch.setenv("FREETOKEN_WNA16_PREFILL_PRECISE", "1" if precise else "")
-    monkeypatch.setattr(fused_wna16, "_DECODE_V2", v2)
+    if not v2:
+        monkeypatch.setattr(fused_wna16.wna16_decode, "supported", lambda *a, **k: False)
     torch.manual_seed(0)
     dev = "cuda"
     S, H, I, TOPK, TP = 16, 512, 384, 4, 2  # bands of 192: [0,192) and [192,384)

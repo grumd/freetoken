@@ -73,12 +73,10 @@ def test_decode_split_around_the_copy_is_bit_identical(in_flight):
 
 
 @pytest.mark.parametrize("fuse_act", [True, False])
-@pytest.mark.parametrize("nk_tile", [True, False])
 @pytest.mark.parametrize("routed", [False, True])
-def test_prefill_matches_exact_math(fuse_act, nk_tile, routed, monkeypatch):
+def test_prefill_matches_exact_math(fuse_act, routed):
     from freetoken.moe import fused_nvfp4_tile as ft
 
-    monkeypatch.setattr(ft, "_NK_TILE", nk_tile)
     E, M = 16, 40
     bk = _banks(E, 1)
     x = (torch.randn(M, H, device="cuda") * 0.5).to(torch.bfloat16)

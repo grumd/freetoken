@@ -107,12 +107,11 @@ class TritonWna16MoEKernel(MoEKernel):
         :func:`wna16_decode_silu`."""
         from freetoken.kernel.triton import wna16_decode
         from freetoken.models.wna16_banks import wna16_down_k_off
-        from freetoken.moe.fused_wna16 import _DECODE_V2
 
         t = view.tensors
         k_off = wna16_down_k_off(t["down"].shape[-2] * 8)
         if not (
-            _DECODE_V2 and layer.activation == "silu" and not layer.apply_router_weight_on_input
+            layer.activation == "silu" and not layer.apply_router_weight_on_input
             and wna16_decode.supported(t["gate_up"], t["down"], k_off)
         ):
             return None

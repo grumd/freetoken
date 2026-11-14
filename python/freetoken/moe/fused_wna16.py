@@ -28,10 +28,6 @@ from freetoken.moe.fused import moe_align_block_size
 
 GROUP = 128
 
-# fused-epilogue decode path (kernel/triton/wna16_decode.py); 0 = the split per-op path below
-_DECODE_V2 = os.getenv("FREETOKEN_WNA16_DECODE_V2", "1") != "0"
-
-
 _DECODE_BLOCK_N = 64
 _DECODE_BLOCK_KW = 8
 _DECODE_TARGET_PROGRAMS = 1600
@@ -130,10 +126,6 @@ def _tile_down_config(M: int) -> Dict[str, int]:
 def _tile_ok(K: int, cfg: Dict[str, int], k_off: int = 0) -> bool:
     bk = cfg["BLOCK_SIZE_K"]
     return K % bk == 0 and k_off % bk == 0 and GROUP % bk == 0
-
-
-def _legacy_prefill() -> bool:
-    return os.environ.get("FREETOKEN_WNA16_PREFILL_LEGACY", "") == "1"
 
 
 def prefill_precise() -> bool:
@@ -249,8 +241,10 @@ def fused_experts_decode_wna16(
     act_limit: float = 7.0,
     down_k_off: int = 0,
 ) -> torch.Tensor:
+    # the fused-epilogue kernels (kernel/triton/wna16_decode.py) where they serve the layer,
+    # else the per-op split-K path below
     if (
-        _DECODE_V2 and activation == "silu" and not apply_router_weight_on_input
+        activation == "silu" and not apply_router_weight_on_input
         and wna16_decode.supported(gate_up_qw, down_qw, down_k_off)
     ):
         return wna16_decode.wna16_decode_silu(
@@ -308,7 +302,7 @@ def fused_experts_wna16(
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg_gu, cfg_dn = _TILE_GATE_UP, _tile_down_config(M)
-    if _legacy_prefill() or not (_tile_ok(H, cfg_gu) and _tile_ok(inter, cfg_dn, down_k_off)):
+    if not (_tile_ok(H, cfg_gu) and _tile_ok(inter, cfg_dn, down_k_off)):
         cfg_gu = cfg_dn = _prefill_config(M)
     precise = prefill_precise() and "BLOCK_SIZE_K" in cfg_gu
     fuse_act = precise and activation == "silu" and not apply_router_weight_on_input and H % GROUP == 0

@@ -121,12 +121,12 @@ def mxfp8_encode_exact(w: torch.Tensor, rows: int = 2048) -> tuple[torch.Tensor,
     return mxfp8_encode(w, exact=True, rows=rows)
 
 
-# Groups of bf16 linears that FREETOKEN_DENSE_MXFP8_LOSSY may round to MXFP8, by attribute path.
+# Groups of bf16 linears that --dense-mxfp8-groups may round to MXFP8, by attribute path.
 _HC_LINEARS = frozenset({"input_mix_weight_down_block_inject", "input_mix_weight_down", "input_mix_weight_up"})
 
 
 def mxfp8_lossy_group(path: tuple[str, ...]) -> str | None:
-    """The FREETOKEN_DENSE_MXFP8_LOSSY group of the linear at attribute ``path``, if any."""
+    """The --dense-mxfp8-groups group of the linear at attribute ``path``, if any."""
     if not path:
         return None
     if path[-1] == "lm_head":

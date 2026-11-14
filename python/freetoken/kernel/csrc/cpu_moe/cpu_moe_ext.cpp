@@ -1593,7 +1593,6 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
-    if (const char* v = getenv("FREETOKEN_CPU_MOE_SPIN_US")) spin_ns = int64_t(atoll(v)) * 1000;
     bar_n = num_threads;
     active_workers.store(num_threads);
     cur_active = num_threads;

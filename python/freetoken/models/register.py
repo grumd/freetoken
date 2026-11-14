@@ -46,7 +46,7 @@ _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
 # The qwen4_exp dense reader dequantizes every non-expert weight to bf16 (FP4-Local's MXFP8
 # attention / GDN / shared expert, its NVFP4 vision MLP and MTP experts), so only the routed
 # experts take the checkpoint's quant scheme; MXFP8 dense comes back at load, losslessly
-# (FREETOKEN_DENSE_MXFP8, engine/engine.py).
+# (engine/engine.py, _dense_mxfp8_enabled).
 _QWEN4_EXP_DEQUANTIZED = ("*.self_attn", "*.linear_attn", "*.shared_expert", "*.visual", "visual", "mtp")
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (

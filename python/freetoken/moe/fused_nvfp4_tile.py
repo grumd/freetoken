@@ -6,7 +6,6 @@ Same calling convention as :mod:`freetoken.moe.fused_nvfp4` plus the routed-only
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 import torch
@@ -14,7 +13,6 @@ import triton
 
 from freetoken.kernel import moe_sum_reduce_triton
 from freetoken.kernel.triton.nvfp4_tile_moe import (
-    _gemv_partials_kernel,
     _gemv_partials_v2_kernel,
     _prefill_nvfp4_gate_up_silu_kernel,
     _prefill_nvfp4_tile_kernel,
@@ -28,8 +26,6 @@ from freetoken.moe.fused import moe_align_block_size
 def _u8(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8)
 
-
-_NK_TILE = os.environ.get("FREETOKEN_NVFP4_NK_TILE", "1") != "0"
 
 # Swept with kbench/sweep_nvfp4_prefill.py on an RTX 3080 (q38 TP=2 band: gate_up 2560 x 640,
 # down 320 x 2560, top-10 of 512): M=512 / 2048 / 8192 -> fused gate_up+SiLU 1.05 / 1.96 /
@@ -54,7 +50,7 @@ def tile_ok(K: int, cfg: Dict[str, int]) -> bool:
 
 
 def _prefill_gemm(a, packed, scale, glob, c, tw, sorted_ids, expert_ids, ntpp, num_valid,
-                  kernel_top_k, mul_routed_weight, cfg, nk_tile=None) -> None:
+                  kernel_top_k, mul_routed_weight, cfg) -> None:
     N, K = packed.shape[1], packed.shape[2] * 2
     EM = sorted_ids.shape[0]
     scale = _u8(scale)
@@ -69,12 +65,12 @@ def _prefill_gemm(a, packed, scale, glob, c, tw, sorted_ids, expert_ids, ntpp, n
         c.stride(1), c.stride(2),
         tw.stride(0),
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=kernel_top_k,
-        compute_type=_tl_dtype(c.dtype), NK_TILE=_NK_TILE if nk_tile is None else nk_tile, **cfg,
+        compute_type=_tl_dtype(c.dtype), **cfg,
     )
 
 
 def _prefill_gate_up_silu(a, packed, scale, glob, c, sorted_ids, expert_ids, ntpp, num_valid,
-                          top_k, cfg=None, nk_tile=None) -> None:
+                          top_k, cfg=None) -> None:
     cfg = cfg or _tile_silu_config(sorted_ids.shape[0] // max(1, top_k))
     inter, K = packed.shape[1] // 2, packed.shape[2] * 2
     EM = sorted_ids.shape[0]
@@ -88,8 +84,7 @@ def _prefill_gate_up_silu(a, packed, scale, glob, c, sorted_ids, expert_ids, ntp
         scale.stride(0), scale.stride(1),
         glob.stride(0),
         c.stride(0), c.stride(1),
-        top_k=top_k, compute_type=_tl_dtype(c.dtype),
-        NK_TILE=_NK_TILE if nk_tile is None else nk_tile, **cfg,
+        top_k=top_k, compute_type=_tl_dtype(c.dtype), **cfg,
     )
 
 
@@ -153,7 +148,6 @@ def fused_experts_nvfp4_tile(
 _GU_TILE = (64, 16, 2)
 _DN_TILE = (64, 8, 4)
 _TARGET_PROGRAMS = 544
-_GEMV_V2 = os.environ.get("FREETOKEN_NVFP4_GEMV_V2", "1") != "0"
 
 
 def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0, copy=None, part=None,
@@ -169,8 +163,7 @@ def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0,
     if part is None:
         part = torch.empty((split, R, N), dtype=torch.float32, device=a.device)
     copy_slots, num_copy = copy if copy is not None else (ids, ids)
-    kernel = _gemv_partials_v2_kernel if _GEMV_V2 else _gemv_partials_kernel
-    kernel[(R, triton.cdiv(N, bn), split)](
+    _gemv_partials_v2_kernel[(R, triton.cdiv(N, bn), split)](
         a, words, scale, glob, part, ids, copy_slots, num_copy,
         R, N, kb_per * bkw, kw,
         a.stride(0),
