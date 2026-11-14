@@ -160,6 +160,11 @@ def _gemv_mxfp8_kernel(
 def _config_mxfp8(N: int, K: int) -> tuple[int, int, int]:
     if K % 512:
         return 16, 64 if K % 128 else 128, 4
+    # single-GPU q38 (--dense-mxfp8-groups): hyper-connection down rows and the shared-expert gate_up
+    if K >= 8192 and K % 2048 == 0:
+        return 1, 2048, 8
+    if 1024 < N <= 2048 and K % 1024:
+        return 2, 512, 2
     if N <= 1024:
         return 1, 512, 2
     if K % 1024 == 0 and N <= 4096:

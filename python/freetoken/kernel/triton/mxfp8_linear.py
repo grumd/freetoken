@@ -54,6 +54,8 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
 # 512 exceeds sm_120's shared-memory budget. Past the cap only prefill lands here,
 # where cuBLAS amortizes the transient.
 _GEMV_MAX_M = 256
+# Largest bf16 transient (elements) the dequant + cuBLAS path materializes at once.
+_DEQUANT_ELEMS = 1 << 25
 
 
 @triton.jit
@@ -241,9 +243,18 @@ def mxfp8_linear(
         w8 = e4m3_kernel_view(weight)
         out = _gemv(x.reshape(M, K), w8, scale_codes, x.dtype).reshape(*lead, N)
     else:
-        # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
-        w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
-        out = torch.nn.functional.linear(x.reshape(-1, K), w).reshape(*lead, N)
+        # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS; a large weight
+        # (an MXFP8 lm_head) goes in row slices so the transient stays small.
+        x2 = x.reshape(-1, K)
+        rows = max(MXFP8_BLOCK, _DEQUANT_ELEMS // K)
+        if N <= rows:
+            out = torch.nn.functional.linear(x2, mxfp8_dequant(weight, scale_codes, dtype=x.dtype))
+        else:
+            out = x2.new_empty((M, N))
+            for n0 in range(0, N, rows):
+                w = mxfp8_dequant(weight[n0 : n0 + rows], scale_codes[n0 : n0 + rows], dtype=x.dtype)
+                out[:, n0 : n0 + rows] = torch.nn.functional.linear(x2, w)
+        out = out.reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out

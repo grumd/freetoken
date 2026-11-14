@@ -64,7 +64,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
 | `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
 
-Other useful flags: `--moe-cpu-decode-threads` (CPU threads per GPU for `--moe-decode-fetch` below 1; default all physical cores but one on one GPU), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
+Other useful flags: `--moe-cpu-decode-threads` (CPU threads per GPU for `--moe-decode-fetch` below 1; default all physical cores but one on one GPU), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-mxfp8-groups lm_head` (recommended for FP4: +5% decode on one GPU, rounds the lm_head to MXFP8 with no measurable KLD change; off by default because it is lossy), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
 
 ### Engine switches
 

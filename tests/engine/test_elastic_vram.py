@@ -178,3 +178,39 @@ def test_page_moves_carry_every_kv_tier():
         rows = kv.cmp_k_cache(s)[:, 0]
         assert rows[3 * 16 : 4 * 16].tolist() == [60.0] * 16 and rows[7 * 16 : 8 * 16].tolist() == [63.0] * 16
         assert rows[4 * 16 : 5 * 16].tolist() == [4.0] * 16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_compact_small_weights_releases_interleaved_holes():
+    """--dense-mxfp8-groups frees bf16 weights that sit between per-layer tensors that stay; the
+    allocator keeps such holes reserved until the survivors are repacked. Tensors referenced from
+    elsewhere (an alias, a view sharing the storage) must stay where they are."""
+    from freetoken.engine.engine import _compact_small_weights
+    from freetoken.layers.base import BaseOP
+
+    class Layer(BaseOP):
+        def __init__(self, i):
+            self.freed = torch.full((3 << 20,), i % 251, dtype=torch.uint8, device="cuda")
+            self.kept = torch.full((1 << 20,), i % 7, dtype=torch.uint8, device="cuda")
+
+    class Root(BaseOP):
+        def __init__(self):
+            self.layers = [Layer(i) for i in range(64)]
+
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_reserved()
+    root = Root()
+    alias = root.layers[3].kept
+    root.layers[4].view = root.layers[4].kept[:10]
+    for layer in root.layers:
+        layer.freed = None
+    torch.cuda.empty_cache()
+    before = torch.cuda.memory_reserved() - base
+    moved = _compact_small_weights(root)
+    after = torch.cuda.memory_reserved() - base
+    assert moved == 62 << 20
+    # how much comes back depends on the allocator config (the engine runs expandable segments)
+    assert after < before, (before, after)
+    assert root.layers[3].kept is alias
+    assert root.layers[4].kept.data_ptr() == root.layers[4].view.data_ptr()
+    assert all(int(layer.kept[0]) == i % 7 and layer.kept.is_cuda for i, layer in enumerate(root.layers))

@@ -24,6 +24,7 @@ from freetoken.kernel.triton.hc import (
     hc_gate_mix,
     hc_silu,
     hc_up_gate_mix,
+    hc_up_gate_mix_mxfp8,
     hc_up_gate_mix_supported,
 )
 from freetoken.layers import BaseOP, LinearReplicated
@@ -47,6 +48,11 @@ def _plain_gemv(linear: LinearReplicated) -> bool:
         and type(linear.quant_method).__name__ == "UnquantizedLinearMethod"
         and type(linear.quant_method.kernel).__name__ == "TorchLinearKernel"
     )
+
+
+def _mxfp8_gemv(linear: LinearReplicated) -> bool:
+    """Whether ``linear`` is served as MXFP8 (--dense-mxfp8-groups hc)."""
+    return linear.bias is None and type(linear.quant_method.kernel).__name__ == "OnlineMxfp8LinearKernel"
 
 
 def grouped_plus_one_rms_norm(
@@ -160,6 +166,12 @@ class GatedResidual(BaseOP):
         if comm is not None and down.weight.shape[0] % 4 == 0 and self.hidden_size % 4 == 0:
             return self._mix_sharded(rn, comm, down.weight, up.weight)
         lora, s = self._down(rn)
+        if (
+            HC_FUSE and rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
+            and rn.dtype == torch.bfloat16 and _mxfp8_gemv(up) and up.weight.shape[1] <= 1024
+            and lora.stride(1) == 1
+        ):
+            return hc_up_gate_mix_mxfp8(lora, up.weight, up.weight_scale_inv, rn, self.hc_count), s
         if fused and hc_up_gate_mix_supported(up.weight, self.hc_count, lora):
             return hc_up_gate_mix(lora, up.weight, rn, self.hc_count), s
         gate = up.forward(hc_silu(lora, self.hc_count))

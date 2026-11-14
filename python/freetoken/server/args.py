@@ -93,6 +93,7 @@ _ENV_FLAG_VALUE = {
     "moe_decode_fetch": "FREETOKEN_MOE_DECODE_FETCH",
     "moe_cpu_decode_act": "FREETOKEN_CPU_DECODE_ACT",
     "moe_cpu_decode_threads": "FREETOKEN_CPU_DECODE_THREADS",
+    "dense_mxfp8_groups": "FREETOKEN_DENSE_MXFP8_GROUPS",
 }
 
 
@@ -746,6 +747,11 @@ def parse_args(
                         help="Quantize the model's bf16 linears (routers excepted) to fp8 per "
                              "row at load: faster bandwidth-bound decode, fp8 weight rounding "
                              "(default off).")
+    parser.add_argument("--dense-mxfp8-groups", default=None, dest="dense_mxfp8_groups",
+                        metavar="GROUPS",
+                        help="Also serve these bf16 linear groups as MXFP8 (comma list of lm_head, hc, "
+                             "shared, or all), rounded at load when they are not MXFP8 already: "
+                             "less VRAM and weight traffic, MXFP8 weight rounding (default none).")
     parser.add_argument("--mtp-head-fp8", action=argparse.BooleanOptionalAction, default=None,
                         dest="mtp_head_fp8",
                         help="Quantize the bf16 MTP draft head to fp8 per row at load (default on).")

@@ -559,6 +559,124 @@ def test_early_router_decode_is_bit_identical(monkeypatch):
         assert torch.equal(i0, i1) and torch.equal(w0.view(torch.int32), w1.view(torch.int32))
 
 
+def _mxfp8_grid(w: torch.Tensor) -> torch.Tensor:
+    """``w`` rounded onto the MXFP8 grid (so it re-encodes exactly), back in bf16."""
+    from freetoken.layers.quantization.linear.unquantized import mxfp8_encode
+
+    q, codes = mxfp8_encode(w, exact=False)
+    n, k = q.shape
+    return (q.float().view(n, -1, 32) * torch.exp2(codes.float() - 127).unsqueeze(-1)).view(n, k).to(w.dtype)
+
+
+@requires_cuda
+def test_mxfp8_shared_expert_decode_front(monkeypatch):
+    """--dense-mxfp8-groups shared: an MXFP8 shared expert keeps the decode front (router and
+    gate GEMVs beside an MXFP8 gate_up GEMV), routes bit for bit like the bf16 front, matches it
+    to rounding, and its early-router split gives the one-launch front's bits."""
+    from freetoken.layers import moe as layer_mod
+    from freetoken.layers.quantization.method import finalize_quant
+    from freetoken.layers.quantization.linear.unquantized import mark_online_mxfp8
+    from freetoken.models.qwen4_exp import moe as moe_mod
+    from freetoken.utils.torch_utils import torch_dtype
+
+    routes = []
+    fused_topk = layer_mod.fused_topk
+
+    def recording_topk(*args, **kwargs):
+        w, ids = fused_topk(*args, **kwargs)
+        routes.append((w.clone(), ids.clone()))
+        return w, ids
+
+    monkeypatch.setattr(layer_mod, "fused_topk", recording_topk)
+    config = parse_config(toy_hf_config(4, num_experts=512, num_experts_per_tok=10, moe_intermediate_size=16))
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    with torch.device(device), torch_dtype(dtype):
+        moe = moe_mod.Qwen4ExpMoE(config, 0)
+    _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
+    for lin in (moe.shared_expert.gate_up_proj, moe.shared_expert.down_proj):
+        lin.weight = _mxfp8_grid(lin.weight)
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=False, is_decode=True))
+    moe.fuse_decode_front()
+    gen = torch.Generator(device=device).manual_seed(5)
+    xs = [torch.randn(1, config.hidden_size, device=device, dtype=dtype, generator=gen) for _ in range(8)]
+    refs = [moe.forward(x.clone()) for x in xs]
+    ref_routes = routes[:]
+
+    done, rounded, kept = mark_online_mxfp8(moe, skip=frozenset({"gate", "shared_expert_gate", "experts"}))
+    assert (done, rounded) == (2, {})
+    finalize_quant(moe.shared_expert)
+    assert moe.shared_expert.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    moe._front = False
+    moe.fuse_decode_front()
+    assert moe._front and moe._front_mx
+    monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
+    for i, x in enumerate(xs):
+        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", False)
+        routes.clear()
+        out = moe.forward(x.clone())
+        (w0, i0), = routes
+        rw, ri = ref_routes[i]
+        assert torch.equal(i0, ri) and torch.equal(w0.view(torch.int32), rw.view(torch.int32))
+        torch.testing.assert_close(out, refs[i], rtol=2e-2, atol=2e-2)
+        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", True)
+        torch.testing.assert_close(moe.forward(x.clone()), out, rtol=0, atol=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_mxfp8_hc_mix_matches_dequantized_math(monkeypatch, use_combine):
+    """--dense-mxfp8-groups hc: the hc linears round to MXFP8; the single-token mix (fused MXFP8
+    kernel) and the multi-token mix (dequant GEMMs) both compute the HF math on the rounded weights."""
+    from freetoken.layers.quantization.method import finalize_quant
+    from freetoken.layers.quantization.linear.unquantized import mark_online_mxfp8
+    from freetoken.models.qwen4_exp import hc as hc_module
+
+    hc, _, args, rand = _cuda_hc(use_combine, seed=11, norm_dtype=torch.float32)
+    down = hc.input_mix_weight_down_block_inject if use_combine else hc.input_mix_weight_down
+    assert mark_online_mxfp8(hc) == (0, {}, 2)
+    done, rounded, kept = mark_online_mxfp8(hc, lossy=frozenset({"hc"}))
+    assert (done, rounded, kept) == (0, {"hc": 2}, 0)
+    w_down = _mxfp8_grid(down.weight).float()
+    w_up = _mxfp8_grid(hc.input_mix_weight_up.weight).float()
+    finalize_quant(hc)
+    calls = []
+    real = hc_module.hc_up_gate_mix_mxfp8
+    monkeypatch.setattr(hc_module, "hc_up_gate_mix_mxfp8", lambda *a, **k: calls.append(1) or real(*a, **k))
+    monkeypatch.setattr(hc_module, "get_p2p_comm", lambda: None)
+    lowrank, count = args.hc_lowrank, args.hc_count
+    for tokens in (1, 300):
+        R = rand(tokens, args.ple_state_width, scale=1.0)
+        x, s = hc.mix(R)
+        ref_x, ref_s = _hf_gated_residual(
+            count, R.float(), hc.hc_norm.weight, w_down[:lowrank], w_up,
+            w_down[lowrank : lowrank + count] if use_combine else None, args.hidden_size, hc.hc_norm.eps,
+        )
+        torch.testing.assert_close(x.float(), ref_x, rtol=3e-2, atol=3e-2)
+        if use_combine:
+            torch.testing.assert_close(2 * torch.sigmoid(s.float() / count), ref_s, rtol=2e-2, atol=2e-2)
+    assert len(calls) == 1
+
+
+def test_mxfp8_lossy_groups_by_attribute_path():
+    from freetoken.layers.quantization.linear.unquantized import mxfp8_lossy_group
+
+    assert mxfp8_lossy_group(("lm_head",)) == "lm_head"
+    assert mxfp8_lossy_group(("model", "layers", "3", "mlp_hyper_connection", "input_mix_weight_up")) == "hc"
+    assert mxfp8_lossy_group(("model", "hyper_connection_mixer", "input_mix_weight_down")) == "hc"
+    assert mxfp8_lossy_group(("model", "layers", "0", "mlp", "shared_expert", "gate_up_proj")) == "shared"
+    assert mxfp8_lossy_group(("model", "layers", "0", "mlp", "gate")) is None
+    assert mxfp8_lossy_group(("model", "layers", "0", "self_attn", "qkv_proj")) is None
+
+
+def test_dense_mxfp8_shared_group_unskips_the_shared_expert():
+    from freetoken.engine.engine import _dense_mxfp8_skip
+
+    assert "shared_expert" in _dense_mxfp8_skip(frozenset())
+    assert "shared_expert" in _dense_mxfp8_skip(frozenset({"lm_head", "hc"}))
+    assert "shared_expert" not in _dense_mxfp8_skip(frozenset({"shared"}))
+    assert {"gate", "shared_expert_gate"} <= _dense_mxfp8_skip(frozenset({"lm_head", "hc", "shared"}))
+
+
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_tokens,hidden", [(1, 2560), (7, 640)])

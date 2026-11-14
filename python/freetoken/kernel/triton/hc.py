@@ -552,6 +552,70 @@ def hc_up_gate_mix(
     return out
 
 
+@triton.jit
+def _hc_up_gate_mix_mxfp8_kernel(
+    lora_ptr,
+    w_ptr,
+    s_ptr,
+    rn_ptr,
+    y_ptr,
+    K,
+    stride_wn,
+    stride_sn,
+    HC: tl.constexpr,
+    HC_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    # _hc_up_gate_mix_kernel over MXFP8 rows (e4m3 bytes + an e8m0 code per 32 inputs), decoded
+    # as gemv.py's _gemv_mxfp8_kernel does: e4m3 through an fp16 field (v * 2^-8), and each
+    # 32-block's partial scaled by 2^(code - 127 + 8).
+    KB: tl.constexpr = BLOCK_K // 32
+    h = tl.program_id(0) + tl.arange(0, 1)
+    cols = tl.arange(0, BLOCK_K)
+    kmask = cols < K
+    kbs = tl.arange(0, KB)
+    kbmask = kbs * 32 < K
+    a = tl.load(lora_ptr + cols, mask=kmask, other=0.0).to(tl.float32) / HC
+    a = (a * tl.sigmoid(a)).to(tl.bfloat16).to(tl.float32)
+
+    mixed = tl.zeros([1], dtype=tl.float32)
+    for stream in tl.static_range(HC):
+        rows = stream * HC_DIM + h
+        v = tl.load(
+            w_ptr + rows[:, None].to(tl.int64) * stride_wn + cols[None, :],
+            mask=kmask[None, :], other=0, eviction_policy="evict_first",
+        )
+        f = ((v & 0x80).to(tl.uint16) << 8) | ((v & 0x7F).to(tl.uint16) << 7)
+        w = f.to(tl.float16, bitcast=True).to(tl.float32)
+        part = tl.sum(tl.reshape(w * a[None, :], (1, KB, 32)), axis=2)
+        code = tl.load(s_ptr + rows[:, None].to(tl.int64) * stride_sn + kbs[None, :], mask=kbmask[None, :], other=0)
+        scale = ((code.to(tl.int32) - 119 + 127) << 23).to(tl.float32, bitcast=True)
+        gate = tl.sum(part * scale, axis=1).to(tl.bfloat16)
+        x = tl.load(rn_ptr + stream * HC_DIM + h)
+        mixed += tl.sigmoid(gate.to(tl.float32)) * x.to(tl.float32)
+    mixed /= HC
+    tl.store(y_ptr + h, mixed.to(y_ptr.dtype.element_ty))
+
+
+def hc_up_gate_mix_mxfp8(
+    lora: torch.Tensor, w_up: torch.Tensor, codes: torch.Tensor, rn: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    """``hc_gate_mix(rn, gemv_mxfp8(hc_silu(lora), w_up, codes), hc_count)`` for one token in one
+    launch (the gate rounded to bf16 as the GEMV stores it). ``w_up`` [N, K] e4m3 (or its uint8
+    view), ``codes`` [N, K/32] e8m0, ``lora`` [1, K] and ``rn`` [1, N] bf16 with unit inner stride."""
+    N, K = w_up.shape
+    assert N % hc_count == 0 and K % 32 == 0 and K <= 1024 and codes.shape == (N, K // 32)
+    assert lora.shape == (1, K) and lora.stride(1) == 1 and rn.shape == (1, N) and rn.stride(1) == 1
+    assert w_up.stride(1) == 1 and codes.stride(1) == 1
+    hc_dim = N // hc_count
+    out = rn.new_empty((1, hc_dim))
+    _hc_up_gate_mix_mxfp8_kernel[(hc_dim,)](
+        lora, w_up.view(torch.uint8), codes, rn, out, K, w_up.stride(0), codes.stride(0),
+        HC=hc_count, HC_DIM=hc_dim, BLOCK_K=triton.next_power_of_2(K), num_warps=1,
+    )
+    return out
+
+
 __all__ = [
     "grouped_gemma_rmsnorm",
     "hc_combine",
@@ -560,5 +624,6 @@ __all__ = [
     "hc_gate_mix",
     "hc_silu",
     "hc_up_gate_mix",
+    "hc_up_gate_mix_mxfp8",
     "hc_up_gate_mix_supported",
 ]

@@ -320,6 +320,81 @@ class ForwardOutput(NamedTuple):
 
 
 
+_DENSE_MXFP8_GROUPS = ("lm_head", "hc", "shared")
+
+
+def _dense_mxfp8_groups() -> frozenset:
+    """FREETOKEN_DENSE_MXFP8_GROUPS (comma list of lm_head, hc, shared, or all): bf16 linear
+    groups also served as MXFP8, rounded at load when they do not round-trip exactly."""
+    raw = os.environ.get("FREETOKEN_DENSE_MXFP8_GROUPS", "").replace(" ", "").lower()
+    groups = {g for g in raw.split(",") if g}
+    if "all" in groups:
+        groups = set(_DENSE_MXFP8_GROUPS)
+    unknown = groups - set(_DENSE_MXFP8_GROUPS)
+    if unknown:
+        raise ValueError(f"FREETOKEN_DENSE_MXFP8_GROUPS: unknown {sorted(unknown)}, expected {_DENSE_MXFP8_GROUPS} or all")
+    return frozenset(groups)
+
+
+def _dense_mxfp8_skip(groups: frozenset) -> frozenset:
+    """Subtrees mark_online_mxfp8 leaves bf16: routers, the vision tower (it runs wherever
+    --vision-on-cpu put it) and, unless the ``shared`` group is asked for, the shared expert
+    (the decode front-fuse reads it beside the router)."""
+    skip = {"gate", "shared_expert_gate", "vision_tower"}
+    if "shared" not in groups:
+        skip.add("shared_expert")
+    return frozenset(skip)
+
+
+def _compact_small_weights(root, max_bytes: int = 64 << 20) -> int:
+    """Round-trip the small CUDA tensors under ``root`` through host RAM. The allocator only
+    unmaps free ranges that end up contiguous; the bf16 weights the MXFP8 groups free (hc,
+    shared expert) sit between per-layer routers and norms, so without this the freed bytes stay
+    reserved. Only tensors nothing else references (one Python owner, unshared storage) move.
+    Returns the bytes moved."""
+    import sys
+
+    from freetoken.layers.base import BaseOP
+
+    def refs(obj, name) -> tuple[int, int]:
+        t = obj.__dict__[name]
+        return sys.getrefcount(t), torch._C._storage_Use_Count(t.untyped_storage()._cdata)
+
+    probe = type("Probe", (), {})()
+    probe.t = torch.empty(1)
+    owned = refs(probe, "t")  # a tensor held by one attribute, its storage by that tensor alone
+
+    seen: set[int] = set()
+    stack, moved = [root], []
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        for name in list(vars(op)):
+            value = op.__dict__[name]
+            if isinstance(value, BaseOP):
+                stack.append(value)
+            elif isinstance(value, list):
+                stack.extend(v for v in value if isinstance(v, BaseOP))
+            elif (
+                isinstance(value, torch.Tensor) and value.is_cuda and not value.requires_grad
+                and value.untyped_storage().nbytes() == value.numel() * value.element_size() <= max_bytes
+                and value.storage_offset() == 0 and value.is_contiguous()
+            ):
+                del value
+                if refs(op, name) == owned:
+                    t = op.__dict__[name]
+                    moved.append((op, name, t.device, t.cpu()))
+                    del t
+                    setattr(op, name, None)
+            value = None
+    torch.cuda.empty_cache()
+    for op, name, device, host in moved:
+        setattr(op, name, host.to(device))
+    return sum(t.numel() * t.element_size() for *_, t in moved)
+
+
 def _dense_mxfp8_enabled(hf_config) -> bool:
     """FREETOKEN_DENSE_MXFP8 (auto|1|0): serve the dense linears of an MXFP8 checkpoint
     (ModelOpt FP4-Local) as MXFP8 instead of the bf16 they were exactly dequantized to.
@@ -395,15 +470,13 @@ class Engine:
             )
         from freetoken.env import ENV
 
-        if _dense_mxfp8_enabled(config.hf_config) and not ENV.DENSE_FP8:
+        mx_groups = _dense_mxfp8_groups()
+        if (_dense_mxfp8_enabled(config.hf_config) or mx_groups) and not ENV.DENSE_FP8:
             from freetoken.layers.quantization.linear.unquantized import mark_online_mxfp8
 
-            # routers and the shared expert stay bf16 (the decode front-fuse reads them as one
-            # bf16 GEMV); the vision tower runs wherever --vision-on-cpu put it
-            done, kept = mark_online_mxfp8(
-                self.model, skip=frozenset({"gate", "shared_expert_gate", "shared_expert", "vision_tower"})
-            )
-            logger.info_rank0(f"MXFP8 dense: {done} linears re-encoded to MXFP8 (lossless), {kept} stay bf16")
+            done, rounded, kept = mark_online_mxfp8(self.model, skip=_dense_mxfp8_skip(mx_groups), lossy=mx_groups)
+            lossy = "".join(f", {n} {g} rounded to MXFP8 (lossy)" for g, n in sorted(rounded.items()))
+            logger.info_rank0(f"MXFP8 dense: {done} linears re-encoded to MXFP8 (lossless){lossy}, {kept} stay bf16")
         if ENV.DENSE_FP8:
             from freetoken.layers.quantization.linear.unquantized import mark_online_fp8
 
@@ -411,6 +484,9 @@ class Engine:
             n = mark_online_fp8(self.model, skip=frozenset({"gate", "shared_expert_gate"}))
             logger.info_rank0(f"--dense-fp8: {n} bf16 linears quantized to fp8 per row at load")
         finalize_quant(self.model)
+        if mx_groups and not ENV.DENSE_FP8:
+            moved = _compact_small_weights(self.model)
+            logger.info_rank0(f"MXFP8 dense: {moved / 2**30:.2f} GiB of small weights repacked to release the freed bf16")
         if os.environ.get("FREETOKEN_DECODE_FRONT_FUSE", "1") != "0":
             for op in _iter_ops(self.model):
                 if hasattr(op, "fuse_decode_front"):

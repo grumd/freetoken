@@ -83,7 +83,9 @@ def test_linear_kernel_takes_gemv_only_for_one_bf16_row(monkeypatch):
     assert calls == [(1, 256)]
 
 
-@pytest.mark.parametrize("N,K", [(8240, 2560), (2560, 3072), (640, 2560), (2560, 320), (100, 1024)])
+@pytest.mark.parametrize(
+    "N,K", [(8240, 2560), (2560, 3072), (640, 2560), (2560, 320), (100, 1024), (336, 10240), (1280, 2560)]
+)
 def test_gemv_mxfp8_matches_dequantized_reference(N, K):
     from freetoken.kernel.triton.gemv import gemv_mxfp8
 
@@ -112,3 +114,71 @@ def test_mxfp8_encode_is_exact_for_mxfp8_weights_and_refuses_others():
     back = (q2.float().view(300, -1, 32) * torch.exp2(c2.float() - 127).unsqueeze(-1)).view(300, 512).to(torch.bfloat16)
     assert torch.equal(back, w)
     assert mxfp8_encode_exact(torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)) is None
+
+
+def _dequant(q, codes):
+    N, K = q.shape
+    return (q.float().view(N, -1, 32) * torch.exp2(codes.float() - 127).unsqueeze(-1)).view(N, K)
+
+
+def test_mxfp8_encode_lossy_rounds_to_nearest_within_half_an_e4m3_step():
+    """Lossy MXFP8 (--dense-mxfp8-groups): the no-clip power-of-two block scale, then e4m3
+    round-to-nearest: each weight moves by at most half a step of its block's grid."""
+    from freetoken.layers.quantization.linear.unquantized import mxfp8_encode
+
+    torch.manual_seed(0)
+    w = (torch.randn(300, 512, device="cuda") * torch.logspace(-6, 1, 300, device="cuda")[:, None]).to(torch.bfloat16)
+    w[5, :64] = 0
+    assert mxfp8_encode(w, exact=True) is None
+    q, codes = mxfp8_encode(w, exact=False, rows=128)
+    back = _dequant(q, codes)
+    k = (codes.float() - 127).repeat_interleave(32, dim=1)
+    # normals: 3 mantissa bits -> half a step is 2^-4 relative; subnormals: 2^(k-9) apart
+    bound = torch.maximum(w.float().abs() * 2.0**-4, torch.exp2(k - 10))
+    assert bool(((back - w.float()).abs() <= bound).all())
+    assert back.abs().view(300, -1, 32).amax(-1).le(448 * torch.exp2(codes.float() - 127)).all()
+    assert torch.equal(back[5, :64], torch.zeros(64, device="cuda"))
+    rel = ((back - w.float()).pow(2).mean() / w.float().pow(2).mean()).sqrt().item()
+    assert 0.01 < rel < 0.04, rel
+
+
+def test_mxfp8_linear_dequant_slices_match_one_transient(monkeypatch):
+    """Past the GEMV cap a large MXFP8 weight (an lm_head) is dequantized in row slices."""
+    from freetoken.kernel.triton import mxfp8_linear as mod
+
+    torch.manual_seed(0)
+    q = (torch.randint(0, 256, (1000, 256), device="cuda", dtype=torch.uint8) & 0xF7).view(torch.float8_e4m3fn)
+    codes = torch.randint(110, 125, (1000, 8), device="cuda", dtype=torch.uint8)
+    x = torch.randn(300, 256, device="cuda", dtype=torch.bfloat16)
+    whole = mod.mxfp8_linear(x, q, codes)
+    monkeypatch.setattr(mod, "_DEQUANT_ELEMS", 256 * 96)
+    sliced = mod.mxfp8_linear(x, q, codes)
+    ref = F.linear(x.float(), _dequant(q, codes))
+
+    def rel(a, b):
+        return ((a.float() - b.float()).pow(2).mean() / b.float().pow(2).mean()).sqrt().item()
+
+    assert rel(sliced, ref) < 4e-3 and rel(sliced, whole) < 4e-3
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_hc_up_gate_mix_mxfp8_matches_unfused_chain(seed):
+    """The fused MXFP8 hc mix against hc_silu -> gemv_mxfp8 -> hc_gate_mix and the fp32 math."""
+    from freetoken.kernel.triton.gemv import gemv_mxfp8
+    from freetoken.kernel.triton.hc import hc_gate_mix, hc_silu, hc_up_gate_mix_mxfp8
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    q = (torch.randint(0, 256, (10240, 320), device="cuda", dtype=torch.uint8, generator=gen) & 0xF7).view(
+        torch.float8_e4m3fn
+    )
+    codes = torch.randint(110, 120, (10240, 10), device="cuda", dtype=torch.uint8, generator=gen)
+    lora = torch.randn(1, 336, device="cuda", dtype=torch.bfloat16, generator=gen)[:, :320] * 3
+    rn = torch.randn(1, 10240, device="cuda", dtype=torch.bfloat16, generator=gen)
+    fused = hc_up_gate_mix_mxfp8(lora, q, codes, rn, 4)
+    chain = hc_gate_mix(rn, gemv_mxfp8(hc_silu(lora, 4), q, codes), 4)
+    # same math, the fp32 block partials summed in another order
+    torch.testing.assert_close(fused, chain, rtol=1e-2, atol=1e-3)
+    a = F.silu(lora.float() / 4).to(torch.bfloat16).float()
+    gate = (a @ _dequant(q, codes).t()).view(4, 2560)
+    ref = (torch.sigmoid(gate) * rn.float().view(4, 2560)).mean(0, keepdim=True)
+    torch.testing.assert_close(fused.float(), ref, rtol=2e-2, atol=2e-2)

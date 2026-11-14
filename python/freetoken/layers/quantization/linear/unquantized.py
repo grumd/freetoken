@@ -88,11 +88,12 @@ class OnlineMxfp8LinearKernel(LinearKernel):
         return mxfp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias)
 
 
-def mxfp8_encode_exact(w: torch.Tensor, rows: int = 2048) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """bf16 [N, K] -> (e4m3 [N, K], e8m0 codes [N, K/32]) when that dequantizes back to ``w``
-    bit for bit, else None. Each 32-block takes the smallest power-of-two scale that keeps its
-    max |w| <= 448: a block that came from MXFP8 is ``q * 2^k`` with q on the e4m3 grid, and
-    for any smaller-or-equal k the rescaled q stays on the grid, so the encoding is exact."""
+def mxfp8_encode(w: torch.Tensor, exact: bool = True, rows: int = 2048) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """bf16 [N, K] -> (e4m3 [N, K], e8m0 codes [N, K/32]). Each 32-block takes the smallest
+    power-of-two scale that keeps its max |w| <= 448 (no clipping, finest grid) and rounds to
+    nearest. ``exact``: None unless that dequantizes back to ``w`` bit for bit -- a block that
+    came from MXFP8 is ``q * 2^k`` with q on the e4m3 grid, and for any smaller-or-equal k the
+    rescaled q stays on the grid, so such weights always encode."""
     N, K = w.shape
     if K % 32 or w.dtype != torch.bfloat16:
         return None
@@ -108,45 +109,79 @@ def mxfp8_encode_exact(w: torch.Tensor, rows: int = 2048) -> tuple[torch.Tensor,
         if bool(((k + 127) < 0).any()) or bool(((k + 127) > 254).any()):
             return None
         enc = (blk / torch.exp2(k).unsqueeze(-1)).to(torch.float8_e4m3fn)
-        back = (enc.float() * torch.exp2(k).unsqueeze(-1)).to(torch.bfloat16)
-        if not torch.equal(back.view(-1, K), w[r : r + rows]):
-            return None
+        if exact:
+            back = (enc.float() * torch.exp2(k).unsqueeze(-1)).to(torch.bfloat16)
+            if not torch.equal(back.view(-1, K), w[r : r + rows]):
+                return None
         q[r : r + rows] = enc.view(-1, K)
         codes[r : r + rows] = (k + 127).to(torch.uint8)
     return q, codes
 
 
-def mark_online_mxfp8(root: Any, skip: frozenset = frozenset()) -> tuple[int, int]:
+def mxfp8_encode_exact(w: torch.Tensor, rows: int = 2048) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """:func:`mxfp8_encode` that refuses (None) any weight that does not round-trip."""
+    return mxfp8_encode(w, exact=True, rows=rows)
+
+
+# Groups of bf16 linears that FREETOKEN_DENSE_MXFP8_LOSSY may round to MXFP8, by attribute path.
+_HC_LINEARS = frozenset({"input_mix_weight_down_block_inject", "input_mix_weight_down", "input_mix_weight_up"})
+
+
+def mxfp8_lossy_group(path: tuple[str, ...]) -> str | None:
+    """The FREETOKEN_DENSE_MXFP8_LOSSY group of the linear at attribute ``path``, if any."""
+    if not path:
+        return None
+    if path[-1] == "lm_head":
+        return "lm_head"
+    if path[-1] in _HC_LINEARS:
+        return "hc"
+    if "shared_expert" in path:
+        return "shared"
+    return None
+
+
+def mark_online_mxfp8(
+    root: Any, skip: frozenset = frozenset(), lossy: frozenset = frozenset()
+) -> tuple[int, dict[str, int], int]:
     """Re-encode every bf16 CUDA linear under ``root`` whose weight round-trips through MXFP8
-    exactly (see OnlineMxfp8LinearKernel); the rest stay bf16. ``skip`` names attributes whose
-    subtree is left alone. Must run before ``finalize_quant``. Returns (encoded, kept bf16)."""
+    exactly (see OnlineMxfp8LinearKernel); linears of a ``lossy`` group (see
+    :func:`mxfp8_lossy_group`) that do not round-trip are rounded to MXFP8 instead; the rest
+    stay bf16. ``skip`` names attributes whose subtree is left alone. Must run before
+    ``finalize_quant``. Returns (encoded exactly, {group: rounded}, kept bf16)."""
     from freetoken.layers.base import BaseOP
 
     seen: set[int] = set()
-    stack = [root]
+    stack = [(root, ())]
     done = kept = 0
+    rounded: dict[str, int] = {}
     while stack:
-        op = stack.pop()
+        op, path = stack.pop()
         if id(op) in seen:
             continue
         seen.add(id(op))
         w = getattr(op, "weight", None)
         if (isinstance(getattr(op, "quant_method", None), UnquantizedLinearMethod) and isinstance(w, torch.Tensor)
                 and w.is_cuda and w.dim() == 2):
-            enc = mxfp8_encode_exact(w)
+            enc = mxfp8_encode(w, exact=True)
+            group = mxfp8_lossy_group(path)
+            if enc is None and group in lossy:
+                enc = mxfp8_encode(w, exact=False)
+                if enc is not None:
+                    rounded[group] = rounded.get(group, 0) + 1
+            elif enc is not None:
+                done += 1
             if enc is None:
                 kept += 1
             else:
                 op.online_mxfp8 = enc
-                done += 1
         for name, value in vars(op).items():
             if name in skip:
                 continue
             if isinstance(value, BaseOP):
-                stack.append(value)
+                stack.append((value, path + (name,)))
             elif isinstance(value, list):
-                stack.extend(v for v in value if isinstance(v, BaseOP))
-    return done, kept
+                stack.extend((v, path + (name, str(i))) for i, v in enumerate(value) if isinstance(v, BaseOP))
+    return done, rounded, kept
 
 
 def mark_online_fp8(root: Any, skip: frozenset = frozenset()) -> int:
