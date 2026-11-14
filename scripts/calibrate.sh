@@ -1,5 +1,5 @@
 #!/bin/bash
-# Measure the best CPU-assisted decode settings (FP4) for this machine and GPU setup, and print
+# Measure the best CPU-assisted decode settings (FP4 or INT4) for this machine and GPU setup, and print
 # the serve.sh flags to use them. Run it with the MODEL / GPUS you serve with.
 #
 #   MODEL=~/models/ftw/q38-fp4 scripts/calibrate.sh
@@ -43,9 +43,13 @@ echo "== hardware probe (GPUS=$GPUS) =="
 
 fmt=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["quant_format"])' "$work/hw.json")
 isa=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cpu_kernel", {}).get("isa", ""))' "$work/hw.json")
-if [ "$fmt" != nvfp4 ]; then
+if [ "$fmt" != nvfp4 ] && [ "$fmt" != w4a16 ]; then
   exec "$PY" "$HERE/calibrate.py" skip --hw "$work/hw.json" \
-    --why "the checkpoint is $fmt; CPU-assisted decode serves NVFP4 (FP4) experts only"
+    --why "the checkpoint is $fmt; CPU-assisted decode serves NVFP4 (FP4) and W4A16 (INT4) experts only"
+fi
+if [ "$fmt" = w4a16 ] && [ -z "$isa" ]; then
+  exec "$PY" "$HERE/calibrate.py" skip --hw "$work/hw.json" \
+    --why "the W4A16 (INT4) CPU expert kernel needs AVX-512 BF16, which this CPU lacks"
 fi
 case "$isa" in
   scalar*)

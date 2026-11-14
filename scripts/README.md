@@ -3,7 +3,7 @@
 | Script | Purpose |
 |---|---|
 | `serve.sh` | serve Qwen3.8-Flash-Next (INT4 or FP4) on one or two GPUs |
-| `calibrate.sh`, `calibrate.py` | measure the best CPU-assisted decode flags for this machine (FP4) |
+| `calibrate.sh`, `calibrate.py` | measure the best CPU-assisted decode flags for this machine |
 | `build-release-wheels.sh`, `publish-wheels.sh`, `ci/` | upstream wheel builds and releases, used by `.github/workflows` |
 
 ## `serve.sh`
@@ -62,7 +62,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--vision-on-cpu --vision-threads 8` | the ViT would take 0.84 GiB of VRAM on every GPU; 16 threads encode a full-size image in 3.5 s, 4 in 6.8 s |
 | `--mtp off` | MTP is 10-24% slower decode here in every config |
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
-| `--moe-decode-fetch 0.1` | FP4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (28 -> 53 tok/s at 4k, 20 -> 46 at 261k). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
+| `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
 
 Other useful flags: `--moe-cpu-decode-threads` (CPU threads per GPU for `--moe-decode-fetch` below 1; default all physical cores but one on one GPU), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
 
@@ -84,7 +84,7 @@ For bit-reproducible A/B runs use `FREETOKEN_WNA16_CPU_PREFILL=0` and `--moe-dec
 - **OS / toolchain:** Linux x86_64, NVIDIA driver r580+ (CUDA 13), CUDA 13 toolkit with `nvcc` on PATH (kernels JIT-compile on first use), `g++` (the CPU prefill extension builds with `-march=native`).
 - **GPU:** one or two with 16 GB or more. One 16 GB GPU holds 147k tokens of context, 20 GB the full 262k. Dense weights take 8.2 GiB unsplit (5.5 GiB per GPU at TP=2), KV 25 KiB/token (6.4 GiB at 262k), the expert cache the rest.
 - **RAM:** 96 GB class.
-- **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for CPU prefill. CPU-assisted decode follows RAM bandwidth (~50 GB/s of expert reads on dual-channel DDR5).
+- **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for CPU prefill and for INT4's CPU-assisted decode. CPU-assisted decode follows RAM bandwidth (~50 GB/s of expert reads on dual-channel DDR5).
 - **Disk:** NVMe. PLE rows are read on every token.
 
 ### Setup
@@ -121,7 +121,7 @@ FTW conversion notes:
 - **Load peak too high:** `FREETOKEN_FTW_READ_CONCURRENCY=1` (about -5 GiB).
 - **Per-prefill CPU/GPU split timing:** `FREETOKEN_WNA16_CPU_PREFILL_STATS=1`.
 
-## `calibrate.sh`: CPU-assisted decode (FP4)
+## `calibrate.sh`: CPU-assisted decode
 
 How much of decode's expert-cache misses the CPU should compute depends on the CPU, the RAM, the GPUs and the PCIe link. `calibrate.sh` measures this machine once, with the `MODEL` and `GPUS` you serve with, and prints the flags to pass to `serve.sh`:
 
@@ -135,7 +135,7 @@ MODEL=~/models/ftw/q38-fp4 GPUS=0 scripts/serve.sh --moe-decode-fetch 0.15 --moe
 
 It needs idle GPUs and the same free RAM as the server. On 2x RTX 3080 it takes about 12 min with one GPU and 6 min with two. Calibrate again after changing the CPU, RAM, GPUs, PCIe slots or the BIOS memory settings.
 
-1. **Probe, without the server (~5 s):** pinned host->device bandwidth per GPU and of all at once, the CPU's ISA, and the CPU expert kernel's time per expert on one layer of real experts. With an INT4 checkpoint or a CPU without AVX2 it stops here and recommends `--moe-decode-fetch 1`.
+1. **Probe, without the server (~5 s):** pinned host->device bandwidth per GPU and of all at once, the CPU's ISA, and the CPU expert kernel's time per expert on one layer of real experts. Without AVX2 (FP4) or AVX-512 BF16 (INT4) it stops here and recommends `--moe-decode-fetch 1`.
 2. **Reference load:** `serve.sh` on `CALIBRATION_PORT` with `--moe-decode-fetch 1`. Three greedy streaming decodes each at about 4k and 100k tokens of context.
 3. **Sweep load:** the server restarts with CPU help and `FREETOKEN_CPU_DECODE_TUNABLE=1`, under which a loopback-only endpoint changes the share (0.5, 0.25, 0.15, 0.1, 0.05) and the thread count between requests. The decode path is fixed per load (the CUDA graphs are captured at start), which is why plain decode gets its own load.
 4. **Pick:** the highest share within 2% of the fastest among those that lose nowhere, the fewest threads within 2% of the fastest, and `--moe-decode-fetch 1` unless the pick beats plain decode by 5% at every context length. The pick and the fastest share then run twice more and the choice is made again from the means of three runs.

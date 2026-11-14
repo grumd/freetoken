@@ -427,7 +427,7 @@ class OffloadMoELayer(MoELayer):
             start, lambda: main.wait_stream(side),
             cpu_y=io["y"], cpu_wait=lambda: cpu.wait(self.layer_id, T),
         )
-        assert out is not None, "CPU-assisted decode needs the NVFP4 tile decode kernels"
+        assert out is not None, "CPU-assisted decode needs the NVFP4 tile or W4A16 fused-epilogue decode kernels"
         return out
 
     def _prefill_fetch_routed(

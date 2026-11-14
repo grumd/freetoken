@@ -1109,15 +1109,20 @@ class Engine:
             raise ValueError(f"--moe-decode-fetch must be in [0, 1], got {fetch}")
         if fetch >= 1.0:
             return
+        from freetoken.moe.wna16_cpu_prefill import cpu_supported as wna16_cpu_supported
+
         sample = layers[0]
         kernel = getattr(sample.quant_method, "kernel", None)
+        fmt = getattr(kernel, "cpu_format", None)
         reason = None
         if cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
             reason = "it needs --moe-strategy offload with GPU decode"
-        elif getattr(kernel, "cpu_format", None) != "nvfp4" or not hasattr(kernel, "decode_overlapped"):
-            reason = "it serves NVFP4 experts on the triton kernels only"
+        elif fmt not in ("nvfp4", "w4a16") or not hasattr(kernel, "decode_overlapped"):
+            reason = "it serves NVFP4 and W4A16 experts on the triton kernels only"
         elif sample.activation != "silu" or sample.apply_router_weight_on_input:
             reason = "the CPU kernel computes silu(gate) * up with the router weight after down"
+        elif fmt == "w4a16" and not wna16_cpu_supported():
+            reason = "the W4A16 CPU kernel needs AVX-512 BF16"
         elif cache._unpinned_layers:
             reason = "every expert layer must be pinned"
         if reason:
@@ -1128,6 +1133,16 @@ class Engine:
         act = os.environ.get("FREETOKEN_CPU_DECODE_ACT", "fp32").strip().lower()
         if act not in ("fp32", "int8"):
             raise ValueError(f"FREETOKEN_CPU_DECODE_ACT must be fp32 or int8, got {act!r}")
+        k_off = 0
+        if fmt == "w4a16":
+            from freetoken.models.wna16_banks import wna16_down_k_off
+            from freetoken.moe.legacy_format import canonical_role
+
+            if act == "int8":
+                logger.warning_rank0("--moe-cpu-decode-act int8 ignored: W4A16 experts have no W4A8 CPU GEMV")
+                act = "fp32"
+            down = next(v for k, v in cache.bank_sources.items() if canonical_role(k) == "down")
+            k_off = wna16_down_k_off(down[0].shape[1] * 8)
         tp = config.tp_info
         cores = physical_core_cpus()
         per = max(1, len(cores) // tp.size)
@@ -1150,11 +1165,12 @@ class Engine:
             num_threads=len(cpus),
             max_tokens=max(config.max_running_req, 1),
             device=self.device,
-            fmt="nvfp4",
+            fmt=fmt,
             cpus=cpus,
             coordinator_joins=True,
             out_fp32=True,
             w4a8=act == "int8",
+            w4a16_down_k_off=k_off,
         )
         if tunable:
             executor.set_active_threads(min(threads, executor.max_threads))

@@ -615,6 +615,147 @@ def test_active_threads_change_between_tasks():
         torch.testing.assert_close(io["y"], want, rtol=1e-5, atol=1e-6)
 
 
+def _w4a16_banks(g, E, H, I, down_groups):
+    """Random AutoGPTQ int4 banks in the layout the offload cache keeps (models/wna16_banks.py)."""
+
+    def ints(*shape):
+        return torch.randint(-(2**31), 2**31 - 1, shape, generator=g, dtype=torch.int64).to(torch.int32)
+
+    def scales(*shape):
+        return (torch.rand(shape, generator=g) * 0.02 + 0.001).to(torch.float16)
+
+    return {
+        "gate_up": ints(E, H // 8, 2 * I), "gate_up_zero": ints(E, H // 128, 2 * I // 8),
+        "gate_up_scale": scales(E, H // 128, 2 * I),
+        "down": ints(E, I // 8, H), "down_zero": ints(E, down_groups, H // 8), "down_scale": scales(E, down_groups, H),
+    }
+
+
+def _w4a16_dequant(qw, qz, sc, k_off):
+    """[K/8, N] int32 + zeros + scales -> exact W [K, N] in fp64."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32)
+    codes = ((qw.unsqueeze(1) >> shifts.view(1, 8, 1)) & 15).reshape(-1, qw.shape[1]).double()
+    zeros = ((qz.unsqueeze(2) >> shifts.view(1, 1, 8)) & 15).reshape(qz.shape[0], -1).double() + 1
+    g = (torch.arange(codes.shape[0]) + k_off) // 128
+    return (codes - zeros[g]) * sc.double()[g]
+
+
+def _bf16_once(d):
+    """fp64 -> bf16 rounded once (torch's cast goes through fp32, which can double-round near a tie)."""
+    f = d.float()
+    u = f.view(torch.int32).clone()
+    inexact = f.double() != d
+    u = torch.where(inexact & (f.double().abs() > d.abs()), u - 1, u)
+    return torch.where(inexact, u | 1, u).view(torch.float32).bfloat16()
+
+
+def _w4a16_reference(banks, layer_k_off, x, ids, w):
+    """Exact W4 math in fp64 with the model's one store point: the activation rounded to bf16."""
+    T, H = x.shape
+    y = torch.zeros(T, H, dtype=torch.float64)
+    for t in range(T):
+        for k in range(ids.shape[1]):
+            e = int(ids[t, k])
+            if e < 0:
+                continue
+            h = x[t].double() @ _w4a16_dequant(banks["gate_up"][e], banks["gate_up_zero"][e], banks["gate_up_scale"][e], 0)
+            inter = h.shape[0] // 2
+            a = _bf16_once(h[:inter] / (1 + torch.exp(-h[:inter])) * h[inter:]).double()
+            y[t] += float(w[t, k]) * (a @ _w4a16_dequant(banks["down"][e], banks["down_zero"][e], banks["down_scale"][e],
+                                                         layer_k_off))
+    return y
+
+
+def _needs_avx512_bf16():
+    from freetoken.moe.wna16_cpu_prefill import cpu_supported
+
+    if not cpu_supported():
+        pytest.skip("the W4A16 CPU kernel needs AVX-512 BF16")
+
+
+@pytest.mark.parametrize("k_off,down_groups", [(0, 2), (96, 3)])
+def test_w4a16_kernel_matches_exact_math(k_off, down_groups):
+    """The W4A16 column kernel against exact W4 math: (code - zero) * x products are exact in
+    vdpbf16ps, so only the fp32 sums round; deterministic call to call."""
+    from freetoken.kernel import _cpu_moe
+
+    _needs_avx512_bf16()
+    g = torch.Generator().manual_seed(3)
+    H, I = 512, 192
+    b = _w4a16_banks(g, 2, H, I, down_groups)
+    for qw, qz, sc, K, off in ((b["gate_up"][1], b["gate_up_zero"][1], b["gate_up_scale"][1], H, 0),
+                               (b["down"][1], b["down_zero"][1], b["down_scale"][1], I, k_off)):
+        # heavy-tailed activations, as real hidden states
+        x = (torch.randn(K, generator=g) * torch.exp(torch.randn(K, generator=g))).bfloat16()
+        got = _cpu_moe.w4a16_gemv(qw, qz, sc, x, off)
+        assert torch.equal(got, _cpu_moe.w4a16_gemv(qw, qz, sc, x, off))
+        exact = x.double() @ _w4a16_dequant(qw, qz, sc, off)
+        assert ((got.double() - exact).norm() / exact.norm()) < 1e-6
+        assert ((got.double() - exact).abs().max() / exact.abs().max()) < 1e-5
+
+
+@pytest.mark.parametrize("k_off,down_groups", [(0, 2), (96, 3)])
+def test_w4a16_staged_decode(k_off, down_groups):
+    """The CPU-assisted decode's W4A16 executor (fp32 output, the coordinator computing too, driven by
+    stage / signal / wait inside a CUDA graph) against exact W4 math with the activation rounded to
+    bf16 where the GPU stores it; routes with id -1 (the GPU's) are skipped, and each replay reads the
+    pinned inputs anew."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    _needs_avx512_bf16()
+    L, E, H, I, top_k, layer = 2, 8, 512, 192, 4, 1
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(11)
+    layers = [_w4a16_banks(g, E, H, I, down_groups) for _ in range(L)]
+    cache = SimpleNamespace(quant_format="w4a16", num_layers=L, num_experts=E, decode_target="gpu", cpu_executor=None,
+                            bank_sources={r: [b[r] for b in layers] for r in layers[0]})
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=3,
+                        max_tokens=2, device=dev, cpus=[1, 2, 3], coordinator_joins=True, out_fp32=True,
+                        w4a8=False, w4a16_down_k_off=k_off)
+    assert "w4a16" in ex.isa  # set_w4a8 (the engine always calls it) rebuilds the tag
+    io = ex.stage(layer, 2)
+    out = torch.empty(2, H, device=dev)
+
+    def step():
+        ex.signal(layer, 2)
+        out.copy_(ex.wait(layer, 2), non_blocking=True)
+
+    def fill(seed):
+        gg = torch.Generator().manual_seed(seed)
+        x = (torch.randn(2, H, generator=gg) * torch.exp(torch.randn(2, H, generator=gg))).bfloat16()
+        ids = torch.stack([torch.randperm(E, generator=gg)[:top_k] for _ in range(2)]).to(torch.int32)
+        ids[torch.rand(2, top_k, generator=gg) < 0.3] = -1
+        w = torch.softmax(torch.randn(2, top_k, generator=gg), -1)
+        io["x"].copy_(x)
+        io["ids"].copy_(ids)
+        io["w"].copy_(w)
+        return _w4a16_reference(layers[layer], k_off, x, ids, w)
+
+    def rel(want):
+        return ((out.cpu().double() - want).norm() / want.norm()).item()
+
+    want = fill(0)
+    step()
+    torch.cuda.synchronize()
+    first = out.clone()
+    assert rel(want) < 1e-3
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+    for seed in range(1, 4):
+        want = fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert rel(want) < 1e-3
+    if ex._flag_sync:
+        ex.raise_if_unhealthy()
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""

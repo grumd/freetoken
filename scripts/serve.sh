@@ -44,9 +44,9 @@ args=(
   --enable-cache-report
 )
 [ "$PREFIX_CACHE_RAM_GB" != 0 ] && args+=(--cache-ram-gb "$PREFIX_CACHE_RAM_GB")
-# FP4 on one GPU: the CPU computes 90% of decode's expert-cache misses (28 -> 53 tok/s at 4k).
-# Two GPUs miss too rarely for it to pay. calibrate.sh measures the best share for this machine.
-if [ "$tp" = 1 ] && grep -q '"quant_format": *"nvfp4"' "$MODEL/freetoken_weight.json" 2>/dev/null; then
+# One GPU: the CPU computes 90% of decode's expert-cache misses (FP4 28 -> 53 tok/s at 4k; INT4 needs
+# AVX-512 BF16). Two GPUs miss too rarely for it to pay. calibrate.sh measures the best share here.
+if [ "$tp" = 1 ] && grep -q -E '"quant_format": *"(nvfp4|w4a16)"' "$MODEL/freetoken_weight.json" 2>/dev/null; then
   args+=(--moe-decode-fetch 0.1)
 fi
 

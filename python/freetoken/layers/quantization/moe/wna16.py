@@ -35,7 +35,9 @@ class TritonWna16MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native AutoGPTQ INT4 rows."""
 
     name = "triton"
-    cpu_format = None
+    # the decode executor's format for CPU-assisted decode (--moe-decode-fetch); --moe-strategy
+    # cpu / hybrid stay unsupported (unusable_reason)
+    cpu_format = "w4a16"
     slot_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
@@ -95,6 +97,29 @@ class TritonWna16MoEKernel(MoEKernel):
             x, *banks, topk_weights, topk_ids,
             layer.activation, layer.apply_router_weight_on_input, alpha, limit,
             down_k_off=k_off,
+        )
+
+    def decode_overlapped(self, layer, x, topk_weights, topk_ids, view: ExpertView, copy, start, join, **cpu):
+        """Decode while this step's expert copy runs: ``start()`` launches it, the resident routes
+        compute, ``join()`` waits for it, then the copied-in routes. None (and no ``start``) when
+        the fused-epilogue decode kernels do not serve this layer. ``cpu`` (``cpu_y``,
+        ``cpu_wait``): the routes with slot -1 are computed on the CPU, see
+        :func:`wna16_decode_silu`."""
+        from freetoken.kernel.triton import wna16_decode
+        from freetoken.models.wna16_banks import wna16_down_k_off
+        from freetoken.moe.fused_wna16 import _DECODE_V2
+
+        t = view.tensors
+        k_off = wna16_down_k_off(t["down"].shape[-2] * 8)
+        if not (
+            _DECODE_V2 and layer.activation == "silu" and not layer.apply_router_weight_on_input
+            and wna16_decode.supported(t["gate_up"], t["down"], k_off)
+        ):
+            return None
+        start()
+        return wna16_decode.wna16_decode_silu(
+            x, t["gate_up"], t["gate_up_zero"], t["gate_up_scale"], t["down"], t["down_zero"], t["down_scale"],
+            topk_weights, topk_ids, down_k_off=k_off, copy=copy, join=join, **cpu,
         )
 
 

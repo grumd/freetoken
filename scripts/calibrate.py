@@ -3,7 +3,8 @@
 calibrate.sh, which starts and stops the server).
 
 probe  (no server, GPUs idle): GPU / PCIe / CPU facts, pinned host->device bandwidth per GPU, and
-       the CPU expert kernel's time per expert on one layer of the checkpoint's real NVFP4 experts.
+       the CPU expert kernel's time per expert on one layer of the checkpoint's real NVFP4 or W4A16
+       experts.
 run    two loads of serve.sh: --moe-decode-fetch 1 (plain decode, the reference), then CPU-assisted
        decode with FREETOKEN_CPU_DECODE_TUNABLE=1, where the internal /v1/admin/decode-tune
        endpoint switches the share and the CPU thread count between requests. Greedy streaming
@@ -122,7 +123,7 @@ def _read_ftw_layer(snap: Path, layer: int) -> tuple[dict, int]:
     return banks, per_expert
 
 
-def _cpu_bench(snap: Path, gpus: list[int], thread_counts: list[int]) -> dict:
+def _cpu_bench(snap: Path, gpus: list[int], thread_counts: list[int], fmt: str) -> dict:
     """The CPU decode kernel (fp32 activations, fp32 output) on layer 0's real experts: time per
     task for 1, 2 and 8 routed experts at each thread count, all 512 experts in rotation so the
     reads come from RAM, not the L3."""
@@ -133,7 +134,7 @@ def _cpu_bench(snap: Path, gpus: list[int], thread_counts: list[int]) -> dict:
 
     banks, per_expert = _read_ftw_layer(snap, 0)
     E = next(iter(banks.values())).shape[0]
-    cache = types.SimpleNamespace(quant_format="nvfp4", num_layers=1, num_experts=E,
+    cache = types.SimpleNamespace(quant_format=fmt, num_layers=1, num_experts=E,
                                   bank_sources={k: [v] for k, v in banks.items()})
     cores = physical_core_cpus()
     top_k = 8
@@ -194,9 +195,9 @@ def probe(args) -> None:
     hw["gpus"] = [{**g, **{k: v for k, v in _gpu_facts([g["index"]])[0].items() if k.startswith("pcie_")}}
                   for g in hw["gpus"]]
     torch.cuda.empty_cache()
-    if hw["quant_format"] == "nvfp4":
+    if hw["quant_format"] == "nvfp4" or (hw["quant_format"] == "w4a16" and hw["cpu"]["avx512_bf16"]):
         counts = sorted({1, 2, max(1, per // 2), hw["default_threads"], per})
-        hw["cpu_kernel"] = _cpu_bench(snap, gpus, counts)
+        hw["cpu_kernel"] = _cpu_bench(snap, gpus, counts, hw["quant_format"])
         # a TP rank holds half of every expert's rows and streams half the bytes
         shard = hw["cpu_kernel"]["bytes_per_expert"] / len(gpus)
         hw["pcie_us_per_expert"] = round(shard / (min(g["h2d_gbps"] for g in hw["gpus"]) * 1e3), 1)
@@ -544,7 +545,7 @@ def render_report(res: dict, total_s: float | None = None) -> str:
 
 
 def write_skip(args) -> None:
-    """No sweep: CPU-assisted decode cannot run here (INT4 checkpoint, no SIMD CPU kernel)."""
+    """No sweep: CPU-assisted decode cannot run here (another expert format, no SIMD CPU kernel)."""
     hw = json.load(open(args.hw))
     report = "\n".join([f"FreeToken CPU-assisted decode calibration, {hw['date']} on {hw['host']}, "
                         f"GPUS={hw['gpus_arg']}", "", render_hw(hw), "",

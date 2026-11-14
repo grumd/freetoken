@@ -69,7 +69,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "w4a16": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -143,7 +143,7 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or w4a16 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -162,11 +162,14 @@ class CpuMoeExecutor:
         coordinator_joins: bool = False,
         out_fp32: bool = False,
         w4a8: bool | None = None,
+        w4a16_down_k_off: int = 0,
     ) -> None:
         """``cpus`` (logical CPUs, one thread each) replaces the auto sizing: with the flag
         handshake the first is the coordinator's, which with ``coordinator_joins`` also computes.
         ``out_fp32`` returns the expert sum unrounded (fp32 ``y``). ``w4a8`` picks the nvfp4 GEMV:
-        int8 activations (VNNI) or fp32 activations; None keeps the build's default."""
+        int8 activations (VNNI) or fp32 activations; None keeps the build's default.
+        ``w4a16_down_k_off``: w4a16 only, the offset of this rank's down band inside its first
+        quantization group (``wna16_down_k_off``; 0 without TP)."""
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
@@ -264,6 +267,8 @@ class CpuMoeExecutor:
         self.active_threads = self.max_threads
         if w4a8 is not None:
             self._ext.set_w4a8(bool(w4a8))
+        if fmt == "w4a16":
+            self._ext.set_w4a16_down_band(self._w4a16_down_groups, int(w4a16_down_k_off))
         if coordinator_joins:
             self._ext.set_coordinator_joins(True)
         self.isa = self._ext.isa_name()
@@ -393,6 +398,9 @@ class CpuMoeExecutor:
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
 
+        if fmt == "w4a16":
+            return self._resolve_w4a16_banks(banks)
+
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
 
@@ -447,6 +455,35 @@ class CpuMoeExecutor:
             gate_up_global_ptr=0,
             down_scale_ptr=0,
             down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_w4a16_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """AutoGPTQ int4 (models/wna16_banks.py), read in place: qweight [E, K/8, N] int32, qzeros
+        [E, groups, N/8] int32 (zero - 1), fp16 scales [E, groups, N]; N contiguous, as for mxfp4.
+        The zero tables ride in the ctor's ``*_global_ptr`` slots."""
+        gq, gz, gs = banks["gate_up"], banks["gate_up_zero"], banks["gate_up_scale"]
+        dq, dz, ds = banks["down"], banks["down_zero"], banks["down_scale"]
+        for t in (gq, gz, dq, dz):
+            assert t[0].dtype == torch.int32 and t[0].is_contiguous(), (t[0].dtype, t[0].shape)
+        assert gs[0].dtype == torch.float16 and ds[0].dtype == torch.float16, (gs[0].dtype, ds[0].dtype)
+        H = int(gq[0].shape[1] * 8)
+        I = int(gq[0].shape[2] // 2)
+        dG = int(dz[0].shape[1])
+        assert H % 128 == 0 and I % 64 == 0, (H, I)
+        assert tuple(gz[0].shape[1:]) == (H // 128, 2 * I // 8) and tuple(gs[0].shape[1:]) == (H // 128, 2 * I)
+        assert tuple(dq[0].shape[1:]) == (I // 8, H), (dq[0].shape, H, I)
+        assert tuple(dz[0].shape[1:]) == (dG, H // 8) and tuple(ds[0].shape[1:]) == (dG, H)
+        self._w4a16_down_groups = dG
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gq).data_ptr(),
+            down_ptr=self._make_table(dq).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gs).data_ptr(),
+            gate_up_global_ptr=self._make_table(gz).data_ptr(),
+            down_scale_ptr=self._make_table(ds).data_ptr(),
+            down_global_ptr=self._make_table(dz).data_ptr(),
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
         )

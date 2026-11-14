@@ -29,7 +29,7 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
 - **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
-- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs, and gets no CPU-assisted decode on one GPU.
+- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`), against about 25 without CPU help.
 - **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
 - **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
 

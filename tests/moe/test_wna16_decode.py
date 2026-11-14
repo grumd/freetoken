@@ -200,3 +200,59 @@ def test_prefill_precise_rounds_only_the_activation_and_outputs(M, monkeypatch):
     default, precise = run(False), run(True)
     assert rel(precise, stored) < 5e-4, rel(precise, stored)
     assert rel(precise, exact) < 0.7 * rel(default, exact), (rel(precise, exact), rel(default, exact))
+
+
+def _decode_case(seed, M=2, S=12, H=512, I=256, TOPK=4):
+    torch.manual_seed(seed)
+    gu_qw, gu_qz, gu_sc, gu_w = _expert_bank(S, 2 * I, H, "cuda")
+    dn_qw, dn_qz, dn_sc, dn_w = _expert_bank(S, H, I, "cuda")
+    x = (torch.randn(M, H, device="cuda") * 0.5).to(torch.bfloat16)
+    tw = torch.softmax(torch.randn(M, TOPK, device="cuda"), -1)
+    ids = torch.stack([torch.randperm(S, device="cuda")[:TOPK] for _ in range(M)]).to(torch.int32)
+    return (gu_qw, gu_qz, gu_sc, dn_qw, dn_qz, dn_sc), x, tw, ids
+
+
+def test_decode_copy_overlap_is_bit_identical():
+    """Resident routes first, then join() and the copied-in ones: the same programs compute every
+    route, so the output equals the one-pass decode bit for bit."""
+    from freetoken.kernel.triton.wna16_decode import wna16_decode_silu
+
+    bk, x, tw, ids = _decode_case(2)
+    copy_slots = torch.full((16,), -1, dtype=torch.int32, device="cuda")
+    copy_slots[:2] = torch.stack([ids[0, 1], ids[1, 2]])
+    joins = []
+    got = wna16_decode_silu(x, *bk, tw, ids, copy=(copy_slots, torch.tensor([2], dtype=torch.int64, device="cuda")),
+                            join=lambda: joins.append(1))
+    assert joins == [1]
+    assert torch.equal(got, wna16_decode_silu(x, *bk, tw, ids))
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_decode_with_cpu_routes(copy):
+    """Routes with slot -1 belong to the CPU: the GPU skips them (their slot is never read) and adds
+    the CPU's fp32 partial before the one rounding, after cpu_wait()."""
+    from freetoken.kernel.triton.wna16_decode import wna16_decode_silu
+
+    bk, x, tw, ids = _decode_case(5)
+    on_cpu = torch.zeros_like(ids, dtype=torch.bool)
+    on_cpu[0, 1] = on_cpu[1, 0] = on_cpu[1, 3] = True
+    slots = ids.masked_fill(on_cpu, -1)
+    # the CPU's partial: the GPU kernel's own fp32 sum over just those routes (no rounding)
+    cpu_part = torch.zeros(2, x.shape[1], device="cuda")
+    for m in range(2):
+        for k in range(ids.shape[1]):
+            if on_cpu[m, k]:
+                one = wna16_decode_silu(x[m:m + 1], *bk, tw[m:m + 1, k:k + 1], ids[m:m + 1, k:k + 1])
+                cpu_part[m] += one[0].float()
+    waits, kw = [], {}
+    if copy:
+        copy_slots = torch.full((16,), -1, dtype=torch.int32, device="cuda")
+        copy_slots[0] = ids[0, 0]
+        kw = dict(copy=(copy_slots, torch.tensor([1], dtype=torch.int64, device="cuda")), join=lambda: None)
+    got = wna16_decode_silu(x, *bk, tw, slots, cpu_y=cpu_part.cpu().pin_memory(), cpu_wait=lambda: waits.append(1), **kw)
+    assert waits == [1]
+    full = wna16_decode_silu(x, *bk, tw, ids).float()
+    assert ((got.float() - full).norm() / full.norm()) < 1e-2
+    # GPU part alone (CPU partial 0) == the GPU kernel over only the GPU routes
+    alone = wna16_decode_silu(x, *bk, tw, slots, cpu_y=torch.zeros(2, x.shape[1], device="cuda"), cpu_wait=lambda: None)
+    torch.testing.assert_close(alone, wna16_decode_silu(x, *bk, tw.masked_fill(on_cpu, 0), ids), rtol=0, atol=0)

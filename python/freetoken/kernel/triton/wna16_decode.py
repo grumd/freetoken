@@ -18,7 +18,7 @@ import triton.language as tl
 
 @triton.jit
 def _gemv_partials_kernel(
-    a_ptr, qw_ptr, qz_ptr, sc_ptr, part_ptr, ids_ptr,
+    a_ptr, qw_ptr, qz_ptr, sc_ptr, part_ptr, ids_ptr, copy_slots_ptr, num_copy_ptr,
     R, N, kb_per, n_kb, K_OFF,
     stride_a,
     stride_qe, stride_qkw,
@@ -26,11 +26,20 @@ def _gemv_partials_kernel(
     stride_se, stride_sg,
     GROUP: tl.constexpr, TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
+    ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16, SKIP_NEG: tl.constexpr = False,
 ):
+    # ROUTES 1 / 2: only the routes whose slot is resident / still being copied in;
+    # SKIP_NEG: not the routes whose slot is -1 (computed on the CPU)
     r = tl.program_id(0)
     nb = tl.program_id(1)
     s = tl.program_id(2)
     slot = tl.load(ids_ptr + r).to(tl.int64)
+    if SKIP_NEG:
+        if slot < 0:
+            return
+    if ROUTES != 0:
+        if route_in_flight(slot, copy_slots_ptr, num_copy_ptr, MAX_COPY) != (ROUTES == 2):
+            return
     a_row = r if A_ROW_IS_ROUTE else r // TOP_K
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     nmask = offs_n < N
@@ -131,23 +140,27 @@ def _split(programs: int, n_kb: int) -> int:
     return triton.cdiv(n_kb, triton.cdiv(n_kb, split))
 
 
-def _gemv(a, qw, qz, sc, ids, R, top_k, a_row_is_route, k_off, tile):
+def _gemv(a, qw, qz, sc, ids, R, top_k, a_row_is_route, k_off, tile, routes=0, copy=None, part=None,
+          skip_neg=False):
     bn, bkw, warps = tile
     kw, N = qw.shape[1], qw.shape[2]
     n_kb = kw // bkw
     split = _split(R * triton.cdiv(N, bn), n_kb)
     kb_per = triton.cdiv(n_kb, split)
     split = triton.cdiv(n_kb, kb_per)
-    part = torch.empty((split, R, N), dtype=torch.float32, device=a.device)
+    if part is None:
+        part = torch.empty((split, R, N), dtype=torch.float32, device=a.device)
+    copy_slots, num_copy = copy if copy is not None else (ids, ids)
     _gemv_partials_kernel[(R, triton.cdiv(N, bn), split)](
-        a, qw, qz, sc, part, ids,
+        a, qw, qz, sc, part, ids, copy_slots, num_copy,
         R, N, kb_per, n_kb, k_off,
         a.stride(0),
         qw.stride(0), qw.stride(1),
         qz.stride(0), qz.stride(1),
         sc.stride(0), sc.stride(1),
         GROUP=128, TOP_K=top_k, A_ROW_IS_ROUTE=a_row_is_route,
-        BLOCK_N=bn, BLOCK_KW=bkw, num_warps=warps,
+        BLOCK_N=bn, BLOCK_KW=bkw, ROUTES=routes, MAX_COPY=triton.next_power_of_2(R), SKIP_NEG=skip_neg,
+        num_warps=warps,
     )
     return part, split
 
@@ -168,21 +181,46 @@ def wna16_decode_silu(
     gate_up_qw: torch.Tensor, gate_up_qz: torch.Tensor, gate_up_sc: torch.Tensor,
     down_qw: torch.Tensor, down_qz: torch.Tensor, down_sc: torch.Tensor,
     topk_weights: torch.Tensor, topk_ids: torch.Tensor, down_k_off: int = 0,
-    gu_tile=None, dn_tile=None,
+    gu_tile=None, dn_tile=None, copy=None, join=None, cpu_y: torch.Tensor | None = None, cpu_wait=None,
 ) -> torch.Tensor:
-    """SiLU-gated expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H]."""
+    """SiLU-gated expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H].
+
+    With ``copy = (copy_slots, num_copy)`` (this step's expert copy, still running) the routes
+    already resident go first, then ``join()`` waits for the copy and the rest follow. Every
+    route's partials come from the same programs either way, so the output is bit-identical.
+
+    With ``cpu_y`` ([M, H] fp32) the routes whose slot is -1 are the CPU's: they are skipped here,
+    ``cpu_wait()`` runs after the GPU routes, and ``cpu_y`` joins the fp32 sum before rounding."""
     M, H = x.shape
     top_k = topk_ids.shape[1]
     R = M * top_k
     inter = gate_up_qw.shape[2] // 2
     ids = topk_ids.reshape(-1)
-    part1, s1 = _gemv(x, gate_up_qw, gate_up_qz, gate_up_sc, ids, R, top_k, False, 0, gu_tile or _GU_TILE)
-    act = torch.empty((R, inter), dtype=x.dtype, device=x.device)
-    _reduce_silu_mul_kernel[(R, triton.cdiv(inter, 256))](part1, act, R, inter, SPLIT=s1, BLOCK=256, num_warps=2)
-    part2, s2 = _gemv(act, down_qw, down_qz, down_sc, ids, R, top_k, True, down_k_off, dn_tile or _DN_TILE)
+    gu_tile, dn_tile = gu_tile or _GU_TILE, dn_tile or _DN_TILE
+    skip = cpu_y is not None
+    part1 = act = part2 = None
+    for routes in ((1, 2) if copy is not None else (0,)):
+        if routes == 2:
+            join()
+        part1, s1 = _gemv(x, gate_up_qw, gate_up_qz, gate_up_sc, ids, R, top_k, False, 0, gu_tile,
+                          routes, copy, part1, skip)
+        if act is None:
+            act = torch.empty((R, inter), dtype=x.dtype, device=x.device)
+        masks = {} if routes == 0 else dict(ids_ptr=ids, copy_slots_ptr=copy[0], num_copy_ptr=copy[1],
+                                            ROUTES=routes, MAX_COPY=triton.next_power_of_2(R))
+        if skip:
+            masks.update(ids_ptr=ids, SKIP_NEG=True)
+        _reduce_silu_mul_kernel[(R, triton.cdiv(inter, 256))](part1, act, R, inter, SPLIT=s1, BLOCK=256,
+                                                               num_warps=2, **masks)
+        part2, s2 = _gemv(act, down_qw, down_qz, down_sc, ids, R, top_k, True, down_k_off, dn_tile,
+                          routes, copy, part2, skip)
     out = torch.empty((M, H), dtype=x.dtype, device=x.device)
+    cpu = {}
+    if skip:
+        cpu_wait()
+        cpu = dict(ids_ptr=ids, cpu_ptr=cpu_y, SKIP_NEG=True, HAS_CPU=True)
     _reduce_topk_sum_kernel[(M, triton.cdiv(H, 512))](
         part2, topk_weights, out, R, H, topk_weights.stride(0),
-        TOP_K=top_k, SPLIT=s2, BLOCK=512, num_warps=4,
+        TOP_K=top_k, SPLIT=s2, BLOCK=512, num_warps=4, **cpu,
     )
     return out

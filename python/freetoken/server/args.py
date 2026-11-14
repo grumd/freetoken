@@ -1115,7 +1115,7 @@ def parse_args(
         default=None,
         dest="moe_decode_fetch",
         help=(
-            "With --moe-strategy offload and NVFP4 experts: the share (0-1) of each decode step's "
+            "With --moe-strategy offload and NVFP4 or W4A16 experts: the share (0-1) of each decode step's "
             "expert-cache misses fetched over PCIe into the cache; the CPU computes the rest from "
             "the pinned banks while the GPU runs the hits. 1 (default) = every miss over PCIe, "
             "0 = every miss on the CPU (the cache then only changes during prefill)."
@@ -1128,7 +1128,7 @@ def parse_args(
         dest="moe_cpu_decode_act",
         help=(
             "--moe-decode-fetch < 1: activations of the CPU expert GEMV. fp32 (default) keeps "
-            "them exact; int8 quantizes them per 16 values for the VNNI dot (W4A8)."
+            "them exact; int8 quantizes them per 16 values for the VNNI dot (W4A8, NVFP4 only)."
         ),
     )
     parser.add_argument(
