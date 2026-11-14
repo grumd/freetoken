@@ -768,7 +768,8 @@ def parse_args(
                         dest="ngram_spec",
                         help="Prompt-lookup speculative decoding without a draft head: verify the "
                              "continuation of an earlier repeat of the context where the cost "
-                             "policy expects a gain (default off).")
+                             "policy expects a gain (default off). For models without a draft "
+                             "head; with MTP use --mtp-ngram.")
     parser.add_argument("--ngram-spec-max-draft", type=int, default=None, dest="ngram_spec_max_draft",
                         help="Longest --ngram-spec draft; the verify window is one token longer (default 7).")
     parser.add_argument("--ngram-spec-min-match", type=int, default=None, dest="ngram_spec_min_match",

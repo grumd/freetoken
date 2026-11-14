@@ -485,7 +485,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _make_spec_manager(self):
         """Pick the model's speculative-decode manager: qwen4-exp MTP (residual streams),
-        DeepSeek-V4.1 DSpark (aux-hidden block draft), or a no-op."""
+        DeepSeek-V4.1 DSpark (aux-hidden block draft), --ngram-spec prompt lookup, or a no-op."""
         from .dspark import DSparkManager
 
         model = self.engine.model
