@@ -334,6 +334,60 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
 
 
+@requires_cuda
+@torch.inference_mode()  # as the engine runs: the I/O worker thread is outside it
+def test_async_prefill_fill_reads_the_next_chunk_ahead(tmp_path, monkeypatch):
+    """Prefill rows are read on a worker while the forward launches (the lookup WAITs on the
+    fill), and a chunked prompt's next chunk is read ahead into the other buffer; any batch
+    that does not continue it falls back to its own read. Rows always equal the oracle."""
+    disk, oracle, args = _make_table(tmp_path)
+    if not disk._async:
+        pytest.skip("stream memops unavailable: prefill fills stay synchronous")
+    emb = _embedding()
+    prompt = [(7 * i + 3) % 50 + 1 for i in range(40)]
+    prompt[9] = EOS
+
+    def chunk(lo, hi, uid=5, ahead=True, seq=prompt):
+        full = torch.tensor(seq, dtype=torch.int32)
+        req = SimpleNamespace(uid=uid, input_ids=full[:hi], cached_len=lo, device_len=hi)
+        if ahead and hi < len(seq):
+            req.prompt_ids = full  # a ChunkedReq carries its whole prompt
+        ctx = [seq[lo - 2] if lo >= 2 else EOS, seq[lo - 1] if lo >= 1 else EOS]
+        ids = emb.row_ids(_meta([seq[lo:hi]], [ctx])).cuda()
+        return SimpleNamespace(is_decode=False, padded_reqs=[req]), ids
+
+    def run(batch, ids, *, read_ahead):
+        with disk.forward_host_ctx(batch, use_graph=False):
+            assert (disk._wait_seq == 0) == read_ahead
+            got = disk.lookup(ids)
+        torch.cuda.synchronize()
+        assert _bitwise_equal(got, oracle.lookup(ids))
+
+    run(*chunk(0, 16), read_ahead=False)
+    run(*chunk(16, 32), read_ahead=True)
+    run(*chunk(32, 40), read_ahead=True)  # the final chunk (no prompt_ids) still uses the read-ahead
+    # an unrelated request after a read-ahead: dropped, its own rows are read
+    run(*chunk(0, 16, uid=5), read_ahead=False)
+    run(*chunk(0, 12, uid=6, ahead=False), read_ahead=False)
+    # the read-ahead is the size of the chunk just launched (rounded up to 1024), not the buffer's
+    long = [(7 * i + 3) % 50 + 1 for i in range(5000)]
+    run(*chunk(0, 1000, uid=8, seq=long), read_ahead=False)
+    assert disk._ahead[1:3] == (1000, 2024)
+    run(*chunk(1000, 2000, uid=8, seq=long), read_ahead=True)
+    # a decode fill waits for the worker first
+    run(*chunk(0, 16, uid=7), read_ahead=False)
+    disk.host_fill_batch(_decode_batch([3, 4, EOS, 5], 9), use_graph=False)
+    ids = emb.row_ids(_meta([[9]], [[EOS, 5]], decode=True)).cuda()
+    assert disk._ahead is None and _bitwise_equal(disk.lookup(ids), oracle.lookup(ids))
+
+    monkeypatch.setenv("FREETOKEN_PLE_ASYNC_PREFILL", "0")
+    sync, _, _ = _make_table(tmp_path)
+    assert not sync._async
+    batch, ids = chunk(0, 16)
+    assert sync.host_fill_batch(batch, use_graph=False) is None
+    assert _bitwise_equal(sync.lookup(ids), oracle.lookup(ids))
+
+
 def _write_checkpoint_bf16(tmp_path, table, n_shards):
     from safetensors.torch import save_file
 

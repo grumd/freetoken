@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -19,9 +20,13 @@ class _Elastic:
         self.pages, self.limit_pages, self.step_pages, self.min_pages = pages, limit, step, min_pages
         self.calls = []
         self.reclaims = 0  # the lent prefill reserve handed back
+        self.unboosts = 0  # a long prompt's borrowed slots handed back
 
     def reclaim(self):
         self.reclaims += 1
+
+    def unboost(self):
+        self.unboosts += 1
 
     def growable_pages(self):
         return self.limit_pages - self.pages
@@ -78,7 +83,7 @@ def test_idle_shrink_returns_free_tail_but_never_a_cached_page():
     cm, el = _cm(pages=40, min_pages=8)
     held = cm._allocate(3)  # pages 0..2 stay in use
     cm.elastic_idle()
-    assert el.reclaims == 1  # between turns, before any page moves
+    assert el.reclaims == 1 and el.unboosts == 1  # between turns, before any page moves
     assert el.calls == [("shrink", 40, 16)]  # used 3 + one step of slack, rounded to a step
     assert cm.free_slots.tolist() == list(range(3, 16))
     cm._free(held)
@@ -147,3 +152,36 @@ def test_idle_compaction_moves_cached_pages_down_so_the_pool_can_shrink():
     assert el.payload[[6, 7, 8, 9]].tolist() == [360, 370, 380, 390]
     assert int(cm.free_slots.max()) < 24
     cm.check_integrity()
+
+
+@pytest.mark.parametrize("loop, ngram, want", [
+    ("normal_loop", False, ["unboost", "round", "schedule"]),
+    ("overlap_loop", False, ["unboost", "schedule"]),
+    ("overlap_loop", True, ["unboost", "ngram"]),
+])
+def test_an_aborted_long_prompt_hands_its_boost_back_before_anything_else_runs(loop, ngram, want):
+    """The abort lands in the message loop: the boost is settled right after it, before a
+    rebuild, a speculative round or the next schedule can need the expert slots."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    events = []
+    el = SimpleNamespace(boosted=4)
+    el.unboost = lambda: (events.append("unboost"), setattr(el, "boosted", 0))
+    sched = Scheduler.__new__(Scheduler)
+    sched.engine = SimpleNamespace(elastic=el, stream=None)
+    sched.stream = SimpleNamespace(wait_stream=lambda s: None)
+    sched.prefill_manager = SimpleNamespace(runnable=True)
+    sched.decode_manager = SimpleNamespace(runnable=False, running_reqs=[])
+    sched._pending_rebuild, sched._pending_tunes = None, []
+    sched.receive_msg = lambda blocking: ["abort"]
+    sched._process_one_msg = lambda msg: setattr(sched.prefill_manager, "runnable", False)
+    sched.mtp = SimpleNamespace(enabled=False, is_ngram=ngram, run_round=lambda: events.append("round"))
+    sched._ngram_iteration = lambda mgr, last: events.append("ngram")
+    sched._schedule_next_batch = lambda: events.append("schedule")
+    sched._process_last_data = lambda *a, **k: None
+    sched._flush_abort_acks = lambda: None
+    if loop == "normal_loop":
+        Scheduler.normal_loop(sched)
+    else:
+        Scheduler.overlap_loop(sched, None)
+    assert events == want and el.boosted == 0

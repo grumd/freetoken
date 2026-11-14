@@ -82,6 +82,10 @@ class EngineConfig:
     # the expert cache until the next prefill; 1 = right after the first token, 0 never lends.
     elastic_lend_after: int = 1
     prefill_reserve_gb: float | None = None
+    # Size the standing prefill reserve for chunks of this many tokens (0 = --max-prefill-length);
+    # longer chunks borrow the extra activation VRAM from the expert cache per prompt while the
+    # KV pages leave room, else they stay at this size (engine/elastic.py boost).
+    prefill_reserve_tokens: int = 0
     # Prefix RAM tier (hybrid GDN models): pinned host RAM, total across TP ranks, that evicted
     # prefixes and their GDN snapshots spill to instead of being dropped; 0 disables it.
     cache_ram_gb: float = 0.0

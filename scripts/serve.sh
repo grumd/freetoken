@@ -34,7 +34,10 @@ args=(
   --moe-strategy offload
   --elastic-kv
   --max-running-requests 1
-  --max-prefill-length 8192
+  # prefill streams every expert over PCIe once per chunk: 16384-token chunks halve that traffic.
+  # The standing reserve covers 8192-token chunks (a 16384 one would cap one GPU's context below
+  # 262k); a long prompt borrows the rest from the expert cache while KV leaves room for it.
+  --max-prefill-length 16384 --prefill-reserve-tokens 8192
   # shorter chunks load only their routed experts instead of streaming all of them over PCIe
   --moe-routed-prefill-tokens 3072
   --moe-prefill-hit-d2d

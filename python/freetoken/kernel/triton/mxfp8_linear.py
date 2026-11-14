@@ -17,6 +17,7 @@ any other bf16 projection.
 
 from __future__ import annotations
 
+import os
 
 import torch
 import triton
@@ -56,6 +57,9 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
 _GEMV_MAX_M = 256
 # Largest bf16 transient (elements) the dequant + cuBLAS path materializes at once.
 _DEQUANT_ELEMS = 1 << 25
+# Odd-width row slices (K=2560: 13107 rows) run a half-speed cuBLAS align1 kernel, so these M use 8-aligned
+# rows. Same math: byte-identical on sm_86; on other GPUs cuBLAS may sum in another order (rounding only).
+_PAD_SLICE_M = (1024, 16384) if os.getenv("FREETOKEN_MXFP8_PAD_SLICES", "1") != "0" else (1, 0)
 
 
 @triton.jit
@@ -251,9 +255,14 @@ def mxfp8_linear(
             out = torch.nn.functional.linear(x2, mxfp8_dequant(weight, scale_codes, dtype=x.dtype))
         else:
             out = x2.new_empty((M, N))
+            pad = _PAD_SLICE_M[0] <= M <= _PAD_SLICE_M[1]
             for n0 in range(0, N, rows):
-                w = mxfp8_dequant(weight[n0 : n0 + rows], scale_codes[n0 : n0 + rows], dtype=x.dtype)
-                out[:, n0 : n0 + rows] = torch.nn.functional.linear(x2, w)
+                n1 = min(N, n0 + rows)
+                # padded with the next real rows; the last slice keeps its width
+                n2 = n1 + (-n1 % 8 if pad and n1 + (-n1 % 8) <= N else 0)
+                w = mxfp8_dequant(weight[n0:n2], scale_codes[n0:n2], dtype=x.dtype)
+                y = torch.nn.functional.linear(x2, w)
+                out[:, n0:n1] = y if n2 == n1 else y[:, : n1 - n0]
         out = out.reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)

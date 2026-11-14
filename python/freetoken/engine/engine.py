@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import math
 import os
@@ -884,7 +885,7 @@ class Engine:
         """--elastic-kv: size the virtual reservations of the expert banks and the KV pool from
         the VRAM free now, before either exists. The physical pool is settled in finalize()."""
         from freetoken.engine.cache_budget import (
-            expert_bytes_per_slot, plan_elastic_geometry, prefill_reserve_bytes,
+            PREFILL_BYTES_PER_TOKEN, expert_bytes_per_slot, plan_elastic_geometry, prefill_reserve_bytes,
         )
         from freetoken.engine.elastic import ElasticVram
 
@@ -893,7 +894,12 @@ class Engine:
         cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         fixed += state_pool_bytes(config)
         self._elastic_page_tokens = page_tokens
-        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, config.max_extend_tokens)
+        long_tokens = config.max_extend_tokens
+        base_tokens = config.prefill_reserve_tokens if 0 < config.prefill_reserve_tokens < long_tokens else long_tokens
+        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, base_tokens)
+        boost_bytes = PREFILL_BYTES_PER_TOKEN * (long_tokens - base_tokens)
+        if config.prefill_reserve_gb is not None:
+            boost_bytes = 0  # an explicit reserve is the whole budget; chunks stay at its size
         self._elastic_keep_free = config.vram_keep_free_mb << 20
         free = self._sync_get_memory()[0]
         min_pages = div_ceil(config.elastic_kv_min_tokens, page_tokens)
@@ -917,6 +923,7 @@ class Engine:
             cap_slots=cap_slots,
             cap_pages=cap_pages,
             lend_after=config.elastic_lend_after,
+            boost_bytes=boost_bytes,
         )
         object.__setattr__(config, "moe_cache_size", cap_slots)
         object.__setattr__(config, "num_page_override", cap_pages)
@@ -1676,15 +1683,15 @@ class Engine:
         hidden = self.model.model.forward(batch.input_ids, batch)
         head = self.model.lm_head
         primary = self.config.tp_info.is_primary()
-        # row slices: a full [T, vocab] gather is ~T * 1 MB per copy and every rank holds several
-        rows = []
-        for start in range(0, hidden.shape[0], 512):
-            part = head.forward_all(hidden[start : start + 512])
-            if primary:
-                rows.append(part.to(torch.bfloat16).cpu())
-        if primary:
-            with open(path, "ab") as f:
-                f.write(torch.cat(rows).view(torch.int16).numpy().tobytes())
+        # <file>.stride holding N: only positions that are multiples of N (long-prompt A/Bs)
+        stride = int(open(path + ".stride").read()) if os.path.exists(path + ".stride") else 1
+        keep = hidden if stride == 1 else hidden[(batch.positions[: hidden.shape[0]] % stride) == 0]
+        # row slices, each written as it lands: a 16k chunk's logits are ~8 GB of host RAM
+        with open(path, "ab") if primary else contextlib.nullcontext() as f:
+            for start in range(0, keep.shape[0], 512):
+                part = head.forward_all(keep[start : start + 512])
+                if primary:
+                    f.write(part.to(torch.bfloat16).cpu().view(torch.int16).numpy().tobytes())
         return head.forward(hidden)
 
     def _maybe_start_prefill_profile(self, batch: Batch):

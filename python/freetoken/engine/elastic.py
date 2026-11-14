@@ -17,6 +17,11 @@ hands it back before the next prefill (or at idle, between turns). A lend stalls
 once, mostly torch releasing its cached activations, which blocks decode even from another
 thread (kbench/bench_bg_lend.py); the extra slots are worth ~0.5 ms per token at TP=2 and
 several ms at TP=1 on RTX 3080s.
+
+A long prompt can borrow the other way (``boost_bytes``, --prefill-reserve-tokens): the standing
+reserve is sized for short chunks, and :meth:`boost` retires expert slots to free the extra
+activation VRAM of a long chunk while the KV pages backed now leave room for it; :meth:`unboost`
+takes it back once the prompt is in. Near the context limit the chunks stay short instead.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ class ElasticVram:
         cap_slots: int,
         cap_pages: int,
         lend_after: int = 0,
+        boost_bytes: int = 0,
     ) -> None:
         assert 0 < min_pages <= cap_pages and floor_slots <= cap_slots
         self.device = device
@@ -72,6 +78,11 @@ class ElasticVram:
         self.lent = 0  # chunks borrowed beyond the persistent pool
         self._quiet_steps = 0
         self._keep_free = 0
+        # long-chunk prefill borrowing from the experts (0 = off); chunk count settled in finalize()
+        self.boost_bytes = boost_bytes
+        self.boost_chunks = 0
+        self.boost_limit_pages = 0  # most KV pages a boost leaves room for, the same on every rank
+        self.boosted = 0  # chunks released for the prompt in flight
 
     # ------------------------------------------------------------- allocation hooks
     def kv_tier(self, role: str, shape, dtype: torch.dtype, intervals) -> torch.Tensor:
@@ -114,8 +125,8 @@ class ElasticVram:
                 hi = mid - 1
         return lo
 
-    def _max_pages(self, slots: int) -> int:
-        budget = self.pool.num_handles - self._bank_chunks(slots)
+    def _max_pages(self, slots: int, handles: int | None = None) -> int:
+        budget = (self.pool.num_handles if handles is None else handles) - self._bank_chunks(slots)
         lo, hi = self.min_pages, self.cap_pages
         while lo < hi:
             mid = (lo + hi + 1) // 2
@@ -125,8 +136,11 @@ class ElasticVram:
                 hi = mid - 1
         return lo
 
+    def _page_limit(self) -> int:
+        return min(self.limit_pages, self.boost_limit_pages) if self.boosted else self.limit_pages
+
     def growable_pages(self) -> int:
-        return self.limit_pages - self.pages
+        return max(0, self._page_limit() - self.pages)
 
     def bytes_per(self) -> tuple[int, int]:
         """(KV bytes per page, expert bytes per slot) as mapped, for reports."""
@@ -150,6 +164,14 @@ class ElasticVram:
             # TP ranks must agree on how far KV can grow; bank shards may differ in size
             torch.distributed.all_reduce(limit, op=torch.distributed.ReduceOp.MIN, group=tp_group)
         self.limit_pages = int(limit.item())
+        if self.boost_bytes > 0:
+            self.boost_chunks = -(-self.boost_bytes // self.pool.chunk_bytes)
+            handles = self.pool.num_handles - self.boost_chunks
+            fits = self._kv_chunks(self.min_pages) + self._bank_chunks(self.floor_slots) <= handles
+            blimit = torch.tensor([self._max_pages(self.floor_slots, handles) if fits else 0], dtype=torch.int64)
+            if tp_group is not None:
+                torch.distributed.all_reduce(blimit, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+            self.boost_limit_pages = min(int(blimit.item()), self.limit_pages)
         self._tp_group = tp_group
         self._keep_free = keep_free_bytes
         self._resize(self.pages, self._max_slots(self.pages))
@@ -161,12 +183,17 @@ class ElasticVram:
             f"{self._max_slots(self.limit_pages)}..{self.slots} slots (floor {self.floor_slots}); "
             f"prefill reserve {reserve_bytes / 2**30:.2f} GiB, keep free {keep_free_bytes / 2**20:.0f} MiB"
         )
+        if self.boost_chunks:
+            logger.info_rank0(
+                f"Elastic VRAM: long prefill chunks borrow {self.boost_chunks * self.pool.chunk_bytes / 2**30:.2f} GiB "
+                f"from the experts while KV is at most {self.boost_limit_pages} pages"
+            )
 
     def grow(self, need_pages: int) -> tuple[int, int]:
         """Back at least ``need_pages`` more KV pages (a whole number of steps, capped at the
         limit), retiring expert slots to pay for them. Returns the new page range [old, new)."""
         old = self.pages
-        new = min(self.limit_pages, old + -(-max(need_pages, 1) // self.step_pages) * self.step_pages)
+        new = min(self._page_limit(), old + -(-max(need_pages, 1) // self.step_pages) * self.step_pages)
         if new > old:
             self._resize(new, self._max_slots(new))
         return old, self.pages
@@ -181,6 +208,7 @@ class ElasticVram:
     def decode_step(self, prefill_pending: bool) -> None:
         """Once per decode batch: lend the prefill workspace after ``lend_after`` steps in a row
         with no prefill waiting."""
+        self.unboost()
         self._quiet_steps += 1
         if (self.lend_after and not self.lent and not prefill_pending
                 and self._quiet_steps >= self.lend_after):
@@ -211,6 +239,49 @@ class ElasticVram:
         self._resize(self.pages, self._max_slots(self.pages, persistent), why="reclaim")
         self.pool.release(self.lent)
         self.lent = 0
+
+    def boost(self) -> bool:
+        """Free ``boost_bytes`` for a long prefill chunk by retiring expert slots. False (stay at
+        the reserve's chunk size) when the KV pages backed now leave no room for it."""
+        if self.boosted:
+            return True
+        if not self.boost_chunks or self.pages > self.boost_limit_pages:
+            return False
+        self.reclaim()
+        handles = self.pool.num_handles - self.boost_chunks
+        self._resize(self.pages, self._max_slots(self.pages, handles), why="boost")
+        self.pool.release(self.boost_chunks)
+        self.boosted = self.boost_chunks
+        return True
+
+    def unboost(self) -> None:
+        """Give the experts back what :meth:`boost` freed, once the long prompt is in."""
+        if not self.boosted:
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()  # the long chunk's activations, cached by torch
+        made, err = 0, None
+        try:
+            for _ in range(self.boosted):
+                self.pool.create(1)
+                made += 1
+        except RuntimeError as e:
+            err = e
+        group = getattr(self, "_tp_group", None)
+        if group is not None:
+            # every rank must leave boost together, or their page limits and schedules diverge
+            ok = torch.tensor([int(err is None)], dtype=torch.int64)
+            torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN, group=group)
+            if not int(ok.item()):
+                raise RuntimeError(
+                    f"elastic unboost: a TP rank could not take its {self.boosted} expert chunks back "
+                    f"(this rank: {made}, {err})"
+                )
+        elif err is not None:
+            # retried at the next unboost; KV stays capped at boost_limit_pages meanwhile
+            logger.warning(f"elastic unboost: {made}/{self.boosted} chunks back ({err})")
+        self.boosted -= made
+        self._resize(self.pages, self._max_slots(self.pages), why="unboost")
 
     def move_pages(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Copy whole KV pages ``src`` -> ``dst`` (disjoint sets) across every page-scaled tier."""
@@ -264,6 +335,7 @@ class ElasticVram:
             "expert_slots": self.slots,
             "expert_slots_floor": self.floor_slots,
             "lent_chunks": self.lent,
+            "boosted_chunks": self.boosted,
             "transitions": self.transitions,
             "transition_ms": round(self.transition_ms, 1),
         }

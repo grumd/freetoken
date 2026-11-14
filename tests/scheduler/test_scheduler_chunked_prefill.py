@@ -77,6 +77,35 @@ def _drive_chunked_prefill(cm, tm, pm, n_chunks):
     tm.free(final_req.table_idx)
 
 
+def test_a_long_prompt_grows_the_chunk_once_per_batch():
+    """An elastic boost: a prompt longer than the budget asks once for extra tokens; a refused
+    boost (0) keeps the standing chunk, and a prompt that fits never asks."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, tm, dm, pm = _build_managers(num_pages=MAX_RUNNING * WIDTH)
+    asks = []
+
+    def grant(extra):
+        def grow():
+            asks.append(extra)
+            return extra
+        return grow
+
+    sizes = []
+    pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(30, dtype=torch.int32),
+                                  sampling_params=SamplingParams(max_tokens=4))]
+    for extra in (CHUNK, 0, CHUNK):
+        pm.grow_budget = grant(extra)
+        batch = pm.schedule_next_batch(CHUNK)
+        sizes.append(sum(r.extend_len for r in batch.reqs))
+        cm.allocate_paged(batch.reqs)
+        for r in batch.reqs:
+            r.complete_one()
+    assert sizes == [2 * CHUNK, CHUNK, 30 - 3 * CHUNK] and asks == [CHUNK, 0]
+    assert not pm.runnable
+
+
 def test_multichunk_overlap_no_double_free():
     """The fix: not caching intermediate chunks keeps page accounting consistent across a
     multi-chunk prefill, and still caches the whole prompt (reusable) exactly once."""

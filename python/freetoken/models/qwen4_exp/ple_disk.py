@@ -6,6 +6,7 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -30,6 +31,7 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
+_ASYNC_ENV = "FREETOKEN_PLE_ASYNC_PREFILL"  # 0 = read a prefill's rows before its forward launches
 
 logger = init_logger(__name__)
 
@@ -208,6 +210,23 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        # Prefill rows are read on a worker thread (I/O releases the GIL): the forward launches at
+        # once and the PLE layer WAITs for the fill's sequence number; while a chunk computes, the
+        # worker reads the request's next chunk into a second buffer.
+        self._async = self._wait_sync and os.getenv(_ASYNC_ENV, "1") != "0"
+        if self._async:
+            self._io = ThreadPoolExecutor(1, thread_name_prefix="ple-io")
+            self._eager_tokens = max_extend_tokens
+            self._ahead_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
+            self._eager_seq = alloc_pinned_tensor(1, dtype=torch.int64)
+            self._eager_seq.zero_()
+            # the worker publishes through numpy: inference mode is per thread, and the model is
+            # built under it, so a torch write from the worker would be an illegal inplace update
+            self._eager_seq_np = self._eager_seq.numpy()
+            self._seq = 0  # last fill submitted
+            self._wait_seq = 0  # what the next eager lookup waits for (0: rows already staged)
+            self._cur: Future | None = None
+            self._ahead: tuple[int, int, int, Future] | None = None  # (uid, start, end, fill)
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
@@ -232,8 +251,60 @@ class DiskRowTable:
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
+    def _stage_flush(self, runs: Sequence[torch.Tensor], pinned: torch.Tensor, seq: int) -> None:
+        """Worker thread: one batched read of ``runs`` into ``pinned``, then publish ``seq``."""
+        try:
+            offset = 0
+            for run in runs:
+                self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+                offset += run.numel() - 2
+            self._store.flush(0)
+        finally:
+            if seq:
+                # also on failure: the stream must not hang; the join after the launch raises
+                self._eager_seq_np[0] = seq
+
+    def _join(self) -> None:
+        """Wait for the worker's fills (the store is single-threaded); drops an unused read-ahead."""
+        cur, self._cur = self._cur, None
+        ahead, self._ahead = self._ahead, None
+        if ahead is not None:
+            ahead[3].result()
+        if cur is not None:
+            cur.result()
+
+    def _fill_prefill_async(self, batch: Batch, runs: list[torch.Tensor]) -> None:
+        reqs = batch.padded_reqs
+        req = reqs[0] if len(reqs) == 1 else None
+        ahead, self._ahead = self._ahead, None
+        if ahead is not None:
+            ahead[3].result()
+        if (ahead is not None and req is not None and req.uid == ahead[0]
+                and req.cached_len == ahead[1] and req.device_len <= ahead[2]):
+            # read while the previous chunk computed: it becomes this chunk's staging
+            self._eager_pinned, self._ahead_pinned = self._ahead_pinned, self._eager_pinned
+            self._wait_seq = 0
+        else:
+            cur, self._cur = self._cur, None
+            if cur is not None:
+                cur.result()
+            self._seq += 1
+            self._cur = self._io.submit(self._stage_flush, runs, self._eager_pinned, self._seq)
+            self._wait_seq = self._seq
+        prompt = getattr(req, "prompt_ids", None)
+        if prompt is not None and req.device_len < len(prompt):
+            # the next chunk is this one's size (a boost lasts the whole prompt); 1024 covers rounding
+            chunk = -(-(req.device_len - req.cached_len) // 1024) * 1024
+            start = req.device_len
+            end = min(len(prompt), start + min(chunk, self._eager_tokens))
+            run = torch.cat((torch.tensor(_context(prompt, start, self.eos_token_id), dtype=torch.int64),
+                             prompt[start:end].to(torch.int64)))
+            self._ahead = (req.uid, start, end, self._io.submit(self._stage_flush, [run], self._ahead_pinned, 0))
+
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
+        if self._async:
+            self._join()
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         for run in runs:
@@ -279,8 +350,17 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
+        if self._async and not use_graph:
+            self._fill_prefill_async(batch, runs)
+            return self._finish_prefill_fill
         self.fill(runs, graph=False)
         return None
+
+    def _finish_prefill_fill(self) -> None:
+        """After the launch: surface a failed read (the forward's output is discarded)."""
+        cur, self._cur = self._cur, None
+        if cur is not None:
+            cur.result()
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
@@ -302,6 +382,13 @@ class DiskRowTable:
             _ple_store.memop_wait_reset(
                 torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
             )
+        if not capturing and self._async and self._wait_seq:
+            from freetoken.kernel import _ple_store
+
+            stream = torch.cuda.current_stream(self._device).cuda_stream
+            if _ple_store.memop_wait_geq(stream, self._eager_seq.data_ptr(), self._wait_seq) != 0:
+                self._finish_prefill_fill()  # no stream WAIT: block the host instead
+            self._wait_seq = 0
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
         )

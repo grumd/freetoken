@@ -27,6 +27,9 @@ def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
 
 
 class ChunkedReq(Req):
+    # the whole prompt, for work that runs a chunk ahead (the PLE disk read-ahead)
+    prompt_ids: torch.Tensor | None = None
+
     def _alloc_ids_buf(self) -> None:
         pass  # never sampled; keep input_ids a view of the pending prompt
 
@@ -50,6 +53,9 @@ class PrefillAdder:
     reserved_swa: int = 0
     # Gives images their soft tokens; returns an error string instead of raising.
     embed_images: Callable[[List[MMImage]], str | None] | None = None
+    # Extra tokens this batch may take when a prompt outruns the budget (elastic boost); asked
+    # at most once, after the request's admission has backed its pages.
+    grow_budget: Callable[[], int] | None = None
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -141,6 +147,9 @@ class PrefillAdder:
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
+        if self.grow_budget is not None and remain_len > self.token_budget:
+            self.token_budget += self.grow_budget()
+            self.grow_budget = None
         chunk_size = min(self.token_budget, remain_len)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
@@ -211,6 +220,8 @@ class PrefillAdder:
         req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        if is_chunked:
+            req.prompt_ids = pending_req.input_ids
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -266,6 +277,8 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     embed_images: Callable[[List[MMImage]], str | None] | None = None
+    # PrefillAdder.grow_budget for every batch (the scheduler's elastic boost), None = off
+    grow_budget: Callable[[], int] | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
     # (uid, error) of requests dropped at admission; the scheduler replies and clears it
     failed: List[Tuple[int, str]] = field(default_factory=list)
@@ -284,6 +297,7 @@ class PrefillManager:
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
             embed_images=self.embed_images,
+            grow_budget=self.grow_budget,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

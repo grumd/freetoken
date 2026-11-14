@@ -133,6 +133,10 @@ def resolve_moe_cache_auto(
     )
 
 
+# prefill activation VRAM per token of the chunk, beyond a 256 MiB base
+PREFILL_BYTES_PER_TOKEN = 230 * 1024
+
+
 def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: int) -> int:
     """VRAM kept back for prefill activations under --elastic-kv. Auto: 256 MiB + 230 KiB per
     token of the prefill chunk (--max-prefill-length). Qwen3.8-Flash-Next FP4 prefills at 261k
@@ -140,7 +144,7 @@ def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: i
     token chunks (RTX 3080, 2026-10-27), the same on one unsplit GPU as on each TP=2 rank."""
     if prefill_reserve_gb is not None:
         return int(prefill_reserve_gb * 2**30)
-    return (256 << 20) + 230 * 1024 * max_extend_tokens
+    return (256 << 20) + PREFILL_BYTES_PER_TOKEN * max_extend_tokens
 
 
 def plan_elastic_geometry(

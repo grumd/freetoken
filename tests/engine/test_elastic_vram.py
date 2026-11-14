@@ -13,7 +13,7 @@ L, E = 4, 64
 FEATS = [65536, 512, 256, 32768, 512, 256]
 
 
-def _build(cap_pages=1024, spare_mib=16):
+def _build(cap_pages=1024, spare_mib=16, boost_mib=0):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.engine.elastic import ElasticVram
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
@@ -23,7 +23,8 @@ def _build(cap_pages=1024, spare_mib=16):
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     dev = torch.device("cuda", torch.cuda.current_device())
-    el = ElasticVram(dev, min_pages=64, step_pages=32, floor_slots=E, cap_slots=L * E, cap_pages=cap_pages)
+    el = ElasticVram(dev, min_pages=64, step_pages=32, floor_slots=E, cap_slots=L * E, cap_pages=cap_pages,
+                     boost_bytes=boost_mib << 20)
     cache = OffloadMoeCache(
         num_layers=L, num_experts=E, cache_size=L * E, device=dev, prefill_overlap=False,
         quant_format="mxfp4_triton", bank_alloc=el.bank, active_slots=el.slots,
@@ -150,6 +151,88 @@ def test_lend_after_zero_never_lends():
     for _ in range(200):
         el.decode_step(prefill_pending=False)
     assert el.lent == 0
+
+
+@CUDA
+def test_a_long_prefill_borrows_expert_slots_and_hands_them_back_intact():
+    el, cache, kv = _build(spare_mib=16, boost_mib=4)
+    assert el.boost_chunks * el.pool.chunk_bytes >= 4 << 20
+    assert el.pages <= el.boost_limit_pages < el.limit_pages
+    s0, handles0 = el.slots, el.pool.num_handles
+    _decode(cache, 50, seed=8)
+    _stamp(kv, 64)
+
+    assert el.boost() and el.boosted == el.boost_chunks
+    assert el.pool.num_handles == handles0 - el.boost_chunks  # back with the driver for activations
+    assert el.slots < s0 and cache.active_slots == el.slots
+    assert el.boost() and el.pool.num_handles == handles0 - el.boost_chunks  # a no-op while boosted
+    _check_stamp(kv, 64)
+    _coherent(cache)
+    _no_leak(el)
+    # KV can grow only as far as the boost leaves room for
+    assert el.growable_pages() == el.boost_limit_pages - el.pages
+    old, new = el.grow(10_000)
+    assert new == el.boost_limit_pages and el.slots >= E
+    _decode(cache, 30, seed=9)
+    _coherent(cache)
+    _no_leak(el)
+    el.shrink(64)
+
+    el.decode_step(prefill_pending=False)  # the first decode step takes the slots back
+    assert el.boosted == 0 and el.pool.num_handles == handles0 and el.slots == s0
+    _check_stamp(kv, 64)
+    _coherent(cache)
+    _decode(cache, 30, seed=10)
+    _no_leak(el)
+
+    # with more KV backed than a boost leaves room for, a long chunk is refused
+    el.grow(el.boost_limit_pages - el.pages + 1)
+    assert el.pages > el.boost_limit_pages
+    assert not el.boost() and el.boosted == 0 and el.pool.num_handles == handles0
+
+
+@CUDA
+def test_an_unboost_short_of_vram_retries_on_one_gpu_and_fails_loudly_under_tp(monkeypatch):
+    el, cache, kv = _build(spare_mib=16, boost_mib=4)
+    assert el.boost_chunks >= 2
+    handles0, create = el.pool.num_handles, el.pool.create
+    made = []
+
+    def flaky(n):
+        if made:
+            raise RuntimeError("CUDA driver VMM call failed: out of memory")
+        made.append(n)
+        create(n)
+
+    assert el.boost()
+    monkeypatch.setattr(el.pool, "create", flaky)
+    el.unboost()  # one GPU: what came back is kept, the rest is retried, KV stays capped meanwhile
+    assert el.boosted == el.boost_chunks - 1 and el.growable_pages() == el.boost_limit_pages - el.pages
+    _no_leak(el)
+    monkeypatch.setattr(el.pool, "create", create)
+    el.unboost()
+    assert el.boosted == 0 and el.pool.num_handles == handles0
+    _coherent(cache)
+    _no_leak(el)
+
+    # TP: the ranks vote, so they leave boost together or the server stops (never diverges)
+    votes = []
+
+    def all_reduce(t, op=None, group=None):
+        votes.append(int(t[0]))
+        t.fill_(min(votes[-1], peer_ok))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(el, "_tp_group", object())
+    peer_ok = 1
+    assert el.boost()
+    el.unboost()
+    assert votes == [1] and el.boosted == 0 and el.pool.num_handles == handles0
+    peer_ok = 0  # this rank got its chunks back, another did not
+    assert el.boost()
+    with pytest.raises(RuntimeError, match="a TP rank could not take"):
+        el.unboost()
+    assert votes == [1, 1]
 
 
 @CUDA

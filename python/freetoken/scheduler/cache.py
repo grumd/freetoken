@@ -759,6 +759,7 @@ class CacheManager:
         if self.elastic is None:
             return
         # between turns: the reclaim stays off the next prompt's time to first token
+        self.elastic.unboost()
         self.elastic.reclaim()
         parked = self.prefix_cache.spilled_tokens if self.host_pool is not None else 0
         self._evict_cold()

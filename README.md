@@ -17,7 +17,7 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 | 16 GB | **8192** | 51 tok/s | **1,530 tok/s** | 147k |
 | 16 GB | 4096 | 52 tok/s | 800 tok/s | 186k |
 | 16 GB | 2048 | 52 tok/s | 900 tok/s | **205k** |
-| 20 GB | **8192** | 56 tok/s | **1,610 tok/s** | **262k** |
+| 20 GB | **16384** (8192 reserve) | 56 tok/s | **2,580 tok/s** | **262k** |
 | 20 GB | 4096 | 57 tok/s | 850 tok/s | 262k |
 
 ### **Two GPUs at PCIe 4.0 x8**
@@ -25,9 +25,10 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 | GPU | Prefill batch | Decode | 16k prefill | Max context (F16) |
 |---|---|---|---|---|
 | 2x 16 GB | 8192 | 82 tok/s | 2,760 tok/s | 262k |
-| 2x 20 GB | 8192 | 93 tok/s | 3,030 tok/s | 262k |
+| 2x 20 GB | 16384 (8192 reserve) | 93 tok/s | 3,270 tok/s | 262k |
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
+- **16384 prefill batch:** the 20 GB rows were re-measured with `serve.sh`'s 16384-token chunks, whose standing reserve covers 8192-token chunks and borrows the rest from the expert cache per prompt, so the context limit stays the same. 16k prefill there is the time to first token of the first uncached 16k-token prompt after start (later ones, with a warm expert cache: 2,780 and 3,450 tok/s); the same measurement gave 1,320 and 2,050 tok/s with 8192-token chunks before. The 16 GB rows were not re-measured.
 - **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
 - **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`), against about 25 without CPU help.
 - **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.

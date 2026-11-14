@@ -1019,6 +1019,18 @@ def parse_args(
             "(default: auto from the prefill chunk size)."
         ),
     )
+    parser.add_argument(
+        "--prefill-reserve-tokens",
+        type=int,
+        default=ServerArgs.prefill_reserve_tokens,
+        help=(
+            "With --elastic-kv: size the standing prefill reserve for chunks of this many tokens "
+            "(0 = --max-prefill-length). Longer chunks, up to --max-prefill-length, borrow the "
+            "extra activation VRAM from the expert cache for one prompt while the KV cache "
+            "leaves room for it; near the context limit, or with an explicit "
+            "--prefill-reserve-gb, they stay at this size."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",
@@ -1243,6 +1255,10 @@ def parse_args(
             parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
         if kwargs["elastic_lend_after"] < 0:
             parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
+    if kwargs["prefill_reserve_tokens"] < 0:
+        parser.error("--prefill-reserve-tokens must be >= 0")
+    if kwargs["prefill_reserve_tokens"] and not kwargs["elastic_kv"]:
+        parser.error("--prefill-reserve-tokens needs --elastic-kv")
 
     # --memory-ratio takes a single float or a per-GPU list; a list is the same
     # override set as --gpu-memory-ratio (combining both is ambiguous).

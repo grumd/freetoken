@@ -42,6 +42,26 @@ def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     assert rel.item() < 2e-2, rel.item()
 
 
+@pytest.mark.skipif(torch.cuda.get_device_capability() != (8, 6), reason="kernel picks verified on sm_86 only")
+@pytest.mark.parametrize("M", [1024, 7811, 16384])
+@pytest.mark.parametrize("N", [16384, 13312])
+def test_aligned_row_slices_are_bit_identical_to_the_odd_width_ones(M: int, N: int):
+    """K=2560 slices the weight at 13107 rows; over _PAD_SLICE_M the first slice runs 8-aligned
+    (the GDN in_proj / QSA qkv shapes), which must not change a single output bit."""
+    from freetoken.kernel.triton import mxfp8_linear as ml
+
+    K = 2560
+    w8, codes = _make_mxfp8(N, K, seed=N + M)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
+    rows = ml._DEQUANT_ELEMS // K
+    ref = torch.cat([
+        torch.nn.functional.linear(x, ml.mxfp8_dequant(w8[n0 : n0 + rows], codes[n0 : n0 + rows], torch.bfloat16))
+        for n0 in range(0, N, rows)
+    ], dim=1)
+    assert ml._PAD_SLICE_M[0] <= M <= ml._PAD_SLICE_M[1]
+    assert torch.equal(ml.mxfp8_linear(x, w8, codes), ref)
+
+
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     """Triton fallback vs the (1+w) definition; per-head 3D strided in-place."""
     from freetoken.kernel.triton.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
