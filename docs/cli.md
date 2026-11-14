@@ -152,6 +152,10 @@ With `--elastic-kv`, KV pages and MoE expert slots share one pool of VRAM at run
 | `--[no-]mtp-head-fp8` | on | Quantize the bf16 MTP draft head to fp8 per row at load |
 | `--dspark-verify` | decode | DeepSeek-V4.1 DSpark verify path: `decode` aligns the attention reduction with plain decode; `prefill` keeps the ascending-window extend. Inert without the DSpark draft head |
 | `--dspark-k` | draft block size | DSpark draft chain length |
+| `--[no-]ngram-spec` | off | Prompt-lookup speculative decoding without a draft head: verify the continuation of an earlier repeat of the request's context (code edits, quoted input, tool-call JSON) where the measured round cost and acceptance say it pays. Lossless: every emitted token is the target's argmax (greedy) or a sample of the target distribution, computed by the verify window (not bit-identical to plain decode). Verify CUDA graphs per window width cost ~240 MB of VRAM (`FREETOKEN_NGRAM_SPEC_GRAPH=0` runs them eager) |
+| `--ngram-spec-max-draft` | 7 | Longest `--ngram-spec` draft (the verify window is one token longer) |
+| `--ngram-spec-min-match` | 3 | Shortest context repeat, in tokens, a draft is taken from |
+| `--ngram-spec-policy` | adaptive | `adaptive`: draft only where the expected tokens per ms beat a plain decode step; `always`: verify every proposal; `fixed` / `fixed-null`: a full-width window every step, lookup drafts / padding only (diagnostics) |
 
 ### DeepSeek-V4.1 — Engram & SWA
 

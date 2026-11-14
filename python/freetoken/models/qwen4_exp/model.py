@@ -165,7 +165,14 @@ class Qwen4ExpModel(BaseOP):
                 hidden, rn = layer.forward(hidden, batch, rn), None
             else:
                 hidden, rn = layer.forward(hidden, batch, rn, next_norm)
-        if meta is not None:
+        if meta is not None and getattr(batch, "mtp_verify", False):
+            from .ple import stash_verify_ngram_context
+
+            # speculative verify: the context moves only over the accepted prefix (commit_mtp_verify)
+            bufs = self.__dict__.setdefault("_verify_ctx_bufs", {})
+            t = meta.seq_lens[0]
+            bufs[t] = self._verify_ctx = stash_verify_ngram_context(meta, bufs.get(t))
+        elif meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
@@ -286,6 +293,39 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward_all(self.model.forward(batch.input_ids, batch))
 
+    def select_verify_width(self, t: int) -> None:
+        """After a captured verify of width ``t`` (no Python ran): point the commit at that
+        width's buffers, as an eager verify forward does."""
+        for layer in self.model.layers.op_list:
+            mixer = getattr(layer, "linear_attn", None)
+            bufs = getattr(mixer, "_mtp_verify_by_t", None) if mixer is not None else None
+            if bufs and t in bufs:
+                mixer._mtp_verify = bufs[t]
+        for ple in self.model.ple_layers:
+            if t in ple._verify_hist:
+                ple._verify_last = ple._verify_hist[t]
+        bufs = getattr(self.model, "_verify_ctx_bufs", None)
+        if bufs and t in bufs:
+            self.model._verify_ctx = bufs[t]
+
+    def verify_graph_host_fill(self, batch) -> None:
+        """Before a captured verify replays: stage its PLE rows from disk into the graph buffers
+        (the graph WAITs on the fill's flag; the eager path does this in forward_host_ctx)."""
+        table = getattr(self, "_ple_table", None)
+        if table is None or not hasattr(table, "fill"):
+            return
+        from .ple_disk import _context
+
+        eos = table.eos_token_id
+        runs = [
+            torch.cat((
+                torch.tensor(_context(r.input_ids, r.cached_len, eos), dtype=torch.int64),
+                r.input_ids[r.cached_len : r.device_len].to(torch.int64),
+            ))
+            for r in batch.padded_reqs
+        ]
+        table.fill(runs, graph=True)
+
     def commit_mtp_verify(self, pool, slots, lens) -> None:
         """Commit the accepted MTP-verify prefix into every GDN layer's live state.
         ``slots`` [n] int32 live GDN slots, ``lens`` [n] int32 accepted tokens per request
@@ -294,6 +334,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             mixer = getattr(layer, "linear_attn", None)
             if mixer is not None:
                 mixer.commit_verify(pool, slots, lens)
+        # the PLE conv history and n-gram context ride the same slots; the verify left them as well
+        for ple in self.model.ple_layers:
+            ple.commit_verify(pool, slots, lens)
+        window = getattr(self.model, "_verify_ctx", None)
+        if window is not None:
+            from .ple import commit_verify_ngram_context
+
+            commit_verify_ngram_context(window, slots, lens)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

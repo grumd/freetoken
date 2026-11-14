@@ -213,6 +213,9 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(
+                spec.index_ratio, QSAKVCache.speculative_depth(model_config)
+            ),
             layer_ids=spec.layer_ids,
         )
 

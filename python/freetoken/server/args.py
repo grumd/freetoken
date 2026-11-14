@@ -68,6 +68,7 @@ _ENV_FLAG_BOOL = {
     "mtp_chain": "FREETOKEN_MTP_CHAIN",
     "mtp_head_fp8": "FREETOKEN_MTP_HEAD_FP8",
     "dense_fp8": "FREETOKEN_DENSE_FP8",
+    "ngram_spec": "FREETOKEN_NGRAM_SPEC",
 }
 _ENV_FLAG_VALUE = {
     "mtp_draft_tokens": "FREETOKEN_MTP_DRAFT_TOKENS",
@@ -94,6 +95,9 @@ _ENV_FLAG_VALUE = {
     "moe_cpu_decode_act": "FREETOKEN_CPU_DECODE_ACT",
     "moe_cpu_decode_threads": "FREETOKEN_CPU_DECODE_THREADS",
     "dense_mxfp8_groups": "FREETOKEN_DENSE_MXFP8_GROUPS",
+    "ngram_spec_max_draft": "FREETOKEN_NGRAM_SPEC_MAX_DRAFT",
+    "ngram_spec_min_match": "FREETOKEN_NGRAM_SPEC_MIN_MATCH",
+    "ngram_spec_policy": "FREETOKEN_NGRAM_SPEC_POLICY",
 }
 
 
@@ -759,6 +763,21 @@ def parse_args(
                         help="Override the MTP draft chain with a self-history n-gram match when it repeats.")
     parser.add_argument("--mtp-ngram-size", type=int, default=None, dest="mtp_ngram_size",
                         help="n-gram history length for --mtp-ngram (default 3).")
+    parser.add_argument("--ngram-spec", action=argparse.BooleanOptionalAction, default=None,
+                        dest="ngram_spec",
+                        help="Prompt-lookup speculative decoding without a draft head: verify the "
+                             "continuation of an earlier repeat of the context where the cost "
+                             "policy expects a gain (default off).")
+    parser.add_argument("--ngram-spec-max-draft", type=int, default=None, dest="ngram_spec_max_draft",
+                        help="Longest --ngram-spec draft; the verify window is one token longer (default 7).")
+    parser.add_argument("--ngram-spec-min-match", type=int, default=None, dest="ngram_spec_min_match",
+                        help="Shortest context repeat --ngram-spec drafts from, in tokens (default 3).")
+    parser.add_argument("--ngram-spec-policy", choices=["adaptive", "always", "fixed", "fixed-null"], default=None,
+                        dest="ngram_spec_policy",
+                        help="adaptive (default): draft where the measured round costs and the "
+                             "acceptance say it pays; always: verify every proposal; fixed / "
+                             "fixed-null: every step a full-width round, drafts padded (exactness "
+                             "diagnostics).")
     parser.add_argument("--dspark-k", type=int, default=None, dest="dspark_k",
                         help="DSpark draft chain length k (default: the draft block size).")
     parser.add_argument("--mamba-ssm-dtype", choices=["float32", "bfloat16", "float16"], default=None,

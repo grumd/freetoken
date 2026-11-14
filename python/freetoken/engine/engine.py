@@ -731,6 +731,42 @@ class Engine:
             logger.info_rank0(
                 f"MTP commit CUDA graphs captured: bs={self.verify_graph_runner.bs_list}"
             )
+        # --ngram-spec verify CUDA graphs, one per window width: eager rounds cost ~40 ms more
+        # (FREETOKEN_NGRAM_SPEC_GRAPH=0 turns them off, ~240 MB of VRAM back to the expert cache)
+        self.ngram_verify_graphs = None
+        from freetoken.engine.verify_graph import ngram_spec_unsupported, verify_store_attr
+        from freetoken.env import ENV as _ENV
+
+        if (
+            _ENV.NGRAM_SPEC
+            and os.environ.get("FREETOKEN_NGRAM_SPEC_GRAPH", "1") == "1"
+            and _decode_bs
+            and hasattr(self.attn_backend, "init_capture_verify")
+            and verify_store_attr(self.attn_backend) is not None
+            and ngram_spec_unsupported(self.model, self.linear_state_pool) is None
+        ):
+            from freetoken.engine.verify_graph import MultiWidthVerifyGraphs
+
+            _widths = list(range(2, _ngram_spec_depth() + 2))
+            _max_req = max(1, config.max_running_req)
+            _bs_list = sorted({b for b in _decode_bs if b <= _max_req} | {_max_req})
+            self.ngram_verify_graphs = MultiWidthVerifyGraphs(
+                _widths,
+                pool=self.linear_state_pool,
+                graph_runner=self.graph_runner,
+                model=self.model,
+                attn_backend=self.attn_backend,
+                moe_offload_cache=self.moe_offload_cache,
+                bs_list=_bs_list,
+                vocab_size=config.model_config.vocab_size,
+                device=self.device,
+                padding_slot=(
+                    self.linear_state_pool.padding_slot
+                    if self.linear_state_pool is not None
+                    else 0
+                ),
+            )
+            logger.info_rank0(f"n-gram verify CUDA graphs captured: widths {_widths}, bs={_bs_list}")
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -1239,7 +1275,8 @@ class Engine:
             activation=sample.activation,
             apply_router_weight_on_input=False,
             num_threads=len(cpus),
-            max_tokens=max(config.max_running_req, 1),
+            # an --ngram-spec verify window computes its CPU routes in the same task
+            max_tokens=max(config.max_running_req, 1) * (1 + _ngram_spec_depth()),
             device=self.device,
             fmt=fmt,
             cpus=cpus,
@@ -1883,6 +1920,12 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
                 "(larger decode batches never occur)."
             )
             override("cuda_graph_bs", kept)
+
+
+def _ngram_spec_depth() -> int:
+    from freetoken.env import ENV
+
+    return max(int(ENV.NGRAM_SPEC_MAX_DRAFT.value), 0) if ENV.NGRAM_SPEC else 0
 
 
 def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:

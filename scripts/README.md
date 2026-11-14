@@ -61,6 +61,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--moe-prefill-hit-d2d` | longer chunks copy VRAM-cached experts device-side and stream only the misses (pp16384 -14%, output identical) |
 | `--vision-on-cpu --vision-threads 8` | the ViT would take 0.84 GiB of VRAM on every GPU; 16 threads encode a full-size image in 3.5 s, 4 in 6.8 s |
 | `--mtp off` | MTP is 10-24% slower decode here in every config |
+| `--ngram-spec` | Prompt-lookup drafts verified in one window, no draft model. FP4, a code edit that copies a 351-line file back: one RTX 3080 52.5 -> 84.6 tok/s, two 81.9 -> 126.7. Prose +2% on one GPU, -2% on two (its verify graphs take ~170 expert slots per GPU); agent turns even. Lossless (verified tokens only); `--no-ngram-spec` turns it off. Not measured with parallel requests yet |
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
 | `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
 

@@ -370,6 +370,30 @@ def build_ple_metadata(
     )
 
 
+def stash_verify_ngram_context(meta: PLEMetadata, out: torch.Tensor | None) -> torch.Tensor:
+    """Speculative verify: ``[context | the window's tokens]`` per request ``[n, ctx + t]``, from which
+    :func:`commit_verify_ngram_context` takes the context after the accepted prefix. The live
+    context is left alone (the verify must not roll it past rejected drafts)."""
+    n, t = len(meta.seq_lens), meta.seq_lens[0]
+    ctx_len = meta.ngram_context.shape[1]
+    if out is None or out.shape[0] < n or out.shape[1] != ctx_len + t:
+        out = meta.ngram_context.new_empty(n, ctx_len + t)
+    out[:n, :ctx_len].copy_(meta.ngram_context)
+    out[:n, ctx_len:].copy_(meta.input_ids.long().view(n, t))
+    return out
+
+
+def commit_verify_ngram_context(
+    window: torch.Tensor, slots: torch.Tensor, lens: torch.Tensor, context_pool: torch.Tensor | None = None
+) -> None:
+    """The context after ``lens`` accepted tokens: columns ``[L, L + ctx)`` of ``[context | tokens]``."""
+    if context_pool is None:
+        context_pool = _ngram_context_pool()
+    n, ctx_len = slots.shape[0], context_pool.shape[-1]
+    cols = lens.long().view(n, 1) + torch.arange(ctx_len, device=lens.device).view(1, -1)
+    context_pool.index_copy_(0, slots.long(), window[:n].gather(1, cols).to(context_pool.dtype))
+
+
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
@@ -571,6 +595,10 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        # speculative verify: per window width, [n, width, state_len + t] = [state | conv inputs]
+        # of the last verify forward, read by commit_verify (persistent: graphs capture them)
+        self._verify_hist: dict[int, torch.Tensor] = {}
+        self._verify_last: torch.Tensor | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -610,9 +638,51 @@ class PLELayer(BaseOP):
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
         fla = getattr(batch, "fla_metadata", None)
+        if getattr(batch, "mtp_verify", False):
+            return gated + self._verify_conv(x, meta, states)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         return gated + self._short_conv(x, meta, states)
+
+    def _verify_conv(self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor) -> torch.Tensor:
+        """Speculative verify over ``n`` requests x ``t`` tokens: each token runs the decode tap read
+        (same shapes, same bits as a decode step), the live state stays untouched and
+        ``[state | inputs]`` is kept for :meth:`commit_verify`, which advances the state over the
+        accepted prefix only."""
+        n, t = len(meta.seq_lens), meta.seq_lens[0]
+        assert all(s == t for s in meta.seq_lens), "a verify window is uniform"
+        width, state_len = x.shape[1], self.state_len
+        full = self._verify_hist.get(t)
+        if full is None or full.shape[0] < n:
+            full = x.new_empty(n, width, state_len + t)
+            self._verify_hist[t] = full
+        # the whole buffer, not a row view: a captured verify replays at other batch sizes without
+        # running this, and commit_verify takes its own [:n]
+        self._verify_last = full
+        hist = full[:n]
+        hist[:, :, :state_len].copy_(self._read_state(meta, states, x.dtype))
+        hist[:, :, state_len:].copy_(x.view(n, t, width).transpose(1, 2))
+        weight = self.conv1d.weight.squeeze(1).float()
+        outs = []
+        for j in range(t):
+            window = hist[:, :, j : j + state_len + 1 : self.dilation].float()
+            outs.append(F.silu((window * weight).sum(-1).to(x.dtype)))
+        return torch.stack(outs, dim=1).view(n * t, width)
+
+    def commit_verify(self, pool, slots: torch.Tensor, lens: torch.Tensor) -> None:
+        """Advance the conv history of ``slots`` over each request's accepted prefix ``lens``
+        (device int32) of the last verify: the ``state_len`` inputs ending at the last accepted
+        token, columns ``[L, L + state_len)`` of ``[state | inputs]``."""
+        hist = self._verify_last
+        if hist is None:
+            return
+        n = slots.shape[0]
+        hist = hist[:n]
+        cols = lens.long().view(n, 1, 1) + torch.arange(self.state_len, device=lens.device).view(1, 1, -1)
+        states = pool.slot_state(PLE_CONV_STATE, self.layer_id)
+        states.index_copy_(
+            0, slots.long(), hist.gather(2, cols.expand(n, hist.shape[1], self.state_len)).to(states.dtype)
+        )
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -720,6 +790,8 @@ __all__ = [
     "PLETableBackend",
     "PinnedUVATable",
     "build_ple_metadata",
+    "commit_verify_ngram_context",
     "derive_ngram_hash_constants",
     "short_conv_reference",
+    "stash_verify_ngram_context",
 ]

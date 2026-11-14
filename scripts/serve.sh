@@ -41,6 +41,9 @@ args=(
   # the ViT would otherwise take 0.84 GiB of VRAM on every GPU
   --vision-on-cpu --vision-threads 8
   --mtp off
+  # prompt-lookup drafts (no draft model): code edits that copy existing text +55-61% decode,
+  # prose and agent turns about even; the cost policy drafts only where a round pays
+  --ngram-spec
   --enable-cache-report
 )
 [ "$PREFIX_CACHE_RAM_GB" != 0 ] && args+=(--cache-ram-gb "$PREFIX_CACHE_RAM_GB")

@@ -40,13 +40,15 @@ class GDNVerifyBuffers:
 
 
 def ensure_verify_buffers(layer, n: int, t: int, dtype, device, km1: int) -> GDNVerifyBuffers:
-    buf = layer._mtp_verify
-    if buf is not None and buf.n >= n and buf.t == t:
-        return buf
-    assert buf is None or buf.t == t, f"MTP verify width changed ({buf.t} -> {t})"
-    buf = GDNVerifyBuffers(
-        max(n, 1), t, layer.local_conv_dim, km1, layer.local_v_heads, dtype, device
-    )
+    """The buffers for a verify of width ``t`` (one set per width: n-gram windows vary, and a
+    captured graph keeps the addresses of its width's set); the commit reads the last one used."""
+    by_width = layer.__dict__.setdefault("_mtp_verify_by_t", {})
+    buf = by_width.get(t)
+    if buf is None or buf.n < n:
+        buf = GDNVerifyBuffers(
+            max(n, 1), t, layer.local_conv_dim, km1, layer.local_v_heads, dtype, device
+        )
+        by_width[t] = buf
     layer._mtp_verify = buf
     return buf
 

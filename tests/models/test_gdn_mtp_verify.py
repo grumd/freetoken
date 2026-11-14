@@ -94,3 +94,31 @@ def test_verify_and_commit_match_decode(lens):
     untouched = [j for j in range(8) if j not in (5, 1, 6)]
     assert torch.equal(pool.conv_states[0, untouched], conv0[0, untouched])
     assert torch.equal(pool.recurrent_states[0, untouched], rec0[0, untouched])
+
+
+def test_windows_of_changing_width_commit_like_decode():
+    """--ngram-spec windows change width round to round: each width keeps its own buffers and a
+    chain of rounds (verify + commit of a prefix) leaves the state of the same tokens decoded one
+    at a time."""
+    from freetoken.models.qwen3_5_moe.gdn_verify import gdn_verify_commit, gdn_verify_forward
+
+    torch.manual_seed(1)
+    layer = _layer()
+    conv0 = torch.randn(1, 4, layer.local_conv_dim, _KM1, dtype=torch.bfloat16, device="cuda")
+    rec0 = torch.randn(1, 4, layer.local_v_heads, layer.head_k_dim, layer.head_v_dim, device="cuda") * 0.1
+    pool = _pool(conv0.clone(), rec0.clone())
+    ref = _pool(conv0.clone(), rec0.clone())
+    slots = torch.tensor([2], dtype=torch.int32, device="cuda")
+    for t, accepted in [(8, 3), (2, 2), (5, 1), (8, 8), (3, 2)]:
+        conv_in = torch.randn(1, t, layer.local_conv_dim, dtype=torch.bfloat16, device="cuda")
+        a = torch.randn(1, t, layer.local_v_heads, dtype=torch.bfloat16, device="cuda")
+        b = torch.randn(1, t, layer.local_v_heads, dtype=torch.bfloat16, device="cuda")
+        out = gdn_verify_forward(
+            layer, conv_in.reshape(t, -1), a.reshape(t, -1), b.reshape(t, -1), pool, slots, 1, t,
+            torch.bfloat16,
+        )
+        gdn_verify_commit(layer, pool, slots, torch.tensor([accepted], dtype=torch.int32, device="cuda"))
+        ref_out = _decode_steps(layer, ref, conv_in[:, :accepted], a[:, :accepted], b[:, :accepted], slots, accepted)
+        assert torch.equal(out.reshape(1, t, -1)[:, :accepted], ref_out), f"t={t}"
+        assert torch.equal(pool.conv_states, ref.conv_states), f"conv t={t}"
+        assert torch.equal(pool.recurrent_states, ref.recurrent_states), f"ssm t={t}"

@@ -198,4 +198,78 @@ class VerifyGraphRunner:
         return self.logits[:real], (streams[:real] if streams is not None else None)
 
 
-__all__ = ["VerifyGraphRunner"]
+def ngram_spec_unsupported(model, linear_state_pool) -> str | None:
+    """Why ``--ngram-spec`` cannot run on ``model`` (None: it can). A round scores every window
+    position, keeps per-width verify buffers and commits the accepted prefix into the recurrent
+    state; only qwen4-exp implements all three."""
+    if getattr(model, "mtp", None) is not None:
+        return "the model's MTP head drafts instead"
+    if not callable(getattr(model, "forward_logits_all", None)):
+        return "the model has no all-position logits"
+    if not callable(getattr(model, "select_verify_width", None)):
+        return "the model has no per-width verify buffers"
+    if linear_state_pool is not None and not callable(getattr(model, "commit_mtp_verify", None)):
+        return "the model has no speculative-verify commit"
+    return None
+
+
+def verify_store_attr(attn) -> str | None:
+    """The attribute holding the attention backend's captured verify geometry, if any."""
+    for name in ("_graph_verify", "_verify_graph"):  # QSA, FlashInfer
+        if hasattr(attn, name):
+            return name
+    return None
+
+
+class MultiWidthVerifyGraphs:
+    """``--ngram-spec`` verify graphs: one ``VerifyGraphRunner`` per window width (lookup drafts
+    vary in length). The attention backend keeps one verify store at a time, so each width's store
+    is set back before its replay."""
+
+    def __init__(self, widths: List[int], pool=None, **kwargs) -> None:
+        from freetoken.engine.commit_graph import CommitGraphRunner
+
+        self.attn = kwargs["attn_backend"]
+        self.model = kwargs["model"]
+        self.store_attr = verify_store_attr(self.attn)
+        assert self.store_attr is not None, "the attention backend keeps no verify store"
+        self.runners: Dict[int, VerifyGraphRunner] = {}
+        self.stores: Dict[int, dict] = {}
+        self.commits: Dict[int, CommitGraphRunner] = {}
+        for t in sorted(widths, reverse=True):
+            runner = self.runners[t] = VerifyGraphRunner(t=t, **kwargs)
+            self.stores[t] = getattr(self.attn, self.store_attr)
+            if pool is not None and getattr(self.model, "select_verify_width", None) is not None:
+                # the accepted-prefix commit of this width, reading this width's verify buffers
+                self.model.select_verify_width(t)
+                self.commits[t] = CommitGraphRunner(
+                    model=self.model, pool=pool, bs_list=runner.bs_list, t=t,
+                    device=kwargs["device"], stream=kwargs["graph_runner"].stream,
+                )
+
+    def commit(self, slots: List[int], lens: List[int], t: int) -> bool:
+        """Replay width ``t``'s commit graph; False when there is none (commit eagerly)."""
+        runner = self.commits.get(t)
+        if runner is None or not runner.can_use(len(slots)):
+            return False
+        runner.replay(slots, lens)
+        return True
+
+    def can_use(self, n: int, t: int) -> bool:
+        runner = self.runners.get(t)
+        return runner is not None and runner.can_use(n)
+
+    @torch.inference_mode()
+    def replay(self, batch: Batch, t: int):
+        setattr(self.attn, self.store_attr, self.stores[t])
+        fill = getattr(self.model, "verify_graph_host_fill", None)
+        if fill is not None:
+            fill(batch)
+        out = self.runners[t].replay(batch)
+        select = getattr(self.model, "select_verify_width", None)
+        if select is not None:
+            select(t)
+        return out
+
+
+__all__ = ["MultiWidthVerifyGraphs", "VerifyGraphRunner", "ngram_spec_unsupported", "verify_store_attr"]

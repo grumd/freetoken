@@ -356,12 +356,14 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             run_first()
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        batch = get_global_ctx().batch
+        # a speculative verify window is a few decode tokens: same CPU-assisted split
         if (cache.cpu_decode is not None and hidden_states.size(0) <= cache.cpu_decode.max_tokens
-                and (_CPU_DECODE_PREFILL or not get_global_ctx().batch.is_prefill)
+                and (_CPU_DECODE_PREFILL or not batch.is_prefill or getattr(batch, "mtp_verify", False))
                 and not cache.is_unpinned_layer(self.layer_id)):
             return self._decode_cpu_split(cache, hidden_states, topk_weights, topk_ids, during_copy)
         if (cache.cpu_prefill is not None and hidden_states.size(0) <= cache.cpu_prefill.max_tokens
-                and get_global_ctx().batch.is_prefill):
+                and batch.is_prefill and not getattr(batch, "mtp_verify", False)):
             run_first()
             return self._prefill_cpu_hybrid(cache, hidden_states, topk_weights, topk_ids)
         # Only a knob-extended prefill chunk gets here at this size; a big decode batch

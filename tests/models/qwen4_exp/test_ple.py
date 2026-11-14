@@ -695,3 +695,84 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+# --------------------------------------------------------------------------------------
+# speculative verify (--ngram-spec / MTP): decode-exact window, commit of the accepted prefix
+# --------------------------------------------------------------------------------------
+
+
+_DEVICES = [("cpu", torch.float32)] + ([("cuda", torch.bfloat16)] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("device,dtype", _DEVICES)
+@pytest.mark.parametrize("accepted", [1, 2, 5, 6])
+def test_verify_window_matches_decode_and_commits_the_accepted_prefix(accepted, device, dtype):
+    """Each verify row equals a decode step bit for bit, the live state stays untouched, and the
+    commit leaves exactly the state ``accepted`` decode steps would have."""
+    torch.manual_seed(21)
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device=device, dtype=dtype)
+    t = 6
+    tokens = [3, 4, 5, 6, 8, 9]
+    x = torch.randn(t, args.ple_state_width, device=device, dtype=dtype)
+    states = (torch.randn(1, args.ple_state_width, args.ple_conv_state_len, device=device) * 0.1).to(dtype)
+
+    step_states = states.clone()
+    steps = []
+    for j in range(t):
+        meta = _meta([[tokens[j]]], [[1, 2]], decode=True, device=device)
+        steps.append(layer._short_conv(x[j : j + 1], meta, step_states))
+        if j + 1 == accepted:
+            after = step_states.clone()
+
+    verify_states = states.clone()
+    meta = _meta([tokens], [[1, 2]], device=device)
+    got = layer._verify_conv(x, meta, verify_states)
+    assert torch.equal(got, torch.cat(steps))
+    assert torch.equal(verify_states, states)
+    pool = SimpleNamespace(slot_state=lambda name, layer_id: verify_states)
+    one = lambda v: torch.tensor([v], dtype=torch.int32, device=device)
+    layer.commit_verify(pool, one(0), one(accepted))
+    assert torch.equal(verify_states, after)
+
+
+def test_verify_ngram_context_commits_the_accepted_prefix():
+    from freetoken.models.qwen4_exp.ple import commit_verify_ngram_context, stash_verify_ngram_context
+
+    ctxp = torch.tensor([[7, 7], [41, 42], [7, 7]], dtype=torch.int32)
+    meta = _meta([[10, 11, 12, 13], [20, 21, 22, 23]], [[41, 42], [51, 52]], slots=[1, 2])
+    window = stash_verify_ngram_context(meta, None)
+    assert ctxp.tolist() == [[7, 7], [41, 42], [7, 7]]
+    commit_verify_ngram_context(window, torch.tensor([1, 2]), torch.tensor([1, 3]), ctxp)
+    assert ctxp[1].tolist() == [42, 10] and ctxp[2].tolist() == [21, 22]
+
+
+@pytest.mark.parametrize("device,dtype", _DEVICES)
+def test_verify_commit_after_a_smaller_capture_reads_every_row(device, dtype):
+    """Verify graphs are captured largest batch first and replay without running Python: the
+    commit must read the whole persistent buffer, not the row view of the last (smallest) capture."""
+    torch.manual_seed(5)
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device=device, dtype=dtype)
+    t, width, slen = 3, args.ple_state_width, args.ple_conv_state_len
+    tokens = [[3, 4, 5], [6, 8, 9]]
+    x = torch.randn(2 * t, width, device=device, dtype=dtype)
+    states = (torch.randn(2, width, slen, device=device) * 0.1).to(dtype)
+    pool = SimpleNamespace(slot_state=lambda name, layer_id: states)
+    lens = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+    expect = states.clone()
+    layer._verify_conv(x, _meta(tokens, [[1, 2], [1, 2]], device=device), expect)
+    layer.commit_verify(SimpleNamespace(slot_state=lambda name, layer_id: expect), slots, lens)
+
+    layer._verify_conv(x, _meta(tokens, [[1, 2], [1, 2]], device=device), states)  # capture bs 2
+    layer._verify_conv(x[:t], _meta(tokens[:1], [[1, 2]], device=device), states)  # capture bs 1
+    after_capture = layer._verify_last
+    layer._verify_conv(x, _meta(tokens, [[1, 2], [1, 2]], device=device), states)  # replay bs 2
+    layer._verify_last = after_capture  # ... which runs no Python
+    layer.commit_verify(pool, slots, lens)
+    assert torch.equal(states, expect)

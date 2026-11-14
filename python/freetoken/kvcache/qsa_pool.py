@@ -43,6 +43,18 @@ class QSAKVCache(MHAKVCache):
     layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
     """
 
+    @staticmethod
+    def speculative_depth(model_config) -> int:
+        """Draft tokens a speculative verify may hold beyond the pending one (MTP chain or
+        --ngram-spec window). The ring must keep every pending group member a rejected draft
+        row could alias, so it widens by this depth."""
+        from freetoken.env import ENV
+
+        depth = int(ENV.NGRAM_SPEC_MAX_DRAFT.value) if ENV.NGRAM_SPEC else 0
+        if getattr(getattr(model_config, "qwen4_args", None), "mtp_enabled", False):
+            depth = max(depth, int(ENV.MTP_DRAFT_TOKENS.value))
+        return max(depth, 0)
+
     @classmethod
     def ring_capacity_for(cls, index_ratio: int, num_speculative_tokens: int = 0) -> int:
         """Ring depth: one row per pending position, keyed ``position % capacity``; spec decode widens by the draft depth (vLLM sizing)."""
@@ -172,7 +184,8 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                ring = cls.ring_capacity_for(spec.index_ratio, cls.speculative_depth(config.model_config))
+                fixed += num_req_slots * row * (ring + 1)
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:

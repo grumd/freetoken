@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, List
+from typing import TYPE_CHECKING, Callable, Final, List, Sequence, Tuple
 
 import torch
 from freetoken.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg
@@ -10,6 +10,25 @@ if TYPE_CHECKING:
     from .config import SchedulerConfig
 
 logger = init_logger(__name__)
+
+
+def broadcast_count(
+    group, count: int | None, extra: Sequence[float] | None = None, extra_len: int = 0
+) -> Tuple[int, List[float] | None]:
+    """Rank 0 sends ``count`` (and ``extra_len`` floats of ``extra``), the other ranks pass
+    ``None``; every rank gets both back. One broadcast: the extra values ride the message count
+    the ranks exchange every iteration anyway."""
+    if not extra_len:
+        t = torch.tensor(-1 if count is None else count)
+        group.broadcast(t, root=0).wait()
+        return int(t.item()), None
+    if count is None:
+        t = torch.full((1 + extra_len,), -1.0, dtype=torch.float64)
+    else:
+        assert extra is not None and len(extra) == extra_len, "rank 0 must send every extra value"
+        t = torch.tensor([float(count), *extra], dtype=torch.float64)
+    group.broadcast(t, root=0).wait()
+    return int(t[0].item()), t[1:].tolist()
 
 
 class SchedulerIOMixin:
@@ -27,6 +46,11 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        # values rank 0 sends with every message poll (--ngram-spec planning inputs under TP):
+        # tp_sync_source() on rank 0, tp_sync_len on all ranks, the result in tp_sync_values
+        self.tp_sync_len = 0
+        self.tp_sync_source: Callable[[], Sequence[float]] | None = None
+        self.tp_sync_values: List[float] | None = None
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -98,8 +122,12 @@ class SchedulerIOMixin:
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
         # broadcast the number of raw messages to all ranks
-        src_tensor = torch.tensor(len(pending_raw_msgs))
-        self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
+        n = self.tp_sync_len
+        _, values = broadcast_count(
+            self.tp_cpu_group, len(pending_raw_msgs), self.tp_sync_source() if n else None, n
+        )
+        if n:
+            self.tp_sync_values = values
 
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
@@ -113,9 +141,10 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_rank0.get())
 
         # ensure all ranks have the same number of raw messages
-        dst_tensor = torch.tensor(-1)
-        self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
-        dst_length = int(dst_tensor.item())
+        n = self.tp_sync_len
+        dst_length, values = broadcast_count(self.tp_cpu_group, None, None, n)
+        if n:
+            self.tp_sync_values = values
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())

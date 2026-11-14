@@ -183,6 +183,11 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+        if getattr(self.mtp, "is_ngram", False) and config.tp_info.size > 1:
+            # every rank must plan the same n-gram rounds: rank 0's planning inputs ride the
+            # per-iteration message-count broadcast
+            self.tp_sync_len = self.mtp.sync_len
+            self.tp_sync_source = self.mtp.sync_payload
 
     def _make_moe_stats(self) -> Callable[[], str] | None:
         """With --moe-collect-stats: the decode expert-cache miss rate since the last status
@@ -360,6 +365,8 @@ class Scheduler(SchedulerIOMixin):
             self.stream.wait_stream(self.engine.stream)
             self._process_last_data(last_data)
             last_data = None
+        if getattr(mtp, "is_ngram", False):
+            return self._ngram_iteration(mtp, last_data)
         # Phase 4 round-as-batch: when MTP is eligible the verify IS this iteration's
         # batch. Begin it (draft + launch verify) on the engine stream, then drain the
         # previous batch on the host while the verify runs, then finish (accept/publish/
@@ -419,6 +426,40 @@ class Scheduler(SchedulerIOMixin):
         self._flush_abort_acks()
         return ongoing_data
 
+    def _ngram_iteration(self, mgr, last_data: ForwardData | None) -> ForwardData | None:
+        """overlap_loop under --ngram-spec. Plain decode steps stay overlapped; a request whose
+        in-flight step continues a context repeat is drained early, and if the policy takes its
+        proposal a synchronous verify round runs before this iteration's plain step (which the
+        round's requests skip while they keep proposing)."""
+        mgr._deferred = set()
+        mgr.begin_iteration()
+        plans = []
+        if not self.prefill_manager.runnable:
+            batch = last_data[0].batch if last_data is not None else None
+            in_flight = batch.reqs if batch is not None and batch.is_decode else []
+            cands = mgr.candidates(self.decode_manager.running_reqs, in_flight)
+            if cands:
+                if last_data is not None and any(r in in_flight for r in cands):
+                    self.stream.wait_stream(self.engine.stream)
+                    self._process_last_data(last_data)
+                    last_data = None
+                running = self.decode_manager.running_reqs
+                plans = mgr.plan([r for r in cands if r in running])
+        if plans:
+            self.stream.wait_stream(self.engine.stream)
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                mgr.run_plans(plans)
+        self.stream.wait_stream(self.engine.stream)
+        forward_input = self._schedule_next_batch()
+        ongoing_data = self._launch(forward_input) if forward_input is not None else None
+        if forward_input is not None and forward_input.batch.is_decode:
+            mgr.note_plain_step(single=not plans and len(forward_input.batch.reqs) == 1)
+        self.stream.wait_stream(self.engine.stream)
+        self._process_last_data(last_data)
+        self._flush_abort_acks()
+        return ongoing_data
+
     def _make_spec_manager(self):
         """Pick the model's speculative-decode manager: qwen4-exp MTP (residual streams),
         DeepSeek-V4.1 DSpark (aux-hidden block draft), or a no-op."""
@@ -430,6 +471,16 @@ class Scheduler(SchedulerIOMixin):
         getter = getattr(model, "dspark_draft", None)
         if callable(getter) and getter() is not None:
             return DSparkManager(self)
+        if ENV.NGRAM_SPEC:
+            from freetoken.engine.verify_graph import ngram_spec_unsupported
+
+            why = ngram_spec_unsupported(model, self.engine.linear_state_pool)
+            if why is not None:
+                logger.warning_rank0(f"--ngram-spec ignored: {why}")
+                return _NOOP_MTP
+            from .ngram_spec import NgramSpecManager
+
+            return NgramSpecManager(self)
         return _NOOP_MTP
 
     def normal_loop(self) -> None:
@@ -1325,7 +1376,8 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.snapshot_decode_states(
                 batch.reqs,
                 anchors=self.toolcall_anchor_id is not None,
-                boundaries=batch.is_decode and not mtp.enabled,
+                # n-gram rounds never cross a boundary and snapshot on entry themselves
+                boundaries=batch.is_decode and (not mtp.enabled or getattr(mtp, "is_ngram", False)),
             )
         forward_output = self.engine.forward_batch(batch, sample_args)
         if batch.is_decode and mtp.enabled and getattr(mtp, "uses_streams", False):

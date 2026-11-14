@@ -103,6 +103,14 @@ class EnvClassSingleton:
     # history (repetitions need no model). OFF by default.
     MTP_NGRAM = EnvBool(False)
     MTP_NGRAM_SIZE = EnvInt(3)
+    # Prompt-lookup speculative decoding without a draft head (scheduler/ngram_spec.py): drafts
+    # continue the longest earlier repeat (>= MIN_MATCH tokens) of the request's own context,
+    # verified in one window of up to MAX_DRAFT + 1 tokens where the cost policy expects a gain.
+    # POLICY "always" verifies every proposal at full length (diagnostics). OFF by default.
+    NGRAM_SPEC = EnvBool(False)
+    NGRAM_SPEC_MAX_DRAFT = EnvInt(7)
+    NGRAM_SPEC_MIN_MATCH = EnvInt(3)
+    NGRAM_SPEC_POLICY = EnvStr("adaptive")
     # Draft vocabulary size: the draft chain's argmax runs over the lm_head rows of the V most
     # frequently generated tokens (learned from the served traffic, see engine/draft_vocab.py)
     # instead of the whole vocab. 0 = always the full vocab.
