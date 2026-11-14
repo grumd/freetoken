@@ -17,7 +17,6 @@ any other bf16 projection.
 
 from __future__ import annotations
 
-import os
 
 import torch
 import triton
@@ -59,7 +58,7 @@ _GEMV_MAX_M = 256
 _DEQUANT_ELEMS = 1 << 25
 # Odd-width row slices (K=2560: 13107 rows) run a half-speed cuBLAS align1 kernel, so these M use 8-aligned
 # rows. Same math: byte-identical on sm_86; on other GPUs cuBLAS may sum in another order (rounding only).
-_PAD_SLICE_M = (1024, 16384) if os.getenv("FREETOKEN_MXFP8_PAD_SLICES", "1") != "0" else (1, 0)
+_PAD_SLICE_M = (1024, 16384)
 
 
 @triton.jit

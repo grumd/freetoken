@@ -31,7 +31,6 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
-_ASYNC_ENV = "FREETOKEN_PLE_ASYNC_PREFILL"  # 0 = read a prefill's rows before its forward launches
 
 logger = init_logger(__name__)
 
@@ -213,7 +212,7 @@ class DiskRowTable:
         # Prefill rows are read on a worker thread (I/O releases the GIL): the forward launches at
         # once and the PLE layer WAITs for the fill's sequence number; while a chunk computes, the
         # worker reads the request's next chunk into a second buffer.
-        self._async = self._wait_sync and os.getenv(_ASYNC_ENV, "1") != "0"
+        self._async = self._wait_sync
         if self._async:
             self._io = ThreadPoolExecutor(1, thread_name_prefix="ple-io")
             self._eager_tokens = max_extend_tokens

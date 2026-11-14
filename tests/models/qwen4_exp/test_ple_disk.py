@@ -380,7 +380,8 @@ def test_async_prefill_fill_reads_the_next_chunk_ahead(tmp_path, monkeypatch):
     ids = emb.row_ids(_meta([[9]], [[EOS, 5]], decode=True)).cuda()
     assert disk._ahead is None and _bitwise_equal(disk.lookup(ids), oracle.lookup(ids))
 
-    monkeypatch.setenv("FREETOKEN_PLE_ASYNC_PREFILL", "0")
+    # launch-gating (no stream memops) reads a prefill's rows before its forward launches
+    monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")
     sync, _, _ = _make_table(tmp_path)
     assert not sync._async
     batch, ids = chunk(0, 16)
