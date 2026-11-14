@@ -92,7 +92,6 @@ _ENV_FLAG_VALUE = {
     "engram_backend": "FREETOKEN_ENGRAM_BACKEND",
     "moe_routed_prefill_tokens": "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS",
     "moe_decode_fetch": "FREETOKEN_MOE_DECODE_FETCH",
-    "moe_cpu_decode_act": "FREETOKEN_CPU_DECODE_ACT",
     "moe_cpu_decode_threads": "FREETOKEN_CPU_DECODE_THREADS",
     "dense_mxfp8_groups": "FREETOKEN_DENSE_MXFP8_GROUPS",
     "ngram_spec_max_draft": "FREETOKEN_NGRAM_SPEC_MAX_DRAFT",
@@ -1156,16 +1155,6 @@ def parse_args(
             "expert-cache misses fetched over PCIe into the cache; the CPU computes the rest from "
             "the pinned banks while the GPU runs the hits. 1 (default) = every miss over PCIe, "
             "0 = every miss on the CPU (the cache then only changes during prefill)."
-        ),
-    )
-    parser.add_argument(
-        "--moe-cpu-decode-act",
-        choices=["fp32", "int8"],
-        default=None,
-        dest="moe_cpu_decode_act",
-        help=(
-            "--moe-decode-fetch < 1: activations of the CPU expert GEMV. fp32 (default) keeps "
-            "them exact; int8 quantizes them per 16 values for the VNNI dot (W4A8, NVFP4 only)."
         ),
     )
     parser.add_argument(

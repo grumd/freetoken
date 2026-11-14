@@ -1240,17 +1240,11 @@ class Engine:
             return
         from freetoken.moe.cpu_executor import CpuMoeExecutor, physical_core_cpus
 
-        act = os.environ.get("FREETOKEN_CPU_DECODE_ACT", "fp32").strip().lower()
-        if act not in ("fp32", "int8"):
-            raise ValueError(f"FREETOKEN_CPU_DECODE_ACT must be fp32 or int8, got {act!r}")
         k_off = 0
         if fmt == "w4a16":
             from freetoken.models.wna16_banks import wna16_down_k_off
             from freetoken.moe.legacy_format import canonical_role
 
-            if act == "int8":
-                logger.warning_rank0("--moe-cpu-decode-act int8 ignored: W4A16 experts have no W4A8 CPU GEMV")
-                act = "fp32"
             down = next(v for k, v in cache.bank_sources.items() if canonical_role(k) == "down")
             k_off = wna16_down_k_off(down[0].shape[1] * 8)
         tp = config.tp_info
@@ -1280,7 +1274,7 @@ class Engine:
             cpus=cpus,
             coordinator_joins=True,
             out_fp32=True,
-            w4a8=act == "int8",
+            w4a8=False,  # fp32 activations: as close to exact W4 math as the GPU kernel
             w4a16_down_k_off=k_off,
         )
         if tunable:
@@ -1292,8 +1286,8 @@ class Engine:
         self._cpu_decode_tunable = tunable
         logger.info_rank0(
             f"--moe-decode-fetch {fetch}: decode fetches {fetch:.0%} of its expert-cache misses over "
-            f"PCIe and computes the rest on cpus {cpus[:executor.active_threads]} ({executor.isa}, "
-            f"{act} activations)" + (f"; runtime-tunable, up to {executor.max_threads} threads" if tunable else "")
+            f"PCIe and computes the rest on cpus {cpus[:executor.active_threads]} ({executor.isa})"
+            + (f"; runtime-tunable, up to {executor.max_threads} threads" if tunable else "")
         )
 
     def tune_cpu_decode(self, fetch: float | None = None, threads: int | None = None) -> dict:
