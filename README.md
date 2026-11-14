@@ -29,8 +29,8 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
 - **16384 prefill batch:** the 20 GB rows were re-measured with `serve.sh`'s 16384-token chunks, whose standing reserve covers 8192-token chunks and borrows the rest from the expert cache per prompt, so the context limit stays the same. 16k prefill there is the time to first token of the first uncached 16k-token prompt after start (later ones, with a warm expert cache: 2,780 and 3,450 tok/s); the same measurement gave 1,320 and 2,050 tok/s with 8192-token chunks before. The 16 GB rows were not re-measured.
-- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
-- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`), against about 25 without CPU help.
+- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15`, 7 CPU threads); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
+- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15`, 7 CPU threads), against about 25 without CPU help.
 - **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
 - **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
 
@@ -54,7 +54,7 @@ FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) 
 </picture>
 
 **Settings**
-- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15 --moe-cpu-decode-threads 7`.
+- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15` and 7 CPU threads.
 - **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`.
   - `-ub 2048` with a 20 GB cache decoded about 20% faster but prefilled 37% slower.
   - Without moe-cache-mib, decode was 16 tok/s.

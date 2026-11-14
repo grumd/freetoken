@@ -1171,9 +1171,7 @@ class Engine:
             logger.warning_rank0(f"FREETOKEN_WNA16_CPU_PREFILL ignored: {reason}")
             return
         tp = self.config.tp_info
-        from freetoken.moe.cpu_executor import physical_core_cpus
-
-        threads = wcp.threads_from_env(max(1, len(physical_core_cpus()) // tp.size))
+        threads = _rank_cpu_threads(self.config)
         common = dict(
             num_experts=cache.num_experts, top_k=layers[0].top_k,
             max_tokens=max(_ROUTED_PREFILL_TOKENS, layers[0].num_experts // layers[0].top_k + 1),
@@ -1246,9 +1244,7 @@ class Engine:
         cores = physical_core_cpus()
         per = max(1, len(cores) // tp.size)
         mine = cores[tp.rank * per:(tp.rank + 1) * per]
-        # one GPU: leave a core to the process feeding it; two: each rank's half of the cores
-        default = per - 1 if tp.size == 1 and per > 2 else per
-        threads = int(os.environ.get("FREETOKEN_CPU_DECODE_THREADS", "") or default)
+        threads = _rank_cpu_threads(config)
         cpus = mine[len(mine) - threads:] if threads <= len(mine) else mine
         # calibration (scripts/calibrate.sh): tune_cpu_decode changes the share and the
         # thread count at runtime
@@ -1907,6 +1903,14 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
                 "(larger decode batches never occur)."
             )
             override("cuda_graph_bs", kept)
+
+
+def _rank_cpu_threads(config: EngineConfig) -> int:
+    """This rank's share of -t/--threads (default: every physical core)."""
+    from freetoken.moe.cpu_executor import physical_core_cpus
+
+    total = config.cpu_threads or len(physical_core_cpus())
+    return max(1, total // config.tp_info.size)
 
 
 def _ngram_spec_depth() -> int:

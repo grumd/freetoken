@@ -122,3 +122,11 @@ def test_unknown_value_is_rejected():
         _parse(["--mamba-ssm-dtype", "float8"])
     with pytest.raises(SystemExit):
         _parse(["--ple-sync", "nonsense"])
+
+
+def test_threads_is_a_plain_config_field():
+    assert _parse([]).cpu_threads == 0  # 0 = every physical core
+    assert _parse(["-t", "6"]).cpu_threads == 6
+    assert _parse(["--threads", "3"]).cpu_threads == 3
+    with pytest.raises(SystemExit):
+        _parse(["--threads", "-1"])

@@ -184,7 +184,7 @@ def probe(args) -> None:
     cores = physical_core_cpus()
     hw["cpu"]["physical_cores"] = len(cores)
     per = max(1, len(cores) // len(gpus))
-    hw["default_threads"] = per - 1 if len(gpus) == 1 and per > 2 else per
+    hw["default_threads"] = per  # the server's default: every physical core, split across the GPUs
     hw["max_threads"] = per
     import torch
 
@@ -447,7 +447,7 @@ def run(args) -> None:
     # load 2: CPU help, share and threads switched at runtime
     flags = ["--moe-decode-fetch", f"{GRID[1]:g}"]
     if args.threads:
-        flags += ["--moe-cpu-decode-threads", str(args.threads)]
+        flags += ["--threads", str(args.threads * len(args.gpus.split(",")))]
     serve = Serve(args, "cpu-assisted", flags, {"FREETOKEN_CPU_DECODE_TUNABLE": "1"})
     try:
         srv = Server(args.port)
@@ -496,6 +496,7 @@ def run(args) -> None:
     res = {"hw": hw, "depths": {n: ctx_tokens[n] for n in names}, "screen": screen,
            "threads_table": thread_table, "confirm": confirm, "decode_fetch": fetch,
            "threads": threads if fetch < 1 else hw["default_threads"], "why": why,
+           "num_gpus": len(args.gpus.split(",")),
            "screen_threads": threads0, "sweep_s": round(time.perf_counter() - t_begin), "log": log,
            "out_tokens": args.tokens, "skip": args.skip}
     json.dump(res, open(args.out, "w"), indent=1)
@@ -503,10 +504,11 @@ def run(args) -> None:
     print("\n" + report)
 
 
-def recommendation(fetch: float, threads: int) -> str:
+def recommendation(fetch: float, threads: int, num_gpus: int = 1) -> str:
+    """``threads`` is per GPU (the calibrated executor size); --threads takes the total."""
     if fetch >= 1:
         return "--moe-decode-fetch 1"
-    return f"--moe-decode-fetch {fetch:g} --moe-cpu-decode-threads {threads}"
+    return f"--moe-decode-fetch {fetch:g} --threads {threads * num_gpus}"
 
 
 def render_report(res: dict, total_s: float | None = None) -> str:
@@ -535,7 +537,7 @@ def render_report(res: dict, total_s: float | None = None) -> str:
         for p, row in sorted(c["shares"].items(), key=lambda kv: -float(kv[0])):
             mark = "  <- pick" if float(p) == res["decode_fetch"] else ""
             lines.append(f"  {float(p):>12g}   " + "   ".join(f"{row[n]:13.1f}" for n in names) + mark)
-    lines += ["", f"Recommendation: scripts/serve.sh {recommendation(res['decode_fetch'], res['threads'])}",
+    lines += ["", f"Recommendation: scripts/serve.sh {recommendation(res['decode_fetch'], res['threads'], res.get('num_gpus', 1))}",
               f"  {res['why']}"]
     t = f"two loads and the sweep {res['sweep_s'] / 60:.1f} min"
     if total_s:
@@ -571,7 +573,7 @@ def main() -> None:
     s.add_argument("--long", type=int, default=100000)
     s.add_argument("--tokens", type=int, default=192, help="measured decode tokens per prompt")
     s.add_argument("--skip", type=int, default=48, help="warm-up tokens per prompt, not measured")
-    s.add_argument("--threads", type=int, default=0, help="fix the CPU thread count (no thread sweep)")
+    s.add_argument("--threads", type=int, default=0, help="fix the CPU threads per GPU (no thread sweep)")
     s.add_argument("--load-timeout", type=float, default=900)
     s.add_argument("--total-s", type=float, default=None)
     k = sub.add_parser("skip")

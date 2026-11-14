@@ -110,7 +110,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--moe-routed-prefill-tokens` | 0 | Prefill chunks up to N tokens load only their routed experts via the expert cache instead of streaming whole layers (`FREETOKEN_MOE_ROUTED_PREFILL_TOKENS`) |
 | `--moe-decode-fetch` | 1 | With NVFP4 or W4A16 experts: the share (0-1) of each decode step's expert-cache misses fetched over PCIe; the CPU computes the rest straight from the pinned banks while the GPU runs the hits. `1` = every miss over PCIe. `scripts/calibrate.sh` measures the best value per machine |
-| `--moe-cpu-decode-threads` | auto | With `--moe-decode-fetch` below 1: CPU threads per GPU, one per physical core; default all physical cores but one on one GPU, the GPU's share of them with several |
+| `-t`, `--threads` | all physical cores | CPU threads for CPU expert work (CPU-assisted decode and the hybrid CPU prefill), one per physical core, split evenly across the GPUs |
 | `--moe-collect-stats` | off | Decode: count expert-cache misses; the status line shows the miss rate |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--expert-load` | auto | How expert banks are read into host RAM: `auto` (parallel for scattered experts, serial when RAM is tight), `serial`, `parallel` |

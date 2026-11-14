@@ -143,10 +143,5 @@ class Nvfp4CpuPrefill(Wna16CpuPrefill):
         self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES))
 
 
-def threads_from_env(default: int) -> int:
-    raw = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_THREADS", "")
-    return int(raw) if raw.strip() else default
-
-
 __all__ = ["Nvfp4CpuPrefill", "Wna16CpuPrefill", "cpu_supported", "load_extension", "load_nvfp4_extension",
-           "rank_cpus", "threads_from_env"]
+           "rank_cpus"]

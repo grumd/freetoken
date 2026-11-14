@@ -65,7 +65,7 @@ def _serve(tmp_path, gpus, fmt="nvfp4", flags=()):
                MIN_FREE_RAM_GB="0", PORT="1")
     subprocess.run(["bash", str(SCRIPTS / "serve.sh"), *flags], env=env, capture_output=True, timeout=60)
     args = out.read_text().splitlines()
-    decode = ("--moe-decode-fetch", "--moe-cpu-decode-threads")
+    decode = ("--moe-decode-fetch", "--threads")
     return {a: args[i + 1] for i, a in enumerate(args) if a in decode}
 
 
@@ -76,8 +76,8 @@ def test_cpu_assisted_decode_default(tmp_path, gpus, fmt, want):
 
 
 def test_flags_override_the_default(tmp_path):
-    got = _serve(tmp_path, "0", flags=["--moe-decode-fetch", "0.15", "--moe-cpu-decode-threads", "7"])
-    assert got == {"--moe-decode-fetch": "0.15", "--moe-cpu-decode-threads": "7"}
+    got = _serve(tmp_path, "0", flags=["--moe-decode-fetch", "0.15", "--threads", "7"])
+    assert got == {"--moe-decode-fetch": "0.15", "--threads": "7"}
 
 
 def test_report_from_a_full_result(tmp_path):
@@ -99,5 +99,5 @@ def test_report_from_a_full_result(tmp_path):
            "decode_fetch": 0.15, "threads": 7, "why": "confirmation runs: 0.15 is +62%",
            "screen_threads": 7, "sweep_s": 600, "out_tokens": 192, "skip": 48}
     report = cal.render_report(res, 5)
-    assert "Recommendation: scripts/serve.sh --moe-decode-fetch 0.15 --moe-cpu-decode-threads 7" in report
+    assert "Recommendation: scripts/serve.sh --moe-decode-fetch 0.15 --threads 7" in report
     assert "PCIe gen4 x8" in report and "0.15            55.0            51.9  <- pick" in report

@@ -93,7 +93,6 @@ _ENV_FLAG_VALUE = {
     "engram_backend": "FREETOKEN_ENGRAM_BACKEND",
     "moe_routed_prefill_tokens": "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS",
     "moe_decode_fetch": "FREETOKEN_MOE_DECODE_FETCH",
-    "moe_cpu_decode_threads": "FREETOKEN_CPU_DECODE_THREADS",
     "dense_mxfp8_groups": "FREETOKEN_DENSE_MXFP8_GROUPS",
     "ngram_spec_max_draft": "FREETOKEN_NGRAM_SPEC_MAX_DRAFT",
     "ngram_spec_min_match": "FREETOKEN_NGRAM_SPEC_MIN_MATCH",
@@ -1173,13 +1172,14 @@ def parse_args(
         ),
     )
     parser.add_argument(
-        "--moe-cpu-decode-threads",
+        "-t",
+        "--threads",
         type=int,
-        default=None,
-        dest="moe_cpu_decode_threads",
+        default=ServerArgs.cpu_threads,
+        dest="cpu_threads",
         help=(
-            "--moe-decode-fetch < 1: CPU threads per GPU, one per physical core. Default: all "
-            "physical cores but one on one GPU, the GPU's share of them with several."
+            "CPU threads for CPU expert work (CPU-assisted decode and the hybrid CPU prefill), "
+            "one per physical core, split evenly across the GPUs. Default 0 = all physical cores."
         ),
     )
 
@@ -1265,6 +1265,8 @@ def parse_args(
         parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
     if kwargs["prefill_reserve_tokens"] < 0:
         parser.error("--prefill-reserve-tokens must be >= 0")
+    if kwargs["cpu_threads"] < 0:
+        parser.error("--threads must be >= 0 (0 = all physical cores)")
 
     # --memory-ratio takes a single float or a per-GPU list; a list is the same
     # override set as --gpu-memory-ratio (combining both is ambiguous).

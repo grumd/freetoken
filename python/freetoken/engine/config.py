@@ -110,6 +110,9 @@ class EngineConfig:
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
+    # -t/--threads: CPU threads for the fork's CPU expert work (CPU-assisted decode and the hybrid
+    # prefill), split evenly across the TP ranks. 0 = every physical core.
+    cpu_threads: int = 0
     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
