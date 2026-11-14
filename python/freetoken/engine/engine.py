@@ -510,7 +510,7 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
-        self.elastic = None  # ElasticVram under --elastic-kv, planned with the expert banks
+        self.elastic = None  # ElasticVram where _elastic_vram(config) holds, planned with the expert banks
         self.moe_offload_cache = None
         self.dspark_offload_cache = None
         self.cpu_moe_executor = None
@@ -550,10 +550,7 @@ class Engine:
                 self.ctx.kv_cache = self.kv_cache = create_kv_pool(
                     config, self.num_pages, device=self.device, dtype=self.dtype
                 )
-            if not getattr(self.kv_cache, "elastic", False):
-                raise ValueError(
-                    f"--elastic-kv supports paged MHA/QSA KV pools, not {type(self.kv_cache).__name__}"
-                )
+            assert self.kv_cache.elastic, type(self.kv_cache).__name__
             self.elastic.kv_pool = self.kv_cache
         else:
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -772,7 +769,7 @@ class Engine:
             # estimate; past the settled KV limit a prompt would be admitted and never get pages
             limit = self.elastic.limit_pages * self._elastic_page_tokens
             if limit < self.max_seq_len:
-                logger.info_rank0(f"--elastic-kv: max context {self.max_seq_len} -> {limit} tokens (VRAM)")
+                logger.info_rank0(f"elastic VRAM: max context {self.max_seq_len} -> {limit} tokens")
                 self.max_seq_len = limit
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -873,15 +870,13 @@ class Engine:
         )
 
     def _plan_elastic(self, config: EngineConfig, banks, method) -> None:
-        """--elastic-kv: size the virtual reservations of the expert banks and the KV pool from
+        """Elastic VRAM: size the virtual reservations of the expert banks and the KV pool from
         the VRAM free now, before either exists. The physical pool is settled in finalize()."""
         from freetoken.engine.cache_budget import (
             PREFILL_BYTES_PER_TOKEN, expert_bytes_per_slot, plan_elastic_geometry, prefill_reserve_bytes,
         )
         from freetoken.engine.elastic import ElasticVram
 
-        if config.moe_strategy != "offload" or config.model_config.decode_target != "gpu":
-            raise ValueError("--elastic-kv needs --moe-strategy offload with GPU decode")
         cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         fixed += state_pool_bytes(config)
         self._elastic_page_tokens = page_tokens
@@ -919,7 +914,7 @@ class Engine:
         object.__setattr__(config, "moe_cache_size", cap_slots)
         object.__setattr__(config, "num_page_override", cap_pages)
         logger.info_rank0(
-            f"--elastic-kv: reserving {cap_slots} expert slots / {cap_pages * page_tokens} KV tokens "
+            f"elastic VRAM: reserving {cap_slots} expert slots / {cap_pages * page_tokens} KV tokens "
             f"of address space ({mem_GB(free)} free before the caches)"
         )
 
@@ -994,7 +989,7 @@ class Engine:
             )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        if config.elastic_kv:
+        if _elastic_vram(config):
             self._plan_elastic(config, banks, method)
         elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
@@ -1456,7 +1451,7 @@ class Engine:
                 and num_swa_pages is None):
             return
         if self.elastic is not None:
-            raise CacheRebuildRejected("--elastic-kv moves VRAM between the caches by itself")
+            raise CacheRebuildRejected("elastic VRAM moves memory between the caches by itself")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -1965,6 +1960,41 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: 
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
+def _elastic_vram_supported(config: EngineConfig) -> bool:
+    """Offload experts decoded on the GPU, and a KV pool that maps its pages on demand."""
+    model_config = config.model_config
+    return (
+        getattr(model_config, "is_moe", False)
+        and config.moe_strategy == "offload"
+        and getattr(model_config, "decode_target", "gpu") == "gpu"
+        and getattr(resolve_pool_class(model_config), "ELASTIC_VRAM", False)
+    )
+
+
+def _elastic_vram(config: EngineConfig) -> bool:
+    """KV pages and expert slots share VRAM at runtime (engine/elastic.py) wherever it is
+    supported, unless --no-elastic-kv asks for upstream's static split."""
+    return _elastic_vram_supported(config) and getattr(config, "elastic_kv", None) is not False
+
+
+def _check_vram_flags(config: EngineConfig) -> None:
+    """Before the load: --elastic-kv only where supported, and the static sizing flags only where
+    elastic VRAM is off (unsupported, or --no-elastic-kv)."""
+    if getattr(config, "elastic_kv", None) and not _elastic_vram_supported(config):
+        raise ValueError(
+            "--elastic-kv: elastic VRAM needs a MoE model on --moe-strategy offload with GPU decode "
+            "(no --moe-cpu-layers) and an MHA/QSA KV pool; drop the flag for this setup"
+        )
+    flags = getattr(config, "static_vram_flags", ())
+    if flags and _elastic_vram(config):
+        raise ValueError(
+            f"{', '.join(flags)}: these flags size VRAM statically; elastic VRAM is on by default for "
+            "this setup; pass --no-elastic-kv to use them"
+        )
+    if getattr(config, "prefill_reserve_tokens", 0) and not _elastic_vram(config):
+        logger.warning_rank0("--prefill-reserve-tokens ignored: it sizes elastic VRAM's prefill reserve")
+
+
 def _decode_target(config: EngineConfig) -> str:
     """Where routed experts decode, from the flags alone: hybrid co-compute, the CPU executor for some or all layers, or the GPU slot cache."""
     if config.moe_strategy == "hybrid":
@@ -2423,6 +2453,8 @@ def _adjust_config(config: EngineConfig):
                 f"{(config.num_token_override // config.page_size + 1) * config.page_size}"
             )
         override("num_page_override", config.num_token_override // config.page_size)
+
+    _check_vram_flags(config)
 
     # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.

@@ -182,6 +182,7 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
         "--max-running-requests", "1",
         "--max-seq-len-override", str(8192 + args.decode),
         "--memory-ratio", str(args.mem_ratio),
+        "--no-elastic-kv",
         "--cuda-graph-max-bs", "0" if args.no_graph else "1",
         "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]

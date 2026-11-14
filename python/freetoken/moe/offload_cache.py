@@ -184,7 +184,7 @@ class OffloadMoeCache:
     # computes the misses a decode step does not fetch (None: plain decode), and the fetched share.
     cpu_decode: object | None = None
     decode_fetch: float = 1.0
-    # Elastic VRAM (--elastic-kv): ``bank_alloc(name, shape, dtype)`` returns each bank's slot
+    # Elastic VRAM: ``bank_alloc(name, shape, dtype)`` returns each bank's slot
     # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
     # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.
     bank_alloc: object | None = None

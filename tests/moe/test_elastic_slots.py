@@ -1,4 +1,4 @@
-"""Elastic expert slots (--elastic-kv): fenced slots are never LRU victims, shrinking keeps what a
+"""Elastic expert slots (elastic VRAM): fenced slots are never LRU victims, shrinking keeps what a
 smaller LRU would keep and moves the bank bytes with it, growing reopens empty slots, and the
 whole thing runs on CUDA-VMM banks whose retired rows are actually unmapped."""
 

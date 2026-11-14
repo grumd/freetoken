@@ -54,7 +54,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 
 | Flag | Why |
 |---|---|
-| `--moe-strategy offload --elastic-kv` | experts in host RAM; KV and the expert cache share VRAM at runtime, so the cache gets whatever the live context does not need (decode +16%, output identical) and the context shrinks to what fits |
+| `--moe-strategy offload` | experts in host RAM; KV and the expert cache share VRAM at runtime (elastic VRAM, the engine's behaviour for offload MoE), so the cache gets whatever the live context does not need (decode +16%, output identical) and the context shrinks to what fits |
 | `--max-running-requests 1` | batching loses: 3 streams at once decode slower in total than 1 |
 | `--max-prefill-length 16384 --prefill-reserve-tokens 8192` | prefill streams every expert over PCIe once per chunk, so 16384-token chunks halve that traffic: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s; with the PLE read-ahead 6.2 / 4.9 s and 24.4 / 17.5 s). Elastic keeps 256 MiB + 230 KiB per chunk token free for activations; the standing reserve covers 8192-token chunks and a longer prompt borrows the other 1.8 GiB from the expert cache while it prefills, so the context limit stays that of 8192 (a fixed 16384 reserve would cap one RTX 3080 at 238k). Near the limit the chunks stay at 8192. `--max-prefill-length 4096` gives one 16 GB GPU 186k instead of 147k context, at about half the long-prompt prefill speed |
 | `--moe-routed-prefill-tokens 3072` | chunks up to this size load only their routed experts instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). Re-tune on a faster link; `1280` with `FREETOKEN_WNA16_CPU_PREFILL=0` |

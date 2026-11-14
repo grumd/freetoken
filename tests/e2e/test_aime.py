@@ -190,6 +190,7 @@ def build_llm(model_path: Path) -> LLM:
             moe_cache_size=cache_size,
             kv_reserve_tokens=int(os.environ.get("FREETOKEN_TEST_KV_RESERVE", "8192")),
             moe_cache_policy="lru",
+            elastic_kv=False,
             memory_ratio=float(os.environ.get("FREETOKEN_TEST_MEM_RATIO", "0.9")),
             max_seq_len_override=max_tokens() + 2048,
             cuda_graph_max_bs=1,

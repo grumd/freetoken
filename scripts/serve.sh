@@ -32,7 +32,6 @@ args=(
   --host "$HOST" --port "$PORT"
   --gpu "$GPUS" --tp-size "$tp"
   --moe-strategy offload
-  --elastic-kv
   --max-running-requests 1
   # prefill streams every expert over PCIe once per chunk: 16384-token chunks halve that traffic.
   # The standing reserve covers 8192-token chunks (a 16384 one would cap one GPU's context below

@@ -301,3 +301,128 @@ def test_compact_small_weights_releases_interleaved_holes():
     assert root.layers[3].kept is alias
     assert root.layers[4].kept.data_ptr() == root.layers[4].view.data_ptr()
     assert all(int(layer.kept[0]) == i % 7 and layer.kept.is_cuda for i, layer in enumerate(root.layers))
+
+
+
+def _vram_config(pool, strategy="offload", decode_target="gpu", is_moe=True, flags=(), elastic_kv=None,
+                 **settings):
+    from types import SimpleNamespace
+
+    model_config = SimpleNamespace(is_moe=is_moe, decode_target=decode_target, pool=pool)
+    return SimpleNamespace(model_config=model_config, moe_strategy=strategy, static_vram_flags=flags,
+                           elastic_kv=elastic_kv, **{"prefill_reserve_tokens": 0, **settings})
+
+
+@pytest.fixture
+def _pool_from_config(monkeypatch):
+    import freetoken.engine.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "resolve_pool_class", lambda model_config: model_config.pool)
+
+
+def test_elastic_vram_is_on_exactly_where_it_is_supported(_pool_from_config):
+    from freetoken.engine.engine import _elastic_vram
+    from freetoken.kvcache.bsa_pool import BSAKVCache
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    assert _elastic_vram(_vram_config(QSAKVCache))
+    assert _elastic_vram(_vram_config(MHAKVCache))
+    for pool in (BSAKVCache, HybridSWAKVCache, DSV4PagedKVCache):
+        assert not _elastic_vram(_vram_config(pool))
+    assert not _elastic_vram(_vram_config(QSAKVCache, strategy="hybrid", decode_target="hybrid"))
+    assert not _elastic_vram(_vram_config(QSAKVCache, strategy="cpu", decode_target="cpu"))
+    assert not _elastic_vram(_vram_config(QSAKVCache, decode_target="cpu"))  # --moe-cpu-layers
+    assert not _elastic_vram(_vram_config(QSAKVCache, strategy="fused"))
+    assert not _elastic_vram(_vram_config(MHAKVCache, strategy="fused", is_moe=False))
+
+
+def test_static_sizing_flags_need_the_opt_out_where_elastic_vram_is_on(_pool_from_config, monkeypatch):
+    import freetoken.engine.engine as engine_mod
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    check, elastic = engine_mod._check_vram_flags, engine_mod._elastic_vram
+    for forced in (None, True):
+        with pytest.raises(ValueError, match="size VRAM statically; elastic VRAM is on by default for this "
+                                              "setup; pass --no-elastic-kv to use them"):
+            check(_vram_config(QSAKVCache, flags=("--memory-ratio", "--moe-cache-size"), elastic_kv=forced))
+    # the opt-out: the static flags, or upstream's static defaults without any
+    for flags in (("--memory-ratio",), ()):
+        config = _vram_config(QSAKVCache, flags=flags, elastic_kv=False)
+        check(config)
+        assert not elastic(config)
+    check(_vram_config(QSAKVCache, elastic_kv=True))
+    assert elastic(_vram_config(QSAKVCache, elastic_kv=True))
+
+
+def test_elastic_kv_where_unsupported(_pool_from_config, monkeypatch):
+    import freetoken.engine.engine as engine_mod
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    unsupported = (
+        dict(pool=QSAKVCache, strategy="cpu", decode_target="cpu"),
+        dict(pool=QSAKVCache, strategy="hybrid", decode_target="hybrid"),
+        dict(pool=QSAKVCache, decode_target="cpu"),
+        dict(pool=HybridSWAKVCache),
+        dict(pool=QSAKVCache, strategy="fused", is_moe=False),
+    )
+    for setup in unsupported:
+        with pytest.raises(ValueError, match="--elastic-kv: elastic VRAM needs"):
+            engine_mod._check_vram_flags(_vram_config(**setup, elastic_kv=True))
+        # the static flags work as upstream, with or without the opt-out
+        for forced in (None, False):
+            engine_mod._check_vram_flags(_vram_config(**setup, flags=("--memory-ratio",), elastic_kv=forced))
+
+    warned = []
+    monkeypatch.setattr(engine_mod.logger, "warning_rank0", lambda msg: warned.append(msg))
+    engine_mod._check_vram_flags(_vram_config(**unsupported[0], prefill_reserve_tokens=8192))
+    engine_mod._check_vram_flags(_vram_config(QSAKVCache, elastic_kv=False, prefill_reserve_tokens=8192))
+    assert len(warned) == 2 and all("--prefill-reserve-tokens ignored" in w for w in warned)
+
+
+def test_llm_records_its_static_sizing_kwargs(monkeypatch):
+    from freetoken.llm import llm as llm_mod
+
+    seen = []
+    monkeypatch.setattr(llm_mod.Scheduler, "__init__", lambda self, config: seen.append(config))
+    llm_mod.LLM("/models/anon", memory_ratio=0.8, moe_cache_size=4096, elastic_kv=False)
+    llm_mod.LLM("/models/anon", max_running_req=1)
+    assert seen[0].static_vram_flags == ("memory_ratio", "moe_cache_size") and seen[0].elastic_kv is False
+    assert seen[1].static_vram_flags == () and seen[1].elastic_kv is None
+
+
+@pytest.mark.parametrize(
+    ("argv", "want"),
+    [
+        ([], ()),
+        (["--memory-ratio", "0.9"], ("--memory-ratio",)),  # the default value, still a choice
+        (["--memory-ratio=0.8", "--kv-reserve-tokens", "4096"], ("--memory-ratio", "--kv-reserve-tokens")),
+        (["--gpu-memory-ratio", "0:0.8"], ("--gpu-memory-ratio",)),
+        (["--moe-cache-rate", "0.5"], ("--moe-cache-rate",)),
+        (["--moe-cache-auto"], ("--moe-cache-auto",)),
+        (["--num-tokens", "65536"], ("--num-tokens",)),
+        (["--vram-keep-free-mb", "512"], ()),
+        (["--no-elastic-kv", "--moe-cache-size", "4096"], ("--moe-cache-size",)),
+    ],
+)
+def test_parse_args_records_which_static_sizing_flags_were_given(argv, want):
+    from unittest.mock import patch
+
+    from freetoken.engine.config import EngineConfig
+    from freetoken.server.args import parse_args
+
+    class _HF:
+        def to_dict(self):
+            return {"architectures": ["Qwen3_5MoeForConditionalGeneration"], "torch_dtype": "bfloat16"}
+
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: _HF()):
+        args = parse_args(["--model", "/models/anon", *argv])[0]
+    assert args.static_vram_flags == want
+    assert args.elastic_kv is (False if "--no-elastic-kv" in argv else None)
+    if "--memory-ratio" not in " ".join(argv) and "--gpu-memory-ratio" not in argv:
+        assert args.memory_ratio == EngineConfig.memory_ratio
+    if not want:
+        assert args.moe_cache_size == 0 and args.moe_cache_rate is None

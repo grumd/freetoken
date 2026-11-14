@@ -118,11 +118,11 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 ### Elastic VRAM
 
-With `--elastic-kv`, KV pages and MoE expert slots share one pool of VRAM at runtime instead of being split once at startup: experts take whatever the live context does not need, and give slots back (coldest first) when the context grows. Needs `--moe-strategy offload` with GPU decode; replaces `--memory-ratio`, `--kv-reserve-tokens` and `--moe-cache-size`/`-rate`, which are rejected with it. `--max-seq-len-override` still caps one request; the total over parallel requests is limited only by VRAM.
+With `--moe-strategy offload` (the default for MoE models), GPU decode and an MHA or QSA KV pool, KV pages and MoE expert slots share one pool of VRAM at runtime instead of being split once at startup: experts take whatever the live context does not need, and give slots back (coldest first) when the context grows. Output is identical to the static split. It is on by default there. The static sizing flags (`--memory-ratio`, `--gpu-memory-ratio`, `--kv-reserve-tokens`, `--moe-cache-size`/`-rate`/`-auto`, `--num-pages`/`--num-tokens`) need `--no-elastic-kv` on such a setup: without it the server refuses to start, before loading the model. `--no-elastic-kv` alone gives upstream's static defaults (`--moe-cache-auto`). Every other setup (`--moe-strategy cpu`/`hybrid`/`fused`, `--moe-cpu-layers`, SWA/MLA/DSA/DSV4/BSA KV pools, dense models) uses the static split and its flags as upstream does; `--elastic-kv` there is an error, and the flags below have no effect (`--prefill-reserve-tokens` logs that it is ignored). `LLM(...)` follows the same rules (`elastic_kv=False`). `--max-seq-len-override` still caps one request; the total over parallel requests is limited only by VRAM.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--elastic-kv` | off | Share VRAM between KV and the expert cache at runtime |
+| `--[no-]elastic-kv` | auto | Unset: elastic VRAM where supported. `--no-elastic-kv`: upstream's static split, needed for the static sizing flags. `--elastic-kv`: elastic, an error where unsupported |
 | `--vram-keep-free-mb` | 128 | VRAM left free per GPU, also at the prefill peak |
 | `--expert-cache-min-slots` | 1024 | Expert slots KV growth never takes; at least 2 x num_experts (the prefill double buffer) |
 | `--elastic-kv-min-tokens` | 16384 | KV tokens that always stay backed |

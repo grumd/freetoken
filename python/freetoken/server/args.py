@@ -8,6 +8,7 @@ from typing import List, Tuple
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.engine import DSPARK_VERIFY_MODES, MTP_MODES
+from freetoken.engine.config import STATIC_VRAM_FIELDS
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
@@ -443,7 +444,8 @@ def parse_args(
             "cache + KV cache combined; the remainder is reserved runtime headroom. "
             "Either a single float (applies to every TP rank) or a per-GPU list, e.g. "
             "'0:0.8,1:0.9' (shell-safe) or '0,0.8;1,0.9' (quote it: ';' is a shell "
-            "operator). A list is equivalent to --gpu-memory-ratio."
+            "operator). A list is equivalent to --gpu-memory-ratio. Where elastic VRAM is "
+            "supported (offload MoE with GPU decode and an MHA/QSA KV pool) it needs --no-elastic-kv."
         ),
     )
 
@@ -938,32 +940,44 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "KV-cache token floor reserved before --moe-cache-auto fills experts. Where elastic "
+            "VRAM is supported it needs --no-elastic-kv."
+        ),
     )
 
-    elastic_group = parser.add_argument_group("Elastic VRAM")
+    elastic_group = parser.add_argument_group(
+        "Elastic VRAM",
+        "With --moe-strategy offload, GPU decode and an MHA/QSA KV pool, KV pages and MoE expert "
+        "slots share VRAM at runtime: experts take whatever the live context does not need and "
+        "give it back as context grows. On by default there; the static sizing flags "
+        "(--memory-ratio, --gpu-memory-ratio, --kv-reserve-tokens, --moe-cache-size/-rate/-auto, "
+        "--num-pages/--num-tokens) need --no-elastic-kv there and are refused without it. "
+        "--cache-ram-gb aside, the flags of this group tune elastic VRAM and have no effect "
+        "elsewhere.",
+    )
     elastic_group.add_argument(
         "--elastic-kv",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=ServerArgs.elastic_kv,
         help=(
-            "Let KV pages and MoE expert slots share VRAM at runtime: experts take whatever the "
-            "live context does not need and give it back as context grows. Replaces "
-            "--memory-ratio and --kv-reserve-tokens (offload MoE strategies, QSA/MHA KV pools)."
+            "Default: on where supported, upstream's static split elsewhere. --no-elastic-kv "
+            "keeps the static split (upstream's defaults, or the static sizing flags given); "
+            "--elastic-kv where elastic VRAM is not supported is an error."
         ),
     )
     elastic_group.add_argument(
         "--vram-keep-free-mb",
         type=int,
         default=ServerArgs.vram_keep_free_mb,
-        help="With --elastic-kv: VRAM left free per GPU, including at the prefill peak.",
+        help="VRAM left free per GPU, including at the prefill peak.",
     )
     elastic_group.add_argument(
         "--expert-cache-min-slots",
         type=int,
         default=ServerArgs.expert_cache_min_slots,
         help=(
-            "With --elastic-kv: expert slots KV growth never takes. At least 2 x num_experts "
+            "Expert slots KV growth never takes. At least 2 x num_experts "
             "(the prefill double buffer); smaller values are rejected."
         ),
     )
@@ -971,20 +985,20 @@ def parse_args(
         "--elastic-kv-min-tokens",
         type=int,
         default=ServerArgs.elastic_kv_min_tokens,
-        help="With --elastic-kv: KV tokens that always stay backed.",
+        help="KV tokens that always stay backed.",
     )
     elastic_group.add_argument(
         "--elastic-kv-step-tokens",
         type=int,
         default=ServerArgs.elastic_kv_step_tokens,
-        help="With --elastic-kv: KV grows and shrinks in steps of this many tokens.",
+        help="KV grows and shrinks in steps of this many tokens.",
     )
     elastic_group.add_argument(
         "--elastic-keep-requests",
         type=int,
         default=ServerArgs.elastic_keep_requests,
         help=(
-            "With --elastic-kv: cached prefixes untouched by this many admissions are dropped "
+            "Cached prefixes untouched by this many admissions are dropped "
             "before KV takes expert slots (default max(4, 2 x max running requests); max(2, ...) "
             "with --cache-ram-gb)."
         ),
@@ -994,7 +1008,7 @@ def parse_args(
         type=int,
         default=ServerArgs.elastic_lend_after,
         help=(
-            "With --elastic-kv: after this many decode steps with no prefill waiting, lend the "
+            "After this many decode steps with no prefill waiting, lend the "
             "idle prefill reserve to the expert cache until the next prefill (one ~80 ms gap per "
             "turn, faster decode after). 1 = right after the first token, 0 never lends."
         ),
@@ -1014,7 +1028,7 @@ def parse_args(
         type=float,
         default=ServerArgs.prefill_reserve_gb,
         help=(
-            "With --elastic-kv: VRAM per GPU kept back for prefill activations at their peak "
+            "VRAM per GPU kept back for prefill activations at their peak "
             "(default: auto from the prefill chunk size)."
         ),
     )
@@ -1023,7 +1037,7 @@ def parse_args(
         type=int,
         default=ServerArgs.prefill_reserve_tokens,
         help=(
-            "With --elastic-kv: size the standing prefill reserve for chunks of this many tokens "
+            "Elastic VRAM only (ignored elsewhere): size the standing prefill reserve for chunks of this many tokens "
             "(0 = --max-prefill-length). Longer chunks, up to --max-prefill-length, borrow the "
             "extra activation VRAM from the expert cache for one prompt while the KV cache "
             "leaves room for it; near the context limit, or with an explicit "
@@ -1195,8 +1209,19 @@ def parse_args(
         ),
     )
 
-    # Parse arguments
+    # Parse arguments. A sentinel default tells which static VRAM sizing flags were given
+    # (where elastic VRAM is on they need --no-elastic-kv: engine._check_vram_flags).
+    static_dests = (*STATIC_VRAM_FIELDS, "gpu_memory_ratio")
+    unset = object()
+    parser.set_defaults(**dict.fromkeys(static_dests, unset))
     kwargs = parser.parse_args(args).__dict__.copy()
+    kwargs["static_vram_flags"] = tuple(
+        next(a.option_strings[0] for a in parser._actions if a.dest == d)
+        for d in static_dests if kwargs[d] is not unset
+    )
+    for d in static_dests:
+        if kwargs[d] is unset:
+            kwargs[d] = getattr(ServerArgs, d)
 
     # --mtp: resolve the draft-head mode into the env gate the model parsers read.
     # The parsers run in the spawned TP workers, which inherit this process's env;
@@ -1233,21 +1258,12 @@ def parse_args(
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
         )
 
-    if kwargs["elastic_kv"]:
-        if kwargs["memory_ratio"] != ServerArgs.memory_ratio or kwargs["gpu_memory_ratio"]:
-            parser.error("--elastic-kv sizes VRAM by --vram-keep-free-mb; drop --memory-ratio")
-        if kwargs["kv_reserve_tokens"] != ServerArgs.kv_reserve_tokens:
-            parser.error("--elastic-kv grows KV on demand; drop --kv-reserve-tokens")
-        if kwargs["moe_cache_size"] or kwargs["moe_cache_rate"]:
-            parser.error("--elastic-kv sizes the expert cache itself; drop --moe-cache-size/-rate")
-        if kwargs["vram_keep_free_mb"] < 0 or kwargs["elastic_kv_step_tokens"] <= 0:
-            parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
-        if kwargs["elastic_lend_after"] < 0:
-            parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
+    if kwargs["vram_keep_free_mb"] < 0 or kwargs["elastic_kv_step_tokens"] <= 0:
+        parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
+    if kwargs["elastic_lend_after"] < 0:
+        parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
     if kwargs["prefill_reserve_tokens"] < 0:
         parser.error("--prefill-reserve-tokens must be >= 0")
-    if kwargs["prefill_reserve_tokens"] and not kwargs["elastic_kv"]:
-        parser.error("--prefill-reserve-tokens needs --elastic-kv")
 
     # --memory-ratio takes a single float or a per-GPU list; a list is the same
     # override set as --gpu-memory-ratio (combining both is ambiguous).

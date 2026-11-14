@@ -29,6 +29,9 @@ class RequestStatus:
 
 class LLM(Scheduler):
     def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
+        from freetoken.engine.config import STATIC_VRAM_FIELDS
+
+        kwargs.setdefault("static_vram_flags", tuple(k for k in STATIC_VRAM_FIELDS if k in kwargs))
         config = SchedulerConfig(
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),

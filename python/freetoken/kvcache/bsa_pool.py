@@ -34,6 +34,8 @@ class BSAKVCache(MHAKVCache):
     page_size]`` -- serves K/V and index keys alike.
     """
 
+    ELASTIC_VRAM = False  # the index-key slab is a plain allocation of every page
+
     def __init__(
         self,
         num_kv_heads: int,

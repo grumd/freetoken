@@ -138,7 +138,7 @@ PREFILL_BYTES_PER_TOKEN = 230 * 1024
 
 
 def prefill_reserve_bytes(prefill_reserve_gb: float | None, max_extend_tokens: int) -> int:
-    """VRAM kept back for prefill activations under --elastic-kv. Auto: 256 MiB + 230 KiB per
+    """VRAM kept back for prefill activations under elastic VRAM. Auto: 256 MiB + 230 KiB per
     token of the prefill chunk (--max-prefill-length). Qwen3.8-Flash-Next FP4 prefills at 261k
     tokens of depth peaked 526 / 947 / 2030 MiB over the idle footprint with 2048 / 4096 / 8192-
     token chunks (RTX 3080, 2026-10-27), the same on one unsplit GPU as on each TP=2 rank."""
@@ -160,7 +160,7 @@ def plan_elastic_geometry(
     max_slots: int | None = None,
     lendable_bytes: int = 0,
 ) -> tuple[int, int]:
-    """Upper bounds (cap_slots, cap_pages) for --elastic-kv's virtual reservations.
+    """Upper bounds (cap_slots, cap_pages) for elastic VRAM's virtual reservations.
 
     ``budget_bytes`` is free VRAM before the expert banks, minus the fixed pools, the prefill
     reserve and the keep-free margin; the CUDA graphs and allocator slack land later, so the

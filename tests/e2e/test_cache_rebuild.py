@@ -131,6 +131,7 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
             "--host", "127.0.0.1",
             "--port", str(port),
             "--num-pages", str(BOOT_PAGES),
+            "--no-elastic-kv",
         ],
         stdout=log,
         stderr=subprocess.STDOUT,

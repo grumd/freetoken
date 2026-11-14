@@ -288,7 +288,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _set_prefill_budget(self) -> None:
         """Prefill chunk size: --max-prefill-length, capped by the cache manager's window budget.
-        With --elastic-kv the standing chunk is --prefill-reserve-tokens, and a long prompt grows it
+        With elastic VRAM the standing chunk is --prefill-reserve-tokens, and a long prompt grows it
         back to --max-prefill-length when the expert cache can lend the VRAM (never with an explicit
         --prefill-reserve-gb, which sizes no boost)."""
         cfg = self.config

@@ -9,7 +9,7 @@ from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
 
-# Elastic VRAM (--elastic-kv) installs an allocator around pool construction:
+# Elastic VRAM installs an allocator around pool construction:
 # ``alloc(role, shape, dtype, intervals)`` returns the tensor for one page-scaled tier, where
 # ``intervals(num_pages)`` gives the byte ranges that must stay backed while pages
 # ``[0, num_pages)`` are usable. None = plain torch allocations.
@@ -63,6 +63,9 @@ class MHAKVCache(BaseKVCachePool):
     storage slab per KV layer (not per model layer) and remaps the global id to its
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
     """
+
+    # every page-scaled tier goes through alloc_tier, so the engine may back pages on demand
+    ELASTIC_VRAM = True
 
     def __init__(
         self,

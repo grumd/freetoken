@@ -37,6 +37,13 @@ def mtp_artifact_dir(mtp_path: str) -> str:
     return mtp_path
 
 
+# upstream's static VRAM sizing settings; where elastic VRAM is supported they need elastic_kv=False
+STATIC_VRAM_FIELDS: tuple[str, ...] = (
+    "memory_ratio", "kv_reserve_tokens", "moe_cache_size", "moe_cache_rate", "moe_cache_auto",
+    "num_page_override", "num_token_override",
+)
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -64,15 +71,16 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
-    # Elastic VRAM (--elastic-kv): KV pages and expert slots share one CUDA-VMM chunk pool and
-    # trade memory at runtime instead of splitting it once at startup. Replaces --memory-ratio
-    # and --kv-reserve-tokens: the pool is all VRAM left after the weights, the fixed pools,
+    # Elastic VRAM (offload MoE with GPU decode and an MHA/QSA KV pool, engine._elastic_vram): KV
+    # pages and expert slots share one CUDA-VMM chunk pool and trade memory at runtime instead of
+    # splitting it once at startup. elastic_kv: None = on where supported, False = upstream's
+    # static split (required to give a STATIC_VRAM_FIELDS setting there), True = on or fail.
+    # The pool is all VRAM left after the weights, the fixed pools,
     # the CUDA graphs, the prefill workspace (prefill_reserve_gb, None = auto) and
     # vram_keep_free_mb. Experts never drop below expert_cache_min_slots; KV never drops below
     # elastic_kv_min_tokens and moves in elastic_kv_step_tokens steps. Prefix-cache leaves not
     # touched by the last elastic_keep_requests admissions are dropped before KV takes slots
     # (None = max(4, 2 x max_running_req); max(2, ...) with the RAM tier, which makes a spill cheap).
-    elastic_kv: bool = False
     vram_keep_free_mb: int = 128
     expert_cache_min_slots: int = 1024
     elastic_kv_min_tokens: int = 16384
@@ -81,6 +89,9 @@ class EngineConfig:
     # Decode steps in a row (no prefill waiting) after which the idle prefill reserve is lent to
     # the expert cache until the next prefill; 1 = right after the first token, 0 never lends.
     elastic_lend_after: int = 1
+    elastic_kv: bool | None = None
+    # the STATIC_VRAM_FIELDS settings given explicitly (filled by the CLI and LLM())
+    static_vram_flags: tuple[str, ...] = ()
     prefill_reserve_gb: float | None = None
     # Size the standing prefill reserve for chunks of this many tokens (0 = --max-prefill-length);
     # longer chunks borrow the extra activation VRAM from the expert cache per prompt while the
