@@ -41,7 +41,7 @@ runs the server. `ft ctl` is left untouched — it targets a running *serve*, no
 
 ```bash
 ft daemon self                                 # daemon self-health
-ft daemon start MODEL --port 1919 -- --moe-cache-auto   # args after -- go to ft serve
+ft daemon start MODEL --port 1919 -- --no-elastic-kv --moe-cache-auto   # args after -- go to ft serve
 ft daemon status
 ft daemon logs                                 # stream engine logs (SSE)
 ft daemon health                               # proxied serve /health (camelCased)

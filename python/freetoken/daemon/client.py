@@ -151,7 +151,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
                 help="replace even if final accounting cannot be sealed (may lose the unobserved token tail)",
             )
         # Everything after `--` is forwarded verbatim to ft serve (opaque passthrough):
-        #   ft daemon start MODEL --port 1919 -- --moe-cache-auto --graph 256
+        #   ft daemon start MODEL --port 1919 -- --no-elastic-kv --moe-cache-auto --graph 256
         sp.add_argument("serve_args", nargs="*", default=[], help="Extra ft serve args (after --)")
     lg = sub.add_parser("logs", parents=[common], help="Stream engine logs (SSE, GET /engine/logs)")
     lg.add_argument("--since", type=int, default=0, help="Replay from this seq cursor")
