@@ -488,15 +488,13 @@ class Engine:
         if mx_groups and not ENV.DENSE_FP8:
             moved = _compact_small_weights(self.model)
             logger.info_rank0(f"MXFP8 dense: {moved / 2**30:.2f} GiB of small weights repacked to release the freed bf16")
-        if os.environ.get("FREETOKEN_DECODE_FRONT_FUSE", "1") != "0":
-            for op in _iter_ops(self.model):
-                if hasattr(op, "fuse_decode_front"):
-                    op.fuse_decode_front()
+        for op in _iter_ops(self.model):
+            if hasattr(op, "fuse_decode_front"):
+                op.fuse_decode_front()
         embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
         if (
             embed is not None and hasattr(embed, "move_to_host")
             and not getattr(config.model_config, "tie_word_embeddings", True)
-            and os.environ.get("FREETOKEN_EMBED_ON_HOST", "1") != "0"
         ):
             moved = embed.move_to_host()
             logger.info_rank0(f"Token embedding resident in pinned host RAM ({mem_GB(moved)} per rank)")
@@ -733,14 +731,12 @@ class Engine:
                 f"MTP commit CUDA graphs captured: bs={self.verify_graph_runner.bs_list}"
             )
         # --ngram-spec verify CUDA graphs, one per window width: eager rounds cost ~40 ms more
-        # (FREETOKEN_NGRAM_SPEC_GRAPH=0 turns them off, ~240 MB of VRAM back to the expert cache)
         self.ngram_verify_graphs = None
         from freetoken.engine.verify_graph import ngram_spec_unsupported, verify_store_attr
         from freetoken.env import ENV as _ENV
 
         if (
             _ENV.NGRAM_SPEC
-            and os.environ.get("FREETOKEN_NGRAM_SPEC_GRAPH", "1") == "1"
             and _decode_bs
             and hasattr(self.attn_backend, "init_capture_verify")
             and verify_store_attr(self.attn_backend) is not None

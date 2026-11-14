@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -12,9 +11,6 @@ from ..registry import LayerKind, register_method
 from ..scheme import QuantKind
 from .base import LinearKernel, LinearMethod
 
-# Single-token bf16 GEMV on the Triton streaming kernel instead of cuBLAS's split-K
-# tensor-core GEMMs (decode is weight-bandwidth bound); FREETOKEN_TRITON_GEMV=0 for A/B.
-_TRITON_GEMV = os.getenv("FREETOKEN_TRITON_GEMV", "1") != "0"
 
 
 class TorchLinearKernel(LinearKernel):
@@ -26,8 +22,10 @@ class TorchLinearKernel(LinearKernel):
         if w.dtype != x.dtype:
             w = w.to(x.dtype)
             b = b.to(x.dtype) if b is not None else None
+        # single-token bf16 GEMV on the Triton streaming kernel instead of cuBLAS's split-K
+        # tensor-core GEMMs (decode is weight-bandwidth bound)
         if (
-            _TRITON_GEMV and b is None and x.dim() == 2 and x.shape[0] == 1 and x.is_cuda
+            b is None and x.dim() == 2 and x.shape[0] == 1 and x.is_cuda
             and x.dtype == torch.bfloat16 and x.is_contiguous() and w.stride(1) == 1
         ):
             from freetoken.kernel.triton.gemv import gemv

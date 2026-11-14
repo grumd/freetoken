@@ -24,7 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .hc import HC_FUSE, GatedResidual, GroupedPlusOneRMSNorm
+from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 
@@ -90,7 +90,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        if HC_FUSE and hidden.is_cuda and hidden.dim() == 2 and hidden.shape[0] == 1:
+        if hidden.is_cuda and hidden.dim() == 2 and hidden.shape[0] == 1:
             hidden, rn = self.attn_hyper_connection.combine_norm(
                 hidden, block_output, inject, self.mlp_hyper_connection.hc_norm
             )
@@ -152,7 +152,7 @@ class Qwen4ExpModel(BaseOP):
         layers = self.layers.op_list
         # single-token steps hand each layer's final combine the next mix's norm (not across
         # a PLE layer, which adds to R in between)
-        fuse = HC_FUSE and hidden.is_cuda and hidden.shape[0] == 1
+        fuse = hidden.is_cuda and hidden.shape[0] == 1
         rn = None
         for i, layer in enumerate(layers):
             next_norm = None

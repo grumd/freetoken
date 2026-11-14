@@ -10,7 +10,6 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -32,19 +31,12 @@ from freetoken.layers import BaseOP, LinearReplicated
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
-# Single-token mixes fuse hc_silu -> up GEMV -> hc_gate_mix, and a combine feeding the next
-# mix fuses with its RMSNorm; both bit-identical. FREETOKEN_HC_FUSE=0 for A/B.
-HC_FUSE = os.getenv("FREETOKEN_HC_FUSE", "1") != "0"
-# On two peer-access ranks a single-token mix splits its (replicated) GEMV rows between them
-# and all-gathers both halves, still bit-identical. FREETOKEN_HC_SHARD=0 for A/B.
-HC_SHARD = os.getenv("FREETOKEN_HC_SHARD", "1") != "0"
-_TRITON_GEMV = os.getenv("FREETOKEN_TRITON_GEMV", "1") != "0"
 
 
 def _plain_gemv(linear: LinearReplicated) -> bool:
     """Whether a single bf16 row through ``linear`` runs gemv.py's ``gemv``."""
     return (
-        _TRITON_GEMV and linear.bias is None and linear.weight.dtype == torch.bfloat16
+        linear.bias is None and linear.weight.dtype == torch.bfloat16
         and type(linear.quant_method).__name__ == "UnquantizedLinearMethod"
         and type(linear.quant_method.kernel).__name__ == "TorchLinearKernel"
     )
@@ -156,18 +148,20 @@ class GatedResidual(BaseOP):
         """:meth:`mix` from the already-normalized streams ``rn`` (CUDA only)."""
         down = self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
         up = self.input_mix_weight_up
-        # the fused kernel replays gemv's reduction, so take it only where gemv would run
+        # Single-token mixes fuse hc_silu -> up GEMV -> hc_gate_mix (bit-identical). The fused
+        # kernel replays gemv's reduction, so take it only where gemv would run.
         fused = (
-            HC_FUSE and rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
+            rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
             and rn.dtype == torch.bfloat16 and _plain_gemv(down) and _plain_gemv(up)
             and hc_up_gate_mix_supported(up.weight, self.hc_count)
         )
-        comm = get_p2p_comm() if fused and HC_SHARD else None
+        # two peer-access ranks split the replicated GEMV rows and all-gather them (bit-identical)
+        comm = get_p2p_comm() if fused else None
         if comm is not None and down.weight.shape[0] % 4 == 0 and self.hidden_size % 4 == 0:
             return self._mix_sharded(rn, comm, down.weight, up.weight)
         lora, s = self._down(rn)
         if (
-            HC_FUSE and rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
+            rn.dim() == 2 and rn.shape[0] == 1 and rn.is_contiguous()
             and rn.dtype == torch.bfloat16 and _mxfp8_gemv(up) and up.weight.shape[1] <= 1024
             and lora.stride(1) == 1
         ):

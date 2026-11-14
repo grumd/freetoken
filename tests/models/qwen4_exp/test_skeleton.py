@@ -170,9 +170,11 @@ def test_hc_fused_single_token_mix_is_bit_identical(monkeypatch, use_combine, no
     monkeypatch.setattr(hc_module, "get_p2p_comm", lambda: None)
     for scale in (0.5, 1.0, 4.0):
         R = rand(1, args.ple_state_width, scale=scale)
-        monkeypatch.setattr(hc_module, "HC_FUSE", False)
-        ref_x, ref_s = hc.mix(R)
-        monkeypatch.setattr(hc_module, "HC_FUSE", True)
+        # the unfused chain: norm, down GEMV, hc_silu, up GEMV, hc_gate_mix
+        rn = hc_kernels.grouped_gemma_rmsnorm(R, hc.hc_norm.weight, hc.hc_norm.eps, args.hc_count)
+        lora, ref_s = hc._down(rn)
+        gate = hc.input_mix_weight_up.forward(hc_kernels.hc_silu(lora, args.hc_count))
+        ref_x = hc_kernels.hc_gate_mix(rn, gate, args.hc_count)
         x, s = hc.mix(R)
         torch.testing.assert_close(x, ref_x, rtol=0, atol=0)
         if use_combine:
@@ -546,14 +548,13 @@ def test_early_router_decode_is_bit_identical(monkeypatch):
     _fresh_ctx(_batch=SimpleNamespace(is_prefill=False, is_decode=True))
     moe.fuse_decode_front()
     assert moe._front and not moe.experts.overlaps_decode_copy()
-    # resident experts have no copy to hide the shared expert behind; force the split path
-    monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
+    # resident experts have no copy to hide the shared expert behind; the test forces the split path
     gen = torch.Generator(device=device).manual_seed(5)
     for _ in range(16):
         x = torch.randn(1, config.hidden_size, device=device, dtype=dtype, generator=gen)
-        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", False)
+        monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: False)
         ref = moe.forward(x.clone())
-        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", True)
+        monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
         torch.testing.assert_close(moe.forward(x.clone()), ref, rtol=0, atol=0)
         (w0, i0), (w1, i1) = routes[-2:]
         assert torch.equal(i0, i1) and torch.equal(w0.view(torch.int32), w1.view(torch.int32))
@@ -609,16 +610,15 @@ def test_mxfp8_shared_expert_decode_front(monkeypatch):
     moe._front = False
     moe.fuse_decode_front()
     assert moe._front and moe._front_mx
-    monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
     for i, x in enumerate(xs):
-        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", False)
+        monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: False)
         routes.clear()
         out = moe.forward(x.clone())
         (w0, i0), = routes
         rw, ri = ref_routes[i]
         assert torch.equal(i0, ri) and torch.equal(w0.view(torch.int32), rw.view(torch.int32))
         torch.testing.assert_close(out, refs[i], rtol=2e-2, atol=2e-2)
-        monkeypatch.setattr(moe_mod, "_EARLY_ROUTER", True)
+        monkeypatch.setattr(moe.experts, "overlaps_decode_copy", lambda: True)
         torch.testing.assert_close(moe.forward(x.clone()), out, rtol=0, atol=0)
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,12 +8,6 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
-
-# Single-token steps whose expert kernel overlaps the copy score the router alone and run the shared
-# expert while the routed experts' copy is in flight, so a miss starts streaming ~10 us earlier.
-# Same tiles, same bits; FREETOKEN_EARLY_ROUTER=0 for A/B.
-_EARLY_ROUTER = os.getenv("FREETOKEN_EARLY_ROUTER", "1") != "0"
-
 
 class Qwen4ExpMoE(Qwen3_5MoE):
     """Qwen3_5MoE with the shared-expert gate on triton instead of gemv + sigmoid + mul + add.
@@ -77,7 +70,9 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if num_tokens == 1 and getattr(self, "_front", False) and hidden_states.is_contiguous():
-            if _EARLY_ROUTER and self.experts.overlaps_decode_copy():
+            if self.experts.overlaps_decode_copy():
+                # score the router alone and run the shared expert while the routed experts' copy
+                # is in flight, so a miss starts streaming ~10 us earlier (same tiles, same bits)
                 from freetoken.kernel.triton.gemv import gemv
 
                 # The router kernel's tile layout follows its input's row stride (triton specializes

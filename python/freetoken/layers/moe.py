@@ -35,9 +35,6 @@ _ROUTED_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_ROUTED_PREFILL_TOKENS", "0
 # 2**20), so one call takes at most 1024 ids; a routed-only prefill passes it the layer's
 # unique routed experts, which is bounded by num_experts.
 _LRU_MAX_QUERIES = 1024
-# GPU decode streams a step's missing experts on a side stream while the resident ones
-# compute, where the expert kernel supports it (bit-identical). FREETOKEN_COPY_OVERLAP=0 for A/B.
-_COPY_OVERLAP = os.getenv("FREETOKEN_COPY_OVERLAP", "1") != "0"
 # Diagnostics: prefill chunks as small as a decode step also take the CPU-assisted decode path, so
 # a --max-prefill-length 1 prompt is a teacher-forced decode (logit dumps for quality A/Bs).
 _CPU_DECODE_PREFILL = os.getenv("FREETOKEN_CPU_DECODE_PREFILL", "0") == "1"
@@ -232,7 +229,7 @@ class OffloadMoELayer(MoELayer):
         return self._maybe_all_reduce(final_hidden_states) if reduce else final_hidden_states
 
     def overlaps_decode_copy(self) -> bool:
-        return _COPY_OVERLAP and hasattr(getattr(self.quant_method, "kernel", None), "decode_overlapped")
+        return hasattr(getattr(self.quant_method, "kernel", None), "decode_overlapped")
 
     def _fetch_routed_only(self, hidden_states: torch.Tensor) -> bool:
         """Whether to fetch on demand (decode-style) instead of streaming whole layers.
@@ -377,9 +374,9 @@ class OffloadMoELayer(MoELayer):
         if (log := route_log.current()) is not None:
             log.record_actual(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        if _COPY_OVERLAP and (
-            out := self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids, during_copy)
-        ) is not None:
+        # the missing experts stream in on a side stream while the resident ones compute
+        # (bit-identical), where the expert kernel supports it
+        if (out := self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids, during_copy)) is not None:
             return out
         if during_copy is not None:
             during_copy()
