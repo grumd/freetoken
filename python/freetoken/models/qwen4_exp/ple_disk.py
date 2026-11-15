@@ -9,7 +9,7 @@ import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import safetensors
 import torch
@@ -304,12 +304,45 @@ class DiskRowTable:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
         if self._async:
             self._join()
+        self._stage_runs(runs, graph)
+
+    def _stage_runs(self, runs: Sequence[torch.Tensor], graph: bool) -> None:
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
             offset += run.numel() - 2
         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+
+    @property
+    def wait_sync(self) -> bool:
+        """Whether captured graphs WAIT at the PLE layer for the fill's flag (flag-sync)."""
+        return self._wait_sync
+
+    def fill_graph_async(self, ready: torch.cuda.Event, runs_fn: Callable[[], Sequence[torch.Tensor]]) -> "AsyncGraphFill":
+        """:meth:`fill` for a captured graph on the I/O worker (flag-sync only): the graph WAITs
+        at the PLE layer, so it can launch while the rows are read. The worker waits for
+        ``ready`` (the device->host copy ``runs_fn`` reads), stages ``runs_fn()`` and signals --
+        also on failure, so the stream never hangs (a failed fill's output is discarded). Submit
+        right before the launch; if the launch does not happen, :meth:`AsyncGraphFill.abort`."""
+        assert self._wait_sync
+        self._join()
+
+        def work() -> None:
+            try:
+                # a fresh worker thread sits on device 0: sync from the table's device so it
+                # never creates a context on another GPU
+                with torch.cuda.device(self._device):
+                    ready.synchronize()
+                self._stage_runs(runs_fn(), graph=True)
+            except BaseException:
+                from freetoken.kernel import _ple_store
+
+                _ple_store.signal_flag(self._flag.data_ptr())
+                raise
+
+        self._cur = self._io.submit(work)
+        return AsyncGraphFill(self, self._cur)
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
@@ -409,3 +442,25 @@ class DiskRowTable:
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
         return None
+
+
+class AsyncGraphFill:
+    """Handle of :meth:`DiskRowTable.fill_graph_async`."""
+
+    def __init__(self, table: DiskRowTable, fut: Future) -> None:
+        self._table, self._fut = table, fut
+
+    def join(self) -> None:
+        """After the launch: wait for the fill; re-raises a failed read."""
+        if self._table._cur is self._fut:
+            self._table._cur = None
+        self._fut.result()
+
+    def abort(self) -> None:
+        """The graph did not launch: wait for the fill and clear the flag it set, so the next
+        graph's WAIT does not pass on this fill's signal and read its rows."""
+        try:
+            self.join()
+        except BaseException:
+            pass
+        self._table._flag.zero_()

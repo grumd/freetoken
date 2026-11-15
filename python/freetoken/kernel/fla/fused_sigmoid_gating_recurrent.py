@@ -1,5 +1,5 @@
 """Vendored from sglang (flash-linear-attention) — fused sigmoid-gating gated-delta-rule
-decode kernel. Borrowed verbatim (pure torch+triton, no sglang deps) from sglang's
+decode kernel. Borrowed (pure torch+triton, no sglang deps; only the BV tile changed) from sglang's
 ``python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py``.
 Does gating(sigmoid+softplus) + optional in-kernel l2norm + delta-rule recurrent update +
 per-request state read/write-by-index in ONE kernel — no external gating or
@@ -274,6 +274,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
     num_steps: Optional[torch.Tensor] = None,
+    block_v: int = 8,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -300,7 +301,10 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # block_v 8 (sglang: 32): 4x the single-warp programs, so the per-token chain of a step (and
+    # the t steps of an MTP verify) runs on most SMs instead of a quarter of them. Each program
+    # reduces over K alone, so the result is bit-identical for any block_v at one warp.
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), block_v)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3

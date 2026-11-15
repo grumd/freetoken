@@ -176,8 +176,7 @@ class VerifyGraphRunner:
                     for r in reqs
                 ],
                 dtype=torch.int32,
-                device=self.device,
-            )
+            ).pin_memory().to(self.device, non_blocking=True)
         )
         self.attn.set_verify_n(bs)
         self.attn.stage_verify_round(

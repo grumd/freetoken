@@ -575,15 +575,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         never touch a real request's KV/GDN state."""
         n = len(table_idx)
         bs, t = store["n"], store["t"]
-        ti = torch.as_tensor(
-            list(table_idx) + [pad_table_idx] * (bs - n),
-            dtype=torch.int64, device=self.device,
-        )
-        kv = torch.as_tensor(
-            list(kvlen) + [t] * (bs - n), dtype=torch.int32, device=self.device
-        )
-        store["table_idx"][:bs].copy_(ti.to(torch.int32))
-        store["kvlen"][:bs].copy_(kv)
+        # one pinned, non-blocking copy: a pageable one would wait for the stream to drain
+        rows = torch.tensor(
+            [list(table_idx) + [pad_table_idx] * (bs - n), list(kvlen) + [t] * (bs - n)],
+            dtype=torch.int64,
+        ).pin_memory().to(self.device, non_blocking=True)
+        ti = rows[0]
+        store["table_idx"][:bs].copy_(ti)
+        store["kvlen"][:bs].copy_(rows[1])
         store["block_table"][:bs].copy_(
             self._block_base_view().index_select(0, ti) // self.page_size
         )
@@ -638,6 +637,24 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def draft_scratch(self):
         return self._use_extend_graph(self._graph_draft)
+
+    def can_stage_draft_dev(self) -> bool:
+        return True
+
+    def stage_draft_rows_dev(self, table_idx: torch.Tensor) -> None:
+        """:meth:`stage_draft_round`'s per-request rows from a device ``table_idx`` [bs] (padding
+        rows included): no host list, so nothing waits on the stream."""
+        store = self._graph_draft
+        bs = store["n"]
+        store["table_idx"][:bs].copy_(table_idx[:bs])
+        store["block_table"][:bs].copy_(
+            self._block_base_view().index_select(0, table_idx[:bs].to(torch.int64)) // self.page_size
+        )
+
+    def stage_draft_kvlen_dev(self, kvlen: torch.Tensor) -> None:
+        """One draft step's KV lengths [bs] from device memory (see :meth:`stage_draft_rows_dev`)."""
+        store = self._graph_draft
+        store["kvlen"][: store["n"]].copy_(kvlen[: store["n"]])
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

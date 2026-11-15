@@ -7,8 +7,7 @@ per padded batch size covers every accepted count; unused rows are padded onto t
 padding slot.
 
 Requires the verify graph (its largest capture allocates the per-layer verify buffers the
-commit reads) and a linear_state_pool. Opt-in via ``--mtp-commit-graph`` /
-``FREETOKEN_MTP_COMMIT_GRAPH=1``.
+commit reads) and a linear_state_pool; captured whenever both exist.
 """
 
 from __future__ import annotations

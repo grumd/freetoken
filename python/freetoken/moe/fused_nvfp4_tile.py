@@ -148,6 +148,12 @@ def fused_experts_nvfp4_tile(
 _GU_TILE = (64, 16, 2)
 _DN_TILE = (64, 8, 4)
 _TARGET_PROGRAMS = 544
+# Token rows up to which the split-K count is the single-token one: a speculative verify window
+# then sums every route's partials exactly as a decode step does (bit-identical outputs), and
+# its programs keep a single token's short K loops -- with one split per route a program
+# walks the whole K serially, which leaves the few routes of an overlapped decode's second
+# pass latency-bound.
+_TOKEN_SPLIT_ROWS = 8
 
 
 def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0, copy=None, part=None,
@@ -157,7 +163,8 @@ def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0,
     words = packed.view(torch.int32)
     scale = _u8(scale)
     n_kb = kw // bkw
-    split = max(1, min(n_kb, _TARGET_PROGRAMS // max(1, R * triton.cdiv(N, bn))))
+    split_routes = top_k if R <= _TOKEN_SPLIT_ROWS * top_k else R
+    split = max(1, min(n_kb, _TARGET_PROGRAMS // max(1, split_routes * triton.cdiv(N, bn))))
     kb_per = triton.cdiv(n_kb, split)
     split = triton.cdiv(n_kb, kb_per)
     if part is None:

@@ -9,6 +9,10 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
+# Token rows up to which the shared expert overlaps the routed experts' copy (decode-sized batches).
+_OVERLAP_ROWS = 8
+
+
 class Qwen4ExpMoE(Qwen3_5MoE):
     """Qwen3_5MoE with the shared-expert gate on triton instead of gemv + sigmoid + mul + add.
 
@@ -100,11 +104,25 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         # one TP all_reduce for routed + gated shared (see Qwen3_5MoE.forward)
         router_logits = self.gate.forward(hidden_states)
         self._log_route_lookahead(hidden_states, num_tokens)
-        shared = self.shared_expert.forward(hidden_states, reduce=False)
-        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
-        routed = self.experts.forward(
-            hidden_states=hidden_states, router_logits=router_logits, reduce=False
-        )
+        res = []
+
+        def shared_and_gate() -> None:
+            res.append(self.shared_expert.forward(hidden_states, reduce=False))
+            res.append(shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1)))
+
+        if num_tokens <= _OVERLAP_ROWS and hidden_states.is_cuda and self.experts.overlaps_decode_copy():
+            # a few tokens (a speculative verify window): the shared expert runs while the
+            # routed experts' copy is in flight, as in a single-token step
+            routed = self.experts.forward(
+                hidden_states=hidden_states, router_logits=router_logits, reduce=False,
+                during_copy=shared_and_gate,
+            )
+        else:
+            shared_and_gate()
+            routed = self.experts.forward(
+                hidden_states=hidden_states, router_logits=router_logits, reduce=False
+            )
+        shared, gate = res
         out = shared_gate_mul_add(routed, shared, gate)
         return self.experts._maybe_all_reduce(out).view(num_tokens, hidden_dim)
 

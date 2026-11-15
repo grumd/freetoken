@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Sequence, Set, Tup
 
 import torch
 from freetoken.core import Batch, Req
-from freetoken.engine.sample import probs_from_logits, sample_residual
+from freetoken.engine.sample import probs_from_logits, speculative_accept
 from freetoken.env import ENV
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
@@ -128,6 +128,8 @@ class _RoundState(NamedTuple):
     pool: object
     moe: object
     timing: bool
+    # per draft step (candidate ids [n, K], q [n, K]) of sampled drafts; None = greedy drafts
+    draft_q: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
 
 
 class MTPManager:
@@ -157,6 +159,10 @@ class MTPManager:
         # (attention/linear.py) that the decode-exact GDN verify never writes.
         assert self.k + 1 <= CHUNK_SIZE, f"MTP k+1 must stay within one GDN chunk ({CHUNK_SIZE})"
         self.embed = model.model.embed_tokens.forward
+        self._ple_host_ids = hasattr(getattr(model, "_ple_table", None), "fill")
+        from .mtp_force import MTPForce
+
+        self._force = MTPForce.from_env(sched.engine.config.tp_info.is_primary())
         self.lm_head = model.lm_head
         # Stream width of the draft input: qwen4-exp carries hyper-connection streams
         # (ple_state_width); the dense qwen3_5 head consumes the plain hidden.
@@ -184,8 +190,8 @@ class MTPManager:
         self._timing_on = os.environ.get("FREETOKEN_MTP_TIMING") == "1"
         moe = getattr(sched.engine, "moe_offload_cache", None)
         logger.info_rank0(
-            f"MTP speculative decoding enabled: k={self.k}, eager verify, "
-            f"greedy{' + sampled' if ENV.MTP_SAMPLED else ''} | MoE "
+            f"MTP speculative decoding enabled: k={self.k}, "
+            f"greedy + sampled | MoE "
             f"strategy={getattr(moe, 'decode_target', '?')} "
             f"verify_cpu={getattr(moe, 'verify_cpu', False)}"
         )
@@ -199,9 +205,6 @@ class MTPManager:
             and not req.aborted
             and req.mm is None
             and req.mtp_streams_row is not None
-            # Greedy always; sampled only with FREETOKEN_MTP_SAMPLED=1 (Phase 1 is
-            # correct but currently a net slowdown, so it is opt-in).
-            and (req.sampling_params.is_greedy or ENV.MTP_SAMPLED)
             # room for k drafts + the bonus token within max_device_len
             and req.remain_len >= self.k + 1
         )
@@ -304,40 +307,86 @@ class MTPManager:
                 # the decode batch of THIS iteration.
                 self._deferred = set(reqs)
 
-    def _accept(self, reqs, logits, am, draft_mat, k, dev):
+    @staticmethod
+    def _stage_window_ids(reqs, C, anchor, drafts_gpu) -> None:
+        """Copy each request's verify window (pending token at ``C``, then the drafts) from the
+        device into its host ids, where a host-staged PLE fill reads ``input_ids[C:]``."""
+        win = torch.stack([anchor.to(torch.int32)] + [d.to(torch.int32) for d in drafts_gpu], dim=1).cpu()
+        for i, r in enumerate(reqs):
+            r._ids_buf[C[i] : C[i] + win.shape[1]] = win[i]
+
+    def _stage_and_verify(self, reqs, C, k, drafts_gpu, verify_batch, inp_map, inp_pos, vgr, host_fill, _lap):
+        """Steps 3-4 of :meth:`begin_round`: returns ``(logits, verify_streams)``."""
+        sched, eng = self.sched, self.engine
+        # -- 3. stage the draft ids into token_pool (the verify gather reads them on-device).
+        #       The host ids feed stop-string checks and the radix insert and are staged in
+        #       finish_round, so this half stays free of host syncs.
+        for j in range(k):
+            for i, r in enumerate(reqs):
+                sched.token_pool[r.table_idx, C[i] + 1 + j] = drafts_gpu[j][i]
+        _lap("stage")
+
+        # -- 4. verify forward (k+1 tokens per request, full per-position logits). Gather
+        #       NOW, after step 3 staged the drafts into token_pool: the verify must be
+        #       conditioned on the pending token + the actual draft chain, not placeholders.
+        verify_batch.input_ids = sched.token_pool[inp_map, inp_pos]
+        # Flag the batch so the GDN layers capture their kernel inputs for the
+        # accepted-prefix commit (Phase 2).
+        verify_batch.mtp_verify = True
+        if vgr is None:
+            return eng.extend_forward(verify_batch)
+        # Phase 3: replay the captured verify extend (fixed n_max x (k+1) shape).
+        fill = getattr(eng.model, "verify_graph_host_fill", None)
+        if host_fill and fill is not None:  # the graph WAITs on its PLE rows (eager: forward_host_ctx)
+            fill(verify_batch)
+        return vgr.replay(verify_batch)
+
+    @staticmethod
+    def _draft_sampling(reqs, dgr, dev):
+        """[3, n] fp32 (temperature, top_p, top_k) for sampled drafts, or None when every
+        request is greedy."""
+        if all(r.sampling_params.is_greedy for r in reqs):
+            return None
+        from freetoken.engine.draft_sample import DRAFT_K
+
+        rows = [[], [], []]
+        for r in reqs:
+            sp = r.sampling_params
+            greedy = sp.is_greedy
+            rows[0].append(0.0 if greedy else float(sp.temperature))
+            rows[1].append(1.0 if greedy or sp.top_p >= 1.0 else float(sp.top_p))
+            rows[2].append(float(DRAFT_K if sp.top_k is None or sp.top_k <= 0 else min(sp.top_k, DRAFT_K)))
+        return torch.tensor(rows, dtype=torch.float32).pin_memory().to(dev, non_blocking=True)
+
+    def _accept(self, reqs, logits, am, draft_mat, k, dev, draft_q=None):
         """Per-request acceptance over the verify logits (flat row ``i*(k+1)+j`` predicts
         the token at ``C+j+1``).
 
         Greedy: the target argmax at verify position ``C+j`` must equal draft ``d_j``;
         reject at the first mismatch, bonus = target argmax at the last accepted position.
-        Sampled: vLLM-style speculative rejection sampling against the target's truncated
-        distribution -- the greedy draft is a point-mass proposal, so accept ``d`` with
-        probability ``p_target(d)`` and on rejection draw from ``normalize(p - delta_d)``.
-        Mirrors ``DSparkManager._accept``.
+        Sampled: speculative sampling against the target's truncated distribution
+        (:func:`speculative_accept`) with the proposal each draft was drawn from --
+        ``draft_q`` for sampled drafts, a point mass for greedy / n-gram ones -- on the
+        device, one host sync for the whole batch.
         """
-        a_list: List[int] = []
-        bonus_list: List[int] = []
+        out: List[Tuple[torch.Tensor, torch.Tensor] | Tuple[int, int]] = []
         for i, r in enumerate(reqs):
             sp = r.sampling_params
             if sp.is_greedy:
                 nomatch = am[i, :k] != draft_mat[i]
                 a = int(nomatch.to(torch.int64).argmax()) if bool(nomatch.any()) else k
-                bonus = int(am[i, a])
+                out.append((a, int(am[i, a])))
             else:
                 probs = probs_from_logits(logits[i * (k + 1) : (i + 1) * (k + 1)], sp)
-                a, bonus = k, -1
-                for j in range(k):
-                    d = int(draft_mat[i, j])
-                    if float(torch.rand(1, device=dev)) < float(probs[j, d]):
-                        continue
-                    a = j
-                    bonus = int(sample_residual(probs[j], d))
-                    break
-                if bonus < 0:
-                    bonus = int(torch.multinomial(probs[k], 1))
-            a_list.append(a)
-            bonus_list.append(bonus)
-        return a_list, bonus_list
+                cid = torch.stack([c[i] for c, _ in draft_q]) if draft_q is not None else None
+                cq = torch.stack([q[i] for _, q in draft_q]) if draft_q is not None else None
+                out.append(speculative_accept(probs, draft_mat[i], cid, cq))
+        dev_pairs = [(i, x) for i, x in enumerate(out) if isinstance(x[0], torch.Tensor)]
+        if dev_pairs:
+            host = torch.stack([torch.stack(x) for _, x in dev_pairs]).tolist()
+            for (i, _), (a, bonus) in zip(dev_pairs, host):
+                out[i] = (int(a), int(bonus))
+        return [a for a, _ in out], [b for _, b in out]
 
     def _round(self, reqs: List[Req]) -> None:
         """One synchronous speculative round (normal_loop): draft+verify, then accept+
@@ -404,16 +453,24 @@ class MTPManager:
         # -- 2. draft chain: k sequential single-token MTP forwards. The anchor token is
         #       the pending token staged in token_pool at C (in overlap the host append
         #       only happens in the interleaved drain), so read it on-device.
-        tables_t = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64, device=dev)
-        toks = sched.token_pool[
-            tables_t, torch.tensor(C, dtype=torch.int64, device=dev)
-        ].to(torch.int32)
+        # pinned + non_blocking: a pageable host->device copy would wait for the stream to drain
+        tc = torch.tensor([[r.table_idx for r in reqs], C], dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+        tables_t = tc[0]
+        toks = sched.token_pool[tables_t, tc[1]].to(torch.int32)
+        anchor = toks
         R_last = torch.stack([r.mtp_streams_row for r in reqs], dim=0)
         drafts_gpu: List[torch.Tensor] = []
         dv = getattr(eng, "draft_vocab", None)
         subset = dv is not None and dv.active
         dgr = getattr(eng, "draft_graph_runner", None)
-        if dgr is not None and dgr.can_use(n):
+        draft_q = None
+        if dgr is not None and dgr.can_use(n) and dgr.can_chain():
+            drafts_gpu, draft_q = dgr.replay_chain(
+                [r.table_idx for r in reqs], C, R_last, toks, k, subset=subset,
+                sampling=self._draft_sampling(reqs, dgr, dev),
+            )
+            toks = drafts_gpu[-1]
+        elif dgr is not None and dgr.can_use(n):
             # Phase 3b: replay the captured draft step k times, staging the per-step
             # positions/out_loc/MTP-KV length in between (the graph bakes the kernels, not
             # the geometry). The R_next/token hand-off stays eager (copies).
@@ -458,28 +515,42 @@ class MTPManager:
                 self.stats_ngram_rounds += 1
                 for j in range(min(k, len(ng))):
                     drafts_gpu[j][i] = ng[j]
+                    if draft_q is not None:  # a fixed proposal: point mass on the n-gram token
+                        cid, q = draft_q[j]
+                        cid[i, 0] = ng[j]
+                        q[i] = 0.0
+                        q[i, 0] = 1.0
 
-        # -- 3. stage the draft ids into token_pool (the verify gather reads them on-device).
-        #       The host ids feed stop-string checks and the radix insert and are staged in
-        #       finish_round, so this half stays free of host syncs.
-        for j in range(k):
-            for i, r in enumerate(reqs):
-                sched.token_pool[r.table_idx, C[i] + 1 + j] = drafts_gpu[j][i]
-        _lap("stage")
+        if self._force is not None:
+            self._force.apply(sched, reqs, C, anchor, drafts_gpu, k)
 
-        # -- 4. verify forward (k+1 tokens per request, full per-position logits). Gather
-        #       NOW, after step 3 staged the drafts into token_pool: the verify must be
-        #       conditioned on the pending token + the actual draft chain, not placeholders.
-        verify_batch.input_ids = sched.token_pool[inp_map, inp_pos]
-        # Flag the batch so the GDN layers capture their kernel inputs for the
-        # accepted-prefix commit (Phase 2).
-        verify_batch.mtp_verify = True
+        # -- 2c. a host-staged PLE table (disk backend) fills each verify row from the HOST ids,
+        #        which hold placeholders for the drafts and, in overlap, not yet the pending
+        #        token: copy the window over first (one sync, after the draft chain). A
+        #        captured verify that WAITs for its rows instead gets them read on the table's
+        #        I/O worker once the window lands, while the graph launches.
         vgr = getattr(eng, "verify_graph_runner", None)
-        if vgr is not None and vgr.can_use(n):
-            # Phase 3: replay the captured verify extend (fixed n_max x (k+1) shape).
-            logits, verify_streams = vgr.replay(verify_batch)
-        else:
-            logits, verify_streams = eng.extend_forward(verify_batch)
+        use_vgr = vgr is not None and vgr.can_use(n)
+        fill_async = getattr(eng.model, "verify_graph_fill_async", None) if use_vgr and self._ple_host_ids else None
+        pending = None
+        if fill_async is not None:
+            win = torch.stack([anchor.to(torch.int32)] + [d.to(torch.int32) for d in drafts_gpu], dim=1)
+            host = torch.empty(win.shape, dtype=torch.int32, pin_memory=True)
+            host.copy_(win, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record()
+            pending = fill_async(verify_batch, host, ready)
+        if self._ple_host_ids and pending is None:
+            self._stage_window_ids(reqs, C, anchor, drafts_gpu)
+        try:
+            logits, verify_streams = self._stage_and_verify(reqs, C, k, drafts_gpu, verify_batch, inp_map, inp_pos,
+                                                            vgr if use_vgr else None, pending is None, _lap)
+        except BaseException:
+            if pending is not None:
+                pending.abort()  # no graph consumed the fill's signal
+            raise
+        if pending is not None:
+            pending.join()
         _lap("verify")
 
         # Restore the host geometry to the round entry so an interleaved drain appends the
@@ -490,7 +561,7 @@ class MTPManager:
 
         return _RoundState(
             reqs, C, k, n, dev, verify_batch, logits, verify_streams, drafts_gpu,
-            toks, pool, _moe, self._timing_on,
+            toks, pool, _moe, self._timing_on, draft_q,
         )
 
     def finish_round(
@@ -515,7 +586,10 @@ class MTPManager:
                 r._ids_buf[C[i] + 1 + j] = drafts_host[j][i]
         am = torch.argmax(logits, dim=-1).view(n, k + 1)
         draft_mat = torch.stack(drafts_gpu, dim=1).to(torch.int64)
-        a_list, bonus_list = self._accept(reqs, logits, am, draft_mat, k, dev)
+        a_list, bonus_list = self._accept(reqs, logits, am, draft_mat, k, dev, state.draft_q)
+        if self._force is not None:
+            a_list, bonus_list = self._force.accept(C, k)
+            self._force.dump(logits[: n * (k + 1)], C)
         bonus_gpu = torch.tensor(bonus_list, dtype=torch.int32, device=dev)
         # cumulative acceptance accounting (published via the reply stamps)
         self.stats_rounds += n

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import torch
 from freetoken.kernel.causal_conv1d import causal_conv1d_update_multi
+from freetoken.kernel.triton.gdn_verify_glue import commit_conv, stage_verify
 
 from .gdn_kernels import gdn_commit_recurrent, gdn_verify_recurrent
 
@@ -60,14 +61,18 @@ def gdn_verify_forward(layer, conv_in, a, b, pool, slots, n: int, t: int, dtype)
     conv_state = pool.conv_states[li]
     km1 = conv_state.shape[-1]
     buf = ensure_verify_buffers(layer, n, t, dtype, conv_in.device, km1)
-    raw = conv_in.reshape(n, t, -1)
-    buf.conv_win[:n, :, :km1].copy_(conv_state[slots.long()])
-    buf.conv_win[:n, :, km1:].copy_(raw.transpose(1, 2))
     mixed = buf.mixed[:n]
-    mixed.copy_(raw)
+    if conv_in.is_cuda:
+        # one launch for the copies below (they read the pre-verify conv state, so before the update)
+        stage_verify(conv_in, a, b, conv_state, slots, buf.conv_win, mixed, buf.a, buf.b, n, t)
+    else:
+        raw = conv_in.reshape(n, t, -1)
+        buf.conv_win[:n, :, :km1].copy_(conv_state[slots.long()])
+        buf.conv_win[:n, :, km1:].copy_(raw.transpose(1, 2))
+        mixed.copy_(raw)
+        buf.a[:n].copy_(a.reshape(n, t, -1))
+        buf.b[:n].copy_(b.reshape(n, t, -1))
     causal_conv1d_update_multi(mixed.transpose(1, 2), conv_state, layer._conv_weight(), slots)
-    buf.a[:n].copy_(a.reshape(n, t, -1))
-    buf.b[:n].copy_(b.reshape(n, t, -1))
     q, k, v = _split_qkv(layer, mixed)
     o = gdn_verify_recurrent(
         q, k, v, buf.a[:n], buf.b[:n], A_log=layer.A_log, dt_bias=layer.dt_bias,
@@ -88,11 +93,14 @@ def gdn_verify_commit(layer, pool, slots: torch.Tensor, lens: torch.Tensor) -> N
     km1 = buf.km1
     # conv slot = the km1 raw inputs ending at the last accepted token: columns [L, L+km1)
     # of [pre-state | raw inputs].
-    cols = lens.long().view(n, 1, 1) + torch.arange(km1, device=lens.device).view(1, 1, km1)
     win = buf.conv_win[:n]
-    pool.conv_states[li].index_copy_(
-        0, slots.long(), win.gather(2, cols.expand(n, win.shape[1], km1))
-    )
+    if win.is_cuda:
+        commit_conv(win, lens, slots, pool.conv_states[li], n)
+    else:
+        cols = lens.long().view(n, 1, 1) + torch.arange(km1, device=lens.device).view(1, 1, km1)
+        pool.conv_states[li].index_copy_(
+            0, slots.long(), win.gather(2, cols.expand(n, win.shape[1], km1))
+        )
     q, k, v = _split_qkv(layer, buf.mixed[:n])
     gdn_commit_recurrent(
         q, k, v, buf.a[:n], buf.b[:n], A_log=layer.A_log, dt_bias=layer.dt_bias,

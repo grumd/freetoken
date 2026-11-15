@@ -88,8 +88,42 @@ class Qwen4ExpMTPMoE(BaseOP):
             self.experts.top_k,
             self.experts.renormalize,
         )
-        routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        if self._fp4 is not None:
+            routed = self.experts._maybe_all_reduce(self._fp4_routed(hidden_states, topk_weights, topk_ids))
+        else:
+            routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
         return (routed + shared).view(num_tokens, hidden_dim)
+
+    _fp4 = None
+
+    def quantize_experts_fp4(self) -> int:
+        """--mtp-experts-fp4: replace the resident bf16 routed experts with NVFP4 banks (the main
+        model's expert format, read by the same kernels). Returns the bf16 bytes released."""
+        from freetoken.moe.fused_nvfp4_tile import decode_supported
+        from freetoken.moe.nvfp4_quant import quantize_nvfp4
+
+        ex = self.experts
+        gu, dn = ex.gate_up_proj, ex.down_proj
+        if not (gu.is_cuda and gu.dtype == torch.bfloat16 and gu.shape[-1] % 16 == 0 and dn.shape[-1] % 16 == 0):
+            return 0
+        banks = (*quantize_nvfp4(gu), *quantize_nvfp4(dn))
+        if not decode_supported(banks[0], banks[3]):
+            return 0
+        freed = gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+        self._fp4 = banks
+        ex.gate_up_proj = ex.down_proj = None
+        return freed
+
+    def _fp4_routed(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        """The NVFP4 routed experts' TP partial: the decode GEMV for a few tokens (the draft
+        steps), the grouped tile kernels for a prompt (draft prefill)."""
+        from freetoken.moe.fused_nvfp4_tile import fused_experts_nvfp4_tile, nvfp4_decode_silu
+
+        if x.shape[0] <= 8:
+            return nvfp4_decode_silu(x, *self._fp4, topk_weights, topk_ids.to(torch.int32))
+        return fused_experts_nvfp4_tile(
+            x, *self._fp4, topk_weights, topk_ids, self.experts.num_experts, activation="silu",
+        )
 
 
 class Qwen4ExpMTPBlock(BaseOP):
@@ -152,6 +186,14 @@ class Qwen4ExpMTP(BaseOP):
                 for i in range(args.mtp_num_layers)
             ]
         )
+        # --mtp-head-fp8: the dense linears read half the bytes on every draft step; drafts only
+        # propose (the target verifies each one). The routers stay bf16, as --dense-fp8 keeps them.
+        from freetoken.env import ENV
+
+        if ENV.MTP_HEAD_FP8:
+            from freetoken.layers.quantization.linear.unquantized import mark_online_fp8
+
+            mark_online_fp8(self, skip=frozenset({"gate", "shared_expert_gate"}))
 
     def draft_step(
         self,

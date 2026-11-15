@@ -389,6 +389,71 @@ def test_async_prefill_fill_reads_the_next_chunk_ahead(tmp_path, monkeypatch):
     assert _bitwise_equal(sync.lookup(ids), oracle.lookup(ids))
 
 
+@requires_cuda
+@torch.inference_mode()  # as the engine runs: the I/O worker thread is outside it
+def test_async_graph_fill_for_a_verify_window(tmp_path):
+    """fill_graph_async (the MTP verify): the graph launches before the worker reads the rows,
+    the window's device->host copy lands late, and the rows are still exact; a failed read
+    still signals (no hang) and re-raises at join; an aborted fill (no launch) clears its
+    signal, so the next graph waits for its own rows instead of reading stale ones."""
+    disk, oracle, args = _make_table(tmp_path)
+    if not disk.wait_sync:
+        pytest.skip("stream memops unavailable (launch-gating)")
+    emb = _embedding()
+    t = 4  # k + 1
+    row_ids = torch.zeros((t, args.num_ngram_heads), dtype=torch.int64, device="cuda")
+    out = torch.empty((t, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            disk.lookup(row_ids, out)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    def window(win):
+        torch.cuda._sleep(20_000_000)  # the draft chain still running: the copy lands late
+        host = torch.empty((1, len(win)), dtype=torch.int32, pin_memory=True)
+        host.copy_(torch.tensor([win], dtype=torch.int32, device="cuda"), non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record()
+        return host, ready
+
+    ctx = [3, 4]
+    for win in ([7, 9, 13, 2], [5, 6, 8, 10]):
+        host, ready = window(win)
+        c = torch.tensor(ctx, dtype=torch.int64)
+        pending = disk.fill_graph_async(ready, lambda: [torch.cat((c, host[0].to(torch.int64)))])
+        ids = emb.row_ids(_meta([win], [ctx])).cuda()
+        row_ids.copy_(ids)
+        graph.replay()
+        pending.join()
+        torch.cuda.synchronize()
+        assert _bitwise_equal(out, oracle.lookup(ids)), f"window {win}"
+        ctx = win[-2:]
+
+    def boom():
+        raise RuntimeError("read failed")
+
+    _, ready = window([1, 2, 3, 4])
+    pending = disk.fill_graph_async(ready, boom)
+    graph.replay()
+    with pytest.raises(RuntimeError, match="read failed"):
+        pending.join()
+    torch.cuda.synchronize()  # the WAIT was released
+
+    _, ready = window([1, 2, 3, 4])
+    disk.fill_graph_async(ready, lambda: [torch.tensor([1, 2, 20, 21, 22, 23])]).abort()
+    win = [30, 31, 32, 33]
+    ids = emb.row_ids(_meta([win], [[22, 23]])).cuda()
+    row_ids.copy_(ids)
+    graph.replay()  # launch first, fill after: must wait for this fill, not pass on the aborted one
+    torch.cuda._sleep(20_000_000)
+    disk.fill([torch.tensor([22, 23, *win])], graph=True)
+    torch.cuda.synchronize()
+    assert _bitwise_equal(out, oracle.lookup(ids)), "aborted fill's signal leaked into the next graph"
+
+
 def _write_checkpoint_bf16(tmp_path, table, n_shards):
     from safetensors.torch import save_file
 

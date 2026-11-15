@@ -7,11 +7,12 @@ runner captures the *single draft step* with its own static geometry -- one grap
 padded batch size (mirroring ``GraphRunner``/``VerifyGraphRunner``), replayed ``k``
 times per round with the per-step positions / out_loc / MTP-KV length staged in
 between. The ``R_next``/token hand-off between steps stays outside the graph (a device
-copy and an argmax), so nothing here needs to know ``k``.
+copy), so nothing here needs to know ``k``. Each step has a greedy variant and a sampled
+one (the draft drawn from the head's truncated distribution, engine/draft_sample.py).
 
 Everything inside the captured region is a device kernel; the eager Python (metadata
-build, page allocation, per-step staging) stays outside. Off by default
-(``--mtp-draft-graph`` / ``FREETOKEN_MTP_DRAFT_GRAPH=1``).
+build, page allocation, per-step staging) stays outside. Captured whenever the model has an
+MTP head.
 """
 
 from __future__ import annotations
@@ -104,8 +105,8 @@ class DraftGraphRunner:
         self.width = width
         self.device = device
         self.dummy_table_idx = graph_runner.dummy_req.table_idx
-        # (padded bs, draft-vocab subset head?) -> graph
-        self.graph_map: Dict[Tuple[int, bool], torch.cuda.CUDAGraph] = {}
+        # (padded bs, draft-vocab subset head?, sampled drafts?) -> graph
+        self.graph_map: Dict[Tuple[int, bool, bool], torch.cuda.CUDAGraph] = {}
         # Private memory pool: the draft graphs must NOT share the decode/verify pool, or a
         # replay of one overwrites the other's baked transients.
         self.pool = None
@@ -117,6 +118,16 @@ class DraftGraphRunner:
         # The MTP block's output stream is the resident bf16 draft dtype.
         self.R_out = torch.empty(self.n_max, width, dtype=torch.bfloat16, device=device)
         self.draft_ids = torch.zeros(self.n_max, dtype=torch.int32, device=device)
+        from .draft_sample import DRAFT_K
+
+        # sampled variants: per-request sampling params (staged per round) and per-step
+        # uniforms in; the draft's candidates and their probabilities q out, for the acceptance
+        self.temp = torch.zeros(self.n_max, dtype=torch.float32, device=device)
+        self.top_p = torch.ones(self.n_max, dtype=torch.float32, device=device)
+        self.top_k = torch.full((self.n_max,), DRAFT_K, dtype=torch.int64, device=device)
+        self.u = torch.full((self.n_max, DRAFT_K), 0.5, dtype=torch.float32, device=device)
+        self.cand_ids = torch.zeros(self.n_max, DRAFT_K, dtype=torch.int32, device=device)
+        self.cand_q = torch.zeros(self.n_max, DRAFT_K, dtype=torch.float32, device=device)
         # Padding rows: position 0 and the dummy page's slot (safe no-op writes).
         self.pad_positions = torch.zeros(self.n_max, dtype=torch.int32, device=device)
         self.pad_out_loc = (
@@ -139,9 +150,10 @@ class DraftGraphRunner:
         # one graph per head variant: the full-vocab argmax and, when a draft vocab is
         # configured, the subset argmax (chosen per round by whether the set is active)
         for subset in (False, True) if self.draft_vocab is not None else (False,):
-            self._capture_variant(bs, subset)
+            for sampled in (False, True):
+                self._capture_variant(bs, subset, sampled)
 
-    def _capture_variant(self, bs: int, subset: bool) -> None:
+    def _capture_variant(self, bs: int, subset: bool, sampled: bool = False) -> None:
         dummy = self.gr.dummy_req
         reqs = [_DraftReq(dummy.table_idx, 0, 1) for _ in range(bs)]
         self.positions[:bs] = self.pad_positions[:bs]
@@ -155,19 +167,19 @@ class DraftGraphRunner:
         with self.attn.draft_scratch():
             sb.attn_metadata = self.attn.make_draft_metadata()
             with get_global_ctx().forward_batch(sb):
-                self._forward(bs, sb, subset)  # eager warmup (materializes scratch)
+                self._forward(bs, sb, subset, sampled)  # eager warmup (materializes scratch)
                 # The MTP block is the only QSA layer here, so qsa_forward's slot-0
                 # ``_plan_index_writes`` guard does not fire during capture; clear the
                 # warmup plan so the per-step index computation is captured (its stale
                 # warmup rows would otherwise be replayed against real geometry).
                 sb.attn_metadata.cmp_rows = None
                 with torch.cuda.graph(graph, pool=self.pool, stream=self.gr.stream):
-                    self._forward(bs, sb, subset)
-        self.graph_map[(bs, subset)] = graph
+                    self._forward(bs, sb, subset, sampled)
+        self.graph_map[(bs, subset, sampled)] = graph
         if self.pool is None:
             self.pool = graph.pool()  # reuse this graph's mempool for the remaining sizes
 
-    def _forward(self, bs: int, sb: _DraftBatch, subset: bool) -> None:
+    def _forward(self, bs: int, sb: _DraftBatch, subset: bool, sampled: bool = False) -> None:
         R_next, sample_hidden = self.mtp.draft_step(
             self.embed, self.R_in[:bs], self.token_in[:bs], sb
         )
@@ -176,7 +188,21 @@ class DraftGraphRunner:
         # gather (``x = x[attn_metadata.last_indices]``) indexes a capture-time temporary
         # that is freed once the capture returns (device-side OOB on replay). At t=1 every
         # row IS the last row.
-        if subset:
+        if sampled:
+            from .draft_sample import candidates, sample
+
+            if subset:
+                logits, ids = self.draft_vocab.local_logits(sample_hidden), self.draft_vocab.ids
+            else:
+                start, count = self.lm_head.vocab_range
+                logits = self.lm_head._logits(sample_hidden)[:, :count]
+                ids = torch.arange(start, start + count, dtype=torch.int32, device=logits.device)
+            vals, cid = candidates(logits, ids, getattr(self.lm_head, "_comm", None), self.lm_head.tp_size)
+            d, q = sample(vals, cid, self.temp[:bs], self.top_p[:bs], self.top_k[:bs], self.u[:bs])
+            self.draft_ids[:bs] = d
+            self.cand_ids[:bs] = cid
+            self.cand_q[:bs] = q
+        elif subset:
             self.draft_ids[:bs] = self.draft_vocab.argmax(sample_hidden)
         else:
             self.draft_ids[:bs] = self.lm_head.forward_argmax(sample_hidden)
@@ -215,8 +241,71 @@ class DraftGraphRunner:
         self.out_loc[:n].copy_(out_loc)
         self.attn.set_draft_n(bs)
         self.attn.stage_draft_round(list(table_idx), list(kvlen), pad_table_idx=self.dummy_table_idx)
-        self.graph_map[(bs, subset)].replay()
+        self.graph_map[(bs, subset, False)].replay()
         return self.R_out[:n], self.draft_ids[:n]
+
+    def can_chain(self) -> bool:
+        return getattr(self.attn, "can_stage_draft_dev", lambda: False)()
+
+    @torch.inference_mode()
+    def replay_chain(
+        self,
+        table_idx: Sequence[int],
+        cached: Sequence[int],
+        R_in: torch.Tensor,
+        tokens: torch.Tensor,
+        k: int,
+        subset: bool = False,
+        sampling: torch.Tensor | None = None,
+    ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]] | None]:
+        """The whole k-step draft chain with no host sync. Every step's geometry is known at
+        round entry (step ``j`` of request ``i`` sits at position ``cached[i] + j`` with KV
+        length ``cached[i] + j + 1``), so it goes to the device in one pinned copy and the k
+        replays run back to back, each step's outputs feeding the next on the device. (Staging
+        step by step from host lists made every step wait for the previous replay.)
+        ``sampling`` [3, n] fp32 on the device (temperature, top_p, top_k per request; temperature
+        0 = greedy) draws each draft from the head's truncated distribution. Returns the k draft id tensors [n] and, when sampled, each step's
+        ``(candidate ids [n, K], q [n, K])``."""
+        n = len(table_idx)
+        assert self.can_use(n), f"draft n={n} outside captured range (max {self.n_max})"
+        bs = self._select_bs(n)
+        pad = bs - n
+        rows = [list(table_idx) + [self.dummy_table_idx] * pad]
+        rows += [[c + j for c in cached] + [0] * pad for j in range(k)]
+        rows += [[c + j + 1 for c in cached] + [1] * pad for j in range(k)]
+        geo = torch.tensor(rows, dtype=torch.int64).pin_memory().to(self.device, non_blocking=True)
+        ti, pos, kvlen = geo[0], geo[1 : 1 + k], geo[1 + k :].to(torch.int32)
+        out_loc = get_global_ctx().page_table[ti.unsqueeze(0).expand(k, bs), pos].to(torch.int32)
+        pos = pos.to(torch.int32)
+        self.R_in[:bs] = 0
+        self.R_in[:n].copy_(R_in)
+        self.token_in[:bs] = 0
+        self.token_in[:n].copy_(tokens)
+        self.attn.set_draft_n(bs)
+        self.attn.stage_draft_rows_dev(ti)
+        sampled = sampling is not None
+        if sampled:
+            self.temp[:bs] = 0.0
+            self.temp[:n].copy_(sampling[0])
+            self.top_p[:n].copy_(sampling[1])
+            self.top_k[:n].copy_(sampling[2].to(torch.int64))
+            # drawn eagerly from the torch generator, which every TP rank advances identically
+            u = torch.rand((k, bs, self.u.shape[1]), device=self.device)
+        drafts, qs = [], ([] if sampled else None)
+        for j in range(k):
+            if j:
+                self.R_in[:n].copy_(self.R_out[:n])
+                self.token_in[:n].copy_(self.draft_ids[:n])
+            self.positions[:bs].copy_(pos[j])
+            self.out_loc[:bs].copy_(out_loc[j])
+            self.attn.stage_draft_kvlen_dev(kvlen[j])
+            if sampled:
+                self.u[:bs].copy_(u[j])
+            self.graph_map[(bs, subset, sampled)].replay()
+            drafts.append(self.draft_ids[:n].clone())
+            if sampled:
+                qs.append((self.cand_ids[:n].clone(), self.cand_q[:n].clone()))
+        return drafts, qs
 
 
 __all__ = ["DraftGraphRunner"]

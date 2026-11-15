@@ -21,15 +21,13 @@ _MTP_ENV = "FREETOKEN_ENABLE_MTP"
 _OVERLAP_ENV = "FREETOKEN_DISABLE_OVERLAP_SCHEDULING"
 # The Phase-1/3 runtime knobs are env-backed flags (see args._ENV_FLAG_*).
 _KNOB_ENVS = (
-    "FREETOKEN_MTP_VERIFY_GRAPH",
-    "FREETOKEN_MTP_DRAFT_GRAPH",
-    "FREETOKEN_MTP_COMMIT_GRAPH",
-    "FREETOKEN_MTP_SAMPLED",
     "FREETOKEN_MTP_CHAIN",
     "FREETOKEN_MTP_NGRAM",
     "FREETOKEN_MTP_NGRAM_SIZE",
     "FREETOKEN_MTP_DRAFT_VOCAB",
     "FREETOKEN_MTP_HEAD_FP8",
+    "FREETOKEN_MTP_EXPERTS_FP4",
+    "FREETOKEN_MTP_DRAFT_TOKENS",
 )
 
 
@@ -153,8 +151,9 @@ def test_mtp_artifact_dir_resolves_a_single_file_to_its_parent(tmp_path):
 
 
 class TestMtpRuntimeKnobs:
-    """--mtp-verify-graph / --mtp-sampled / --mtp-chain / --mtp-ngram fold into the
-    env gates the engine reads (args._ENV_FLAG_ENABLE/_ENV_FLAG_VALUE)."""
+    """--mtp-chain / --mtp-ngram / --mtp-experts-fp4 fold into the env gates the engine reads
+    (args._ENV_FLAG_ENABLE/_ENV_FLAG_VALUE); the verify/draft/commit graphs and sampled
+    drafting have no switch (always on with --mtp on)."""
 
     def test_absent_flags_leave_env_untouched(self):
         _parse([])
@@ -162,14 +161,11 @@ class TestMtpRuntimeKnobs:
             assert env not in os.environ
 
     def test_flags_set_their_env_gates(self):
-        _parse([
-            "--mtp-verify-graph", "--mtp-draft-graph", "--mtp-sampled", "--mtp-chain",
-            "--mtp-ngram", "--mtp-ngram-size", "5",
-        ])
-        assert os.environ["FREETOKEN_MTP_VERIFY_GRAPH"] == "1"
-        assert os.environ["FREETOKEN_MTP_DRAFT_GRAPH"] == "1"
-        assert os.environ["FREETOKEN_MTP_SAMPLED"] == "1"
+        _parse(["--mtp-chain", "--mtp-ngram", "--mtp-ngram-size", "5", "--mtp-experts-fp4",
+                "--mtp-draft-tokens", "2"])
         assert os.environ["FREETOKEN_MTP_CHAIN"] == "1"
+        assert os.environ["FREETOKEN_MTP_EXPERTS_FP4"] == "1"
+        assert os.environ["FREETOKEN_MTP_DRAFT_TOKENS"] == "2"
         assert os.environ["FREETOKEN_MTP_NGRAM"] == "1"
         assert os.environ["FREETOKEN_MTP_NGRAM_SIZE"] == "5"
 

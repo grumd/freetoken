@@ -326,6 +326,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         ]
         table.fill(runs, graph=True)
 
+    def verify_graph_fill_async(self, batch, window: torch.Tensor, ready: torch.cuda.Event):
+        """:meth:`verify_graph_host_fill` on the PLE table's I/O worker, so the captured verify
+        launches while its rows are read (its PLE layer WAITs for them): ``window`` [n, t]
+        int32 pinned holds each request's verify tokens once ``ready`` completes. Returns the
+        :class:`~.ple_disk.AsyncGraphFill` (join after the launch, abort if it does not happen),
+        or None when the table needs the rows staged first."""
+        table = getattr(self, "_ple_table", None)
+        if not getattr(table, "wait_sync", False):
+            return None
+        from .ple_disk import _context
+
+        eos = table.eos_token_id
+        ctx = [torch.tensor(_context(r.input_ids, r.cached_len, eos), dtype=torch.int64) for r in batch.padded_reqs]
+        return table.fill_graph_async(
+            ready, lambda: [torch.cat((c, window[i].to(torch.int64))) for i, c in enumerate(ctx)]
+        )
+
     def commit_mtp_verify(self, pool, slots, lens) -> None:
         """Commit the accepted MTP-verify prefix into every GDN layer's live state.
         ``slots`` [n] int32 live GDN slots, ``lens`` [n] int32 accepted tokens per request

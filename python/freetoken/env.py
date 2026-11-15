@@ -76,9 +76,6 @@ class EnvClassSingleton:
     # reads saturate a 7 GB/s drive. See checkpoint/ftw.py:iter_ftw_weights.
     FTW_LOAD_WORKERS = EnvInt(16)
     FTW_LOAD_WINDOW_MB = EnvInt(2048)
-    # Capture the MTP GDN commit as a CUDA graph (one per verify batch size); eager, its
-    # ~3 small launches per GDN layer make the commit launch-bound.
-    MTP_COMMIT_GRAPH = EnvBool(False)
     # PLE table load: outstanding O_DIRECT chunk reads per shard. The ~48 GiB table is
     # read shard-by-shard (concentrating workers on one file beats spreading them across
     # shards on this ZFS pool). 8 -> ~2.8 GiB/s, 16 -> ~4.2 GiB/s on the NVMe.
@@ -88,10 +85,6 @@ class EnvClassSingleton:
     # k+1-token extend. Must satisfy k + 1 <= the GDN chunk size (64) so verify
     # extends never cross a x64 track boundary.
     MTP_DRAFT_TOKENS = EnvInt(3)
-    # Sampled-request MTP (Phase 1 rejection sampling). OFF by default: it is correct but
-    # currently a net slowdown until the speed phases land, so production (sampled by
-    # default) is not gated on it.
-    MTP_SAMPLED = EnvBool(False)
     # Chain MTP rounds back-to-back (no plain decode step in between): the next round
     # consumes the just-published bonus as its pending token. A round is cheaper per token
     # than a plain decode step (Qwen3.8-27B, 2x3090: 69 vs 63 tok/s at 1k context, 74 vs
@@ -118,6 +111,10 @@ class EnvClassSingleton:
     # Quantize the bf16 MTP draft head's linears to fp8 per row at load (W8A16): half the
     # draft step's weight traffic; only the drafts change, the target verifies them.
     MTP_HEAD_FP8 = EnvBool(True)
+    # Quantize the MTP draft head's resident bf16 routed experts to NVFP4 at load (RTN, per-16
+    # e4m3 scales): ~1.8 GB/rank of VRAM back to the main expert cache and a quarter of the
+    # draft step's expert traffic; only the drafts change, the target verifies them.
+    MTP_EXPERTS_FP4 = EnvBool(False)
     # Quantize every bf16 linear of the main model (routers excepted) to fp8 per row at load
     # and run it W8A16: half the weight traffic of bandwidth-bound decode, at the cost of
     # fp8 weight rounding. Off by default (it changes the model's numerics).

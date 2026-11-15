@@ -13,6 +13,9 @@ from .base import LinearKernel, LinearMethod
 
 
 
+_ROWS_GEMV = 8  # up to this many rows take gemv_rows instead of cuBLAS
+
+
 class TorchLinearKernel(LinearKernel):
     name = "torch"
 
@@ -31,6 +34,14 @@ class TorchLinearKernel(LinearKernel):
             from freetoken.kernel.triton.gemv import gemv
 
             return gemv(x, w)
+        # a few rows (an MTP verify window) share each weight read in one streaming kernel too
+        if (
+            b is None and x.dim() == 2 and 1 < x.shape[0] <= _ROWS_GEMV and x.is_cuda
+            and x.dtype == torch.bfloat16 and x.stride(1) == 1 and w.stride(1) == 1
+        ):
+            from freetoken.kernel.triton.gemv import gemv_rows
+
+            return gemv_rows(x, w)
         return F.linear(x, w, b)
 
 

@@ -46,6 +46,8 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Opt-in round chaining (`FREETOKEN_MTP_CHAIN`) (`a64e66d`)
 - Self-history n-gram draft combiner (`FREETOKEN_MTP_NGRAM`) (`d28592f`)
 - Frequency-adapted draft vocabulary (`--mtp-draft-vocab`) and fp8 draft head at load (`--mtp-head-fp8`) (`20d8a02`)
+- Sampled MTP drafts: each draft drawn from the head's truncated distribution and accepted with `min(1, p/q)` (distribution-exact), on the device with one host sync per round
+- `--mtp-experts-fp4`: the bf16 MTP draft head's routed experts as NVFP4 at load (more expert-cache VRAM, faster drafts, drafts only; opt-in)
 
 **FTW checkpoints**
 - TP-slicing for FTW checkpoints (dense replay + expert banks) (`213389c`)
@@ -90,9 +92,11 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Default `expert_load_workers` raised 8 → 16 (saturates the NVMe) (`7e71fd8`)
 - Small MoE chunks fetch routed experts instead of whole layers (`aa1930f`)
 - MTP round chaining is on by default (`--no-mtp-chain` to interleave plain decode steps) (`20d8a02`)
+- MTP: the verify/draft/commit CUDA graphs and sampled-request MTP are always on with `--mtp on`; `--mtp-verify-graph`, `--mtp-draft-graph`, `--mtp-commit-graph`, `--mtp-sampled` and their `FREETOKEN_MTP_*` env vars are removed
 - compressed-tensors `ignore` matches module names exactly; existing FTWs of checkpoints that ignore a container with quantized children (Qwen3.8-27B-NVFP4) must be re-converted (`50b629f`)
 
 ### Fixed
+- MTP with the disk PLE backend: verify rows read token 0's PLE row for every draft (wrong logits), and the captured verify hung on the PLE flag
 - **FTW: TP band offsets scaled by bank element size** — the fp16 `gate_up_global` bank was read with element offsets treated as bytes, zeroing half the experts at TP>1 (`9b0e853`)
 - FTW: O_DIRECT-safe band reads (EINVAL on ext4) and `piece dest_off` (`cb56d9d`)
 - FTW: release the numpy view before closing the down-family mmap (`e7180f9`)
@@ -142,6 +146,7 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Server: a backend death fails requests parked on their output (500 / cut stream instead of a hung connection) (`ccd06d2`); a scheduler worker that crashes mid-serve exits hard instead of blocking in NCCL teardown (`3ca4248`)
 
 ### Performance
+- MTP on Qwen3.8-Flash-Next FP4: token-split NVFP4 tile, shared expert overlapped with the expert copy, chained draft graphs, multi-row bf16 GEMV, GDN recurrent `block_v` 8 (bit-identical), PLE disk fill overlapping the verify launch, fused GDN verify/commit copies -- 2x3080 greedy 89 -> 116 tok/s (+30%), temperature 1.0 89 -> 110 (+24%); 1 GPU +20% / +17% (k=2); verify KLD equals the prefill path
 - MTP: one verify CUDA graph per padded batch size (`13d7f89`); pin FLA tensor caches after capture (`2fd9f60`); hoist the GDN commit's layer-invariant tensors out of the per-layer loop (`0e7d171`)
 - MTP round overhaul: decode-exact GDN verify + one-call commit, per-round split-KV re-plan of the verify/draft attention graphs, per-rank draft argmax; Qwen3.8-27B MTP 53 -> 88 tok/s at 1k and 29 -> 88 at 14k context (`20d8a02`)
 - Split-K small-M W8A16 fp8 GEMM for batched decode / MTP verify (`42cade6`); tail-wave-aware NVFP4 small-M split on smem-bound GPUs (`7e11dc6`)

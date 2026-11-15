@@ -28,16 +28,27 @@ MIN_WINDOW = 2048        # generated tokens before a miss rate is judged
 MISS_LIMIT = 0.03        # generated tokens outside the set that trigger an early rebuild
 
 
+_QUANT_ROWS = 1024     # rows quantized per block on a rebuild
+
+
 class DraftVocabHead:
-    def __init__(self, lm_head, size: int, device: torch.device) -> None:
+    def __init__(self, lm_head, size: int, device: torch.device, quantize: bool | None = None) -> None:
         self.lm_head = lm_head
         self.size = size
         start, count = lm_head.vocab_range
         self.start, self.count = start, count
         weight = lm_head.weight
         self.fp8 = weight.dtype == torch.float8_e4m3fn
+        # --mtp-head-fp8: a bf16 head's chosen rows are kept as fp8 per row (half the bytes every
+        # draft step reads; the draft only proposes, the target verifies each token)
+        if quantize is None:
+            from freetoken.env import ENV
+
+            quantize = bool(ENV.MTP_HEAD_FP8)
+        self.quantize = quantize and not self.fp8 and weight.dtype == torch.bfloat16
+        dtype = torch.float8_e4m3fn if self.quantize else weight.dtype
         # rows of THIS rank's shard; unused rows carry id -1 and are masked out
-        self.w = torch.zeros(size, weight.shape[1], dtype=weight.dtype, device=device)
+        self.w = torch.zeros(size, weight.shape[1], dtype=dtype, device=device)
         self.scale = torch.ones(size, dtype=torch.float32, device=device)
         self.ids = torch.full((size,), -1, dtype=torch.int32, device=device)
         self.counts = np.zeros(lm_head.num_embeddings, dtype=np.int64)
@@ -63,15 +74,20 @@ class DraftVocabHead:
 
     # ------------------------------------------------------------------ device side
 
-    def argmax(self, x: torch.Tensor) -> torch.Tensor:
-        """Greedy draft token per row ([T] int32) over the current set (graph-capturable)."""
-        if self.fp8:
+    def local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """fp32 logits [T, size] of this rank's rows of the set (column c is token ``ids[c]``;
+        unused columns -inf). Graph-capturable."""
+        if self.fp8 or self.quantize:
             from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
             logits = fp8_pertensor_linear(x, self.w, self.scale)
         else:
             logits = torch.nn.functional.linear(x, self.w)
-        logits = logits.float().masked_fill(self.ids < 0, float("-inf"))
+        return logits.float().masked_fill(self.ids < 0, float("-inf"))
+
+    def argmax(self, x: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token per row ([T] int32) over the current set (graph-capturable)."""
+        logits = self.local_logits(x)
         val, idx = logits.max(dim=-1)
         ids = self.ids[idx]
         if self.lm_head.tp_size == 1:
@@ -120,7 +136,15 @@ class DraftVocabHead:
         mine = chosen[(chosen >= self.start) & (chosen < self.start + self.count)]
         n = mine.size
         rows = torch.from_numpy(mine - self.start).to(self.w.device)
-        self.w[:n].copy_(self.lm_head.weight[rows])
+        if self.quantize:
+            # in row blocks: the elastic expert cache leaves little VRAM for an fp32 transient
+            for r in range(0, n, _QUANT_ROWS):
+                blk = self.lm_head.weight[rows[r : r + _QUANT_ROWS]].float()
+                s = (blk.abs().amax(dim=1) / 448.0).clamp(min=1e-12)
+                self.w[r : r + blk.shape[0]].copy_((blk / s[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn))
+                self.scale[r : r + blk.shape[0]].copy_(s)
+        else:
+            self.w[:n].copy_(self.lm_head.weight[rows])
         if self.fp8:
             self.scale[:n].copy_(self.lm_head.weight_scale[rows])
         self.ids.fill_(-1)

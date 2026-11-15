@@ -153,5 +153,14 @@ class HybridBackend(BaseAttnBackend):
     def stage_draft_round(self, table_idx, kvlen, pad_table_idx: int) -> None:
         self.prefill_backend.stage_draft_round(table_idx, kvlen, pad_table_idx)
 
+    def can_stage_draft_dev(self) -> bool:
+        return hasattr(self.prefill_backend, "stage_draft_rows_dev")
+
+    def stage_draft_rows_dev(self, table_idx) -> None:
+        self.prefill_backend.stage_draft_rows_dev(table_idx)
+
+    def stage_draft_kvlen_dev(self, kvlen) -> None:
+        self.prefill_backend.stage_draft_kvlen_dev(kvlen)
+
     def draft_scratch(self):
         return self.prefill_backend.draft_scratch()

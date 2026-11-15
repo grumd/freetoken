@@ -185,19 +185,21 @@ def _split_reference(slot_for_id, usage, id_of_slot, recency, credit, step, laye
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("frac", [0.0, 0.1, 0.5, 1.0])
-def test_decode_split_matches_reference(frac):
+@pytest.mark.parametrize("T", [1, 4])
+def test_decode_split_matches_reference(frac, T):
     """CPU-assisted decode's ensure: fetched share by per-layer credit (exact in the long run),
     most recently routed misses first, LRU victims never among this step's routed slots, and the
-    CPU's inputs (x, expert ids of the unfetched misses, weights) staged in pinned memory."""
+    CPU's inputs (x, expert ids of the unfetched misses, weights) staged in pinned memory. T=4:
+    a speculative verify window, whose tokens share experts."""
     torch.manual_seed(1)
     E, S, K, H, L = 48, 64, 8, 256, 2
     cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=torch.device("cuda"),
                             quant_format="bf16")
     cache.set_decode_fetch(frac)
     q = round(frac * Q)
-    io = {"x": torch.zeros(1, H, dtype=torch.bfloat16, pin_memory=True),
-          "ids": torch.zeros(1, K, dtype=torch.int32, pin_memory=True),
-          "w": torch.zeros(1, K, dtype=torch.float32, pin_memory=True)}
+    io = {"x": torch.zeros(T, H, dtype=torch.bfloat16, pin_memory=True),
+          "ids": torch.zeros(T, K, dtype=torch.int32, pin_memory=True),
+          "w": torch.zeros(T, K, dtype=torch.float32, pin_memory=True)}
     slot_for_id, usage, id_of_slot = [-1] * (L * E), [0] * S, [-1] * S
     recency, credit = [-1] * (L * E), [0] * L
     total_missing = total_fetched = 0
@@ -205,10 +207,10 @@ def test_decode_split_matches_reference(frac):
     probs = torch.softmax(torch.randn(L, E) * 2, -1)
     for step in range(1, 301):
         layer = step % L
-        ids = torch.multinomial(probs[layer], K).to(torch.int32)
-        x = torch.randn(1, H, device="cuda").to(torch.bfloat16)
-        w = torch.softmax(torch.randn(1, K, device="cuda"), -1)
-        g = ids.view(1, K).cuda()
+        ids = torch.cat([torch.multinomial(probs[layer], K) for _ in range(T)]).to(torch.int32)
+        x = torch.randn(T, H, device="cuda").to(torch.bfloat16)
+        w = torch.softmax(torch.randn(T, K, device="cuda"), -1)
+        g = ids.view(T, K).cuda()
         cache.ensure_experts_split(layer, g, w, x, io)
         torch.cuda.synchronize()
         want, order = _split_reference(slot_for_id, usage, id_of_slot, recency, credit, step, layer,

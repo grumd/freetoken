@@ -152,7 +152,7 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
         _fast_index_copy_spec(feature_size)
         for feature_size in DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES
     )
-    specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=8))
+    specs.append(_fast_index_copy_multi_spec(num_threads=512, blocks_per_bank=2))
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=64))
     specs.append(_batch_memcpy_spec())

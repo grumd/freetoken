@@ -64,23 +64,46 @@ def test_gemv3_split_router_first_is_bit_identical(seed):
     torch.testing.assert_close(front, full, rtol=0, atol=0)
 
 
-def test_linear_kernel_takes_gemv_only_for_one_bf16_row(monkeypatch):
+def test_linear_kernel_routes_rows_by_count(monkeypatch):
+    """One bf16 row takes gemv, 2-8 rows (an MTP verify window) gemv_rows, more rows cuBLAS."""
     from freetoken.layers.quantization.linear import unquantized
 
     calls = []
     from freetoken.kernel.triton import gemv as gemv_mod
 
-    real = gemv_mod.gemv
-    monkeypatch.setattr(gemv_mod, "gemv", lambda x, w: calls.append(x.shape) or real(x, w))
+    real, real_rows = gemv_mod.gemv, gemv_mod.gemv_rows
+    monkeypatch.setattr(gemv_mod, "gemv", lambda x, w: calls.append(("gemv", x.shape[0])) or real(x, w))
+    monkeypatch.setattr(gemv_mod, "gemv_rows", lambda x, w: calls.append(("rows", x.shape[0])) or real_rows(x, w))
     layer = type("L", (), {})()
     layer.weight = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
     layer.bias = None
     k = unquantized.TorchLinearKernel()
-    for m in (1, 3):
+    for m in (1, 3, 8, 9):
         x = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
         out = k.apply(layer, x)
         torch.testing.assert_close(out.float(), F.linear(x.float(), layer.weight.float()), rtol=2e-2, atol=2e-2)
-    assert calls == [(1, 256)]
+    assert calls == [("gemv", 1), ("rows", 3), ("rows", 8)]
+
+
+@pytest.mark.parametrize("M", [2, 4, 7])
+@pytest.mark.parametrize("N,K", SHAPES)
+def test_gemv_rows_matches_fp32_reference(N, K, M):
+    """Every tile rule, 1-4 rows per launch plus a second launch for M > 4, and a row-strided out."""
+    from freetoken.kernel.triton.gemv import gemv_rows
+
+    torch.manual_seed(0)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+    ref = F.linear(x.float(), w.float())
+    big = torch.zeros(M, N + 5, device="cuda", dtype=torch.bfloat16)
+    out = gemv_rows(x, w, out=big[:, :N])
+    assert out.data_ptr() == big.data_ptr()
+    rel = (out.float() - ref).abs().amax(dim=1) / ref.abs().amax(dim=1)
+    assert rel.max().item() < 1e-2, rel
+    assert not big[:, N:].any()
+    # deterministic, and a row's result does not depend on its neighbours
+    torch.testing.assert_close(gemv_rows(x, w), out, rtol=0, atol=0)
+    torch.testing.assert_close(gemv_rows(x[1:2].expand(M, K).contiguous(), w)[0], out[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

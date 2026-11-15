@@ -87,6 +87,37 @@ def sample_residual(probs: torch.Tensor, rejected: int) -> torch.Tensor:
     return torch.multinomial(resid / total, 1)
 
 
+def speculative_accept(P: torch.Tensor, drafts: torch.Tensor, cand_ids: torch.Tensor | None,
+                       cand_q: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Speculative sampling for one request, on the device: ``P`` [k+1, V] the target's
+    truncated distributions at the k draft positions and the bonus position, ``drafts`` [k]
+    int64, and the proposal each draft was drawn from -- ``cand_ids``/``cand_q`` [k, K]
+    (sparse q; ids < 0 unused), or None for point-mass (greedy) drafts. Draft j is accepted
+    with probability ``min(1, p_j(d) / q_j(d))``; at the first rejection the token is drawn
+    from ``normalize(max(0, p_j - q_j))``, and after k acceptances from ``p_k``, so the output
+    is distributed exactly as ``P``. Returns 0-dim tensors ``(accepted count, next token)``."""
+    k, V = P.shape[0] - 1, P.shape[1]
+    d = drafts.view(k, 1)
+    pd = P[:k].gather(1, d).squeeze(1)
+    if cand_q is None:
+        Q = torch.zeros((k, V), dtype=P.dtype, device=P.device).scatter_(1, d, 1.0)
+    else:
+        valid = cand_ids >= 0
+        Q = torch.zeros((k, V), dtype=P.dtype, device=P.device).scatter_add_(
+            1, cand_ids.clamp(min=0).long(), torch.where(valid, cand_q, torch.zeros_like(cand_q)).to(P.dtype)
+        )
+    qd = Q.gather(1, d).squeeze(1)
+    u = torch.rand(k, device=P.device)
+    accept = u * qd < pd  # u < p/q without dividing (q(d) > 0 for a drawn draft)
+    a = accept.to(torch.int64).cumprod(0).sum()
+    resid = (P[:k] - Q).clamp(min=0.0)
+    total = resid.sum(dim=1, keepdim=True)
+    # total == 0 only when q <= p everywhere, where nothing is ever rejected
+    resid = torch.where(total > 0, resid / total.clamp(min=1e-30), P[:k])
+    tokens = torch.multinomial(torch.cat([resid, P[k:]]), 1).squeeze(1)  # one per position
+    return a, tokens[a]
+
+
 @dataclass
 class Sampler:
     device: torch.device

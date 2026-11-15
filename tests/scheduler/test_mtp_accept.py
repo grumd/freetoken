@@ -53,3 +53,17 @@ def test_second_draft_rejected():
 def test_third_draft_rejected():
     a, bonus = _accept([2, 3, 4, 6], [2, 3, 9], k=3)
     assert a == [2] and bonus == [4]
+
+class _IdsReq:
+    def __init__(self, ids: list[int]) -> None:
+        self._ids_buf = torch.tensor(ids, dtype=torch.int32)
+
+
+def test_verify_window_ids_reach_the_host():
+    # a host-staged PLE fill reads input_ids[C : C+k+1]: the pending token and the drafts, not
+    # the placeholders begin_round grows the buffer with
+    r = _IdsReq([5, 6, 7, 0, 0, 0, 0, 0])
+    anchor = torch.tensor([7], dtype=torch.int32)
+    drafts = [torch.tensor([11]), torch.tensor([12]), torch.tensor([13])]
+    MTPManager._stage_window_ids([r], [2], anchor, drafts)
+    assert r._ids_buf.tolist() == [5, 6, 7, 11, 12, 13, 0, 0]

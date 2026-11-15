@@ -45,10 +45,6 @@ _ENV_FLAG_ENABLE = {
     "dspark_diff": "FREETOKEN_DSPARK_DIFF",
     "dspark_timing": "FREETOKEN_DSPARK_TIMING",
     "dspark_force_a0": "FREETOKEN_DSPARK_FORCE_A0",
-    "mtp_verify_graph": "FREETOKEN_MTP_VERIFY_GRAPH",
-    "mtp_draft_graph": "FREETOKEN_MTP_DRAFT_GRAPH",
-    "mtp_commit_graph": "FREETOKEN_MTP_COMMIT_GRAPH",
-    "mtp_sampled": "FREETOKEN_MTP_SAMPLED",
     "mtp_ngram": "FREETOKEN_MTP_NGRAM",
 }
 _ENV_FLAG_DISABLE = {
@@ -69,6 +65,7 @@ _ENV_FLAG_BOOL = {
     "moe_verify_cpu": "FREETOKEN_MOE_VERIFY_CPU",
     "mtp_chain": "FREETOKEN_MTP_CHAIN",
     "mtp_head_fp8": "FREETOKEN_MTP_HEAD_FP8",
+    "mtp_experts_fp4": "FREETOKEN_MTP_EXPERTS_FP4",
     "dense_fp8": "FREETOKEN_DENSE_FP8",
     "ngram_spec": "FREETOKEN_NGRAM_SPEC",
 }
@@ -741,17 +738,6 @@ def parse_args(
     # --- env-backed runtime knobs, exposed as flags (see _ENV_FLAG_* above) ---
     parser.add_argument("--mtp-draft-tokens", type=int, default=None, dest="mtp_draft_tokens",
                         help="MTP draft chain length k (default 3); k+1 must stay inside one GDN chunk.")
-    parser.add_argument("--mtp-verify-graph", action="store_true", default=None,
-                        dest="mtp_verify_graph",
-                        help="Replay the MTP verify extend from a captured CUDA graph (one per batch size).")
-    parser.add_argument("--mtp-draft-graph", action="store_true", default=None,
-                        dest="mtp_draft_graph",
-                        help="Replay the MTP draft chain from a captured CUDA graph (one per batch size).")
-    parser.add_argument("--mtp-commit-graph", action="store_true", default=None,
-                        dest="mtp_commit_graph",
-                        help="Replay the GDN commit from a captured CUDA graph (single-request; needs --mtp-verify-graph).")
-    parser.add_argument("--mtp-sampled", action="store_true", default=None, dest="mtp_sampled",
-                        help="Enable MTP for sampled requests via rejection sampling (default off).")
     parser.add_argument("--mtp-chain", action=argparse.BooleanOptionalAction, default=None,
                         dest="mtp_chain",
                         help="Chain MTP rounds back-to-back instead of alternating a plain decode "
@@ -772,6 +758,10 @@ def parse_args(
     parser.add_argument("--mtp-head-fp8", action=argparse.BooleanOptionalAction, default=None,
                         dest="mtp_head_fp8",
                         help="Quantize the bf16 MTP draft head to fp8 per row at load (default on).")
+    parser.add_argument("--mtp-experts-fp4", action=argparse.BooleanOptionalAction, default=None,
+                        dest="mtp_experts_fp4",
+                        help="Quantize the bf16 MTP draft head's routed experts to NVFP4 at load: "
+                             "VRAM back to the expert cache, faster drafts (default off).")
     parser.add_argument("--mtp-ngram", action="store_true", default=None, dest="mtp_ngram",
                         help="Override the MTP draft chain with a self-history n-gram match when it repeats.")
     parser.add_argument("--mtp-ngram-size", type=int, default=None, dest="mtp_ngram_size",

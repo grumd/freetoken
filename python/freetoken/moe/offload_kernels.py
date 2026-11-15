@@ -508,11 +508,12 @@ def _ensure_experts_split_kernel(
         off_c = tl.arange(0, BLOCK_C)
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
+        # the slots of this step's routed experts are exactly the ones stamped with ``step``
+        # above (the hits; misses have no slot yet): no victim among them, without comparing
+        # every slot's owner against every route (that loop grew with the verify window)
+        tl.debug_barrier()
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=_I64_MAX).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            owner_active = owner_active | (oid == base + tl.load(ids_ptr + i))
-        u = tl.where(owner_active | (~c_mask), _I64_MAX, u)
+        u = tl.where((u == step) | (~c_mask), _I64_MAX, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))

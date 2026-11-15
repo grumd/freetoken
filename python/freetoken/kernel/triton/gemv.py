@@ -64,6 +64,55 @@ def _gemv3_kernel(
                    K, s2, BLOCK_N, BLOCK_K, EVEN_K)
 
 
+@triton.jit
+def _gemv_m_acc(acc, w, x_ptr, k0, cols, kmask, EVEN_K: tl.constexpr):
+    if EVEN_K:
+        x = tl.load(x_ptr + k0 + cols)
+    else:
+        x = tl.load(x_ptr + k0 + cols, mask=kmask, other=0.0)
+    return acc + w * x[None, :].to(tl.float32)
+
+
+@triton.jit
+def _gemv_m_kernel(
+    x_ptr, w_ptr, y_ptr, N, K, stride_wn, stride_xm, stride_ym,
+    M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
+):
+    # _gemv_rows for M <= 4 rows of x off one load of each weight tile
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    cols = tl.arange(0, BLOCK_K)
+    w_ptrs = w_ptr + rows[:, None].to(tl.int64) * stride_wn + cols[None, :]
+    acc0 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kmask = k0 + cols < K
+        if EVEN_K:
+            w = tl.load(w_ptrs, mask=rmask[:, None], other=0.0, eviction_policy="evict_first")
+        else:
+            w = tl.load(w_ptrs, mask=rmask[:, None] & kmask[None, :], other=0.0,
+                        eviction_policy="evict_first")
+        w = w.to(tl.float32)
+        acc0 = _gemv_m_acc(acc0, w, x_ptr, k0, cols, kmask, EVEN_K)
+        if M > 1:
+            acc1 = _gemv_m_acc(acc1, w, x_ptr + stride_xm, k0, cols, kmask, EVEN_K)
+        if M > 2:
+            acc2 = _gemv_m_acc(acc2, w, x_ptr + 2 * stride_xm, k0, cols, kmask, EVEN_K)
+        if M > 3:
+            acc3 = _gemv_m_acc(acc3, w, x_ptr + 3 * stride_xm, k0, cols, kmask, EVEN_K)
+        w_ptrs += BLOCK_K
+    ty = y_ptr.dtype.element_ty
+    tl.store(y_ptr + rows, tl.sum(acc0, axis=1).to(ty), mask=rmask)
+    if M > 1:
+        tl.store(y_ptr + stride_ym + rows, tl.sum(acc1, axis=1).to(ty), mask=rmask)
+    if M > 2:
+        tl.store(y_ptr + 2 * stride_ym + rows, tl.sum(acc2, axis=1).to(ty), mask=rmask)
+    if M > 3:
+        tl.store(y_ptr + 3 * stride_ym + rows, tl.sum(acc3, axis=1).to(ty), mask=rmask)
+
+
 # Tiles swept with kbench/sweep_gemv.py on an RTX 3080 (q38 TP=2 decode shapes): a single
 # warp streaming 512-1024 contiguous K elements per row wins everywhere but the wide-K
 # hyper-connection down-projections, which need a full CTA per row to keep enough bytes
@@ -78,6 +127,17 @@ def _config(N: int, K: int) -> tuple[int, int, int]:
     return 2, 512, 1
 
 
+# Tiles for 2-4 rows sharing each weight tile (kbench sweep at M=4): the wide-K HC down
+# projections want shorter K tiles over more warps, the K=320 ones 64-wide K tiles (no masked
+# tail); other shapes keep the single-row tiles.
+def _config_m(N: int, K: int) -> tuple[int, int, int]:
+    if K >= 8192:
+        return 2, 1024, 4
+    if K <= 512 and K % 64 == 0:
+        return 16, 64, 4
+    return _config(N, K)
+
+
 def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """``x`` [1, K] bf16 contiguous, ``w`` [N, K] with unit inner stride -> [1, N]."""
     N, K = w.shape
@@ -89,6 +149,29 @@ def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> t
         BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps,
     )
     return out
+
+
+def gemv_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """``x`` [M, K] @ ``w`` [N, K]^T for a few rows (a speculative verify window), each launch
+    serving up to 4 rows off one read of the weight; deterministic, no split-K. Unit inner
+    strides; ``out`` [M, N] may be a row-strided view."""
+    M, K = x.shape
+    N = w.shape[0]
+    assert x.stride(1) == 1 and w.stride(1) == 1
+    if out is None:
+        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    assert out.shape == (M, N) and out.stride(1) == 1
+    bn, bk, warps = _config_m(N, K)
+    for m0 in range(0, M, _ROWS_PER_LAUNCH):
+        m = min(_ROWS_PER_LAUNCH, M - m0)
+        _gemv_m_kernel[(triton.cdiv(N, bn),)](
+            x[m0:], w, out[m0:], N, K, w.stride(0), x.stride(0), out.stride(0),
+            M=m, BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps,
+        )
+    return out
+
+
+_ROWS_PER_LAUNCH = 4
 
 
 def gemv3(

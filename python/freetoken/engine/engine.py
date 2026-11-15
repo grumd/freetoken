@@ -486,6 +486,9 @@ class Engine:
         for op in _iter_ops(self.model):
             if hasattr(op, "fuse_decode_front"):
                 op.fuse_decode_front()
+        if ENV.MTP_EXPERTS_FP4:
+            freed = sum(op.quantize_experts_fp4() for op in _iter_ops(self.model) if hasattr(op, "quantize_experts_fp4"))
+            logger.info_rank0(f"--mtp-experts-fp4: MTP draft experts quantized to NVFP4, {mem_GB(freed)} of bf16 released per rank")
         embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
         if (
             embed is not None and hasattr(embed, "move_to_host")
@@ -630,13 +633,13 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-        # MTP verify CUDA graph (Phase 3), opt-in: a fixed prefill extend, captured with the
-        # QSA backend's static verify buffers -- one graph per padded batch size (mirroring
-        # the decode graph list) so a small round does not pay the largest shape.
+        # MTP verify CUDA graph: a fixed prefill extend, captured with the QSA backend's static
+        # verify buffers -- one graph per padded batch size (mirroring the decode graph list) so
+        # a small round does not pay the largest shape. Always on with an MTP head (lossless).
         self.verify_graph_runner = None
         _decode_bs = list(getattr(self.graph_runner, "graph_bs_list", []))
         if (
-            os.environ.get("FREETOKEN_MTP_VERIFY_GRAPH") == "1"
+            getattr(self.model, "mtp", None) is not None
             and _decode_bs
             and hasattr(self.attn_backend, "init_capture_verify")
         ):
@@ -677,13 +680,12 @@ class Engine:
                 logger.info_rank0(f"MTP draft vocab: learning the top {_dv} generated tokens")
             elif _dv > 0:
                 logger.info_rank0("MTP draft vocab: lm_head format unsupported, full vocab")
-        # MTP draft-chain CUDA graph (Phase 3b), opt-in: the MTP block's single-token draft
-        # step captured per padded batch size and replayed k times per round. The MTP block's
-        # routed experts are resident bf16, so the captured region is device-only.
+        # MTP draft-chain CUDA graph: the MTP block's single-token draft step captured per
+        # padded batch size and replayed k times per round. The MTP block's routed experts are
+        # resident, so the captured region is device-only.
         self.draft_graph_runner = None
         if (
-            os.environ.get("FREETOKEN_MTP_DRAFT_GRAPH") == "1"
-            and getattr(self.model, "mtp", None) is not None
+            getattr(self.model, "mtp", None) is not None
             and _decode_bs
             and hasattr(self.attn_backend, "init_capture_draft")
         ):
@@ -707,8 +709,7 @@ class Engine:
         # allocates the per-layer verify buffers the commit reads).
         self.commit_graph_runner = None
         if (
-            os.environ.get("FREETOKEN_MTP_COMMIT_GRAPH") == "1"
-            and getattr(self.model, "commit_mtp_verify", None) is not None
+            getattr(self.model, "commit_mtp_verify", None) is not None
             and self.linear_state_pool is not None
             and self.verify_graph_runner is not None
         ):

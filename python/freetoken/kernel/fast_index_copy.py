@@ -158,10 +158,15 @@ def fast_index_copy_multi_jit(
     src_indices: torch.Tensor,
     num_indices: torch.Tensor | None = None,
     *,
-    num_threads: int = 1024,
-    blocks_per_bank: int = 8,
+    num_threads: int = 512,
+    blocks_per_bank: int = 2,
 ) -> None:
     """Fused multi-bank index copy: copy the same rows for every bank in ONE launch.
+
+    Default grid: 2 x 512 threads per bank. On a PCIe 4.0 x8 RTX 3080 that still runs the link
+    at 12.9-13.2 GB/s (1-3 NVFP4 q38 experts), while the 8 x 1024 grid it replaces held enough
+    of the SMs to slow the expert GEMV computing beside it 2.1x (90 -> 188 us; 121 us now), and
+    the copy and that GEMV are the two halves of an overlapped decode MoE.
 
     The copy is host->device PCIe-bandwidth bound (~31 GB/s measured, vs ~3 TB/s HBM), so what
     saturates the link is the TOTAL in-flight request count, blocks_per_bank*num_threads
