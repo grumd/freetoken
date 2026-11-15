@@ -8,37 +8,23 @@ MoE experts are pinned to host RAM. There's no setting for context length. As a 
 
 ## Benchmarks
 
-FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tests I just limited my 3080 20GB to max 16GB used. Both 3080s have unlocked ReBAR and P2P.
+FP4, `scripts/serve.sh` defaults, measured 2026-11-15.
 
-### **One GPU at PCIe 4.0 x8**
+| Setup | Decode | 16k prefill (first / warm) | Max context |
+|---|---|---|---|
+| 1x 16 GB | 49 tok/s | 2,450 / 2,720 tok/s | 208k |
+| 1x 20 GB | 54 tok/s | 2,590 / 2,720 tok/s | 262k |
+| 2x 16 GB | 75 tok/s | 3,230 / 3,450 tok/s | 262k |
+| 2x 20 GB | 89 tok/s | 3,240 / 3,470 tok/s | 262k |
 
-| GPU | Prefill batch | Decode | 16k prefill | Max context (F16) |
-|---|---|---|---|---|
-| 16 GB | **8192** | 51 tok/s | **1,530 tok/s** | 147k |
-| 16 GB | 4096 | 52 tok/s | 800 tok/s | 186k |
-| 16 GB | 2048 | 52 tok/s | 900 tok/s | **205k** |
-| 20 GB | **16384** (8192 reserve) | 56 tok/s | **2,580 tok/s** | **262k** |
-| 20 GB | 4096 | 57 tok/s | 850 tok/s | 262k |
-
-### **Two GPUs at PCIe 4.0 x8**
-
-| GPU | Prefill batch | Decode | 16k prefill | Max context (F16) |
-|---|---|---|---|---|
-| 2x 16 GB | 8192 | 82 tok/s | 2,760 tok/s | 262k |
-| 2x 20 GB | 16384 (8192 reserve) | 93 tok/s | 3,270 tok/s | 262k |
-
-- **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
-- **Prefill batch** in the tables is the setting they were measured with, before the per-chunk prefill workspace: now `ft serve` keeps a reserve for 2048-token chunks and takes up to 16384-token chunks' VRAM from the expert cache per prompt (`--prefill-batch-min`/`--prefill-batch-max`), so the context limit is that of the 2048 row. The tables were not re-measured.
-- **16384 prefill batch:** the 20 GB rows were re-measured with `serve.sh`'s 16384-token chunks, whose standing reserve covers 8192-token chunks and borrows the rest from the expert cache per prompt, so the context limit stays the same. 16k prefill there is the time to first token of the first uncached 16k-token prompt after start (later ones, with a warm expert cache: 2,780 and 3,450 tok/s); the same measurement gave 1,320 and 2,050 tok/s with 8192-token chunks before. The 16 GB rows were not re-measured.
-- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 -t 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
-- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 -t 7`), against about 25 without CPU help.
-- **Agent turns on one GPU:** prompts up to 4096 new tokens load only their routed experts, with the CPU computing part of the misses (`--moe-routed-prefill-tokens 4096 --moe-prefill-fetch 0.35` in `serve.sh`; 3072 on two GPUs). 4096 new tokens on a cached 16k context: 4.8 -> 3.3 s on one 20 GB card; 8192 still streams faster. Both flags can be tuned for your CPU and PCIe link ([`docs/cli.md`](docs/cli.md)).
-- **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
-- **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
+- **Hardware:** RTX 3080 20 GB cards, each on PCIe 4.0 x8, with P2P between them; Ryzen 7 9800X3D; 96 GB DDR5. A "16 GB" GPU is a 20 GB card with 4 GB held. A x16 or PCIe 5.0 link should be faster.
+- **Decode:** a 1024-token reply to a prose prompt. On one GPU the CPU computes most experts missing from VRAM (`--moe-decode-fetch 0.1`).
+- **16k prefill:** a 16,003-token prompt. "First" is the first prompt after start; "warm" is a later one.
+- **RAM:** the experts stay pinned in host RAM (64 GiB for FP4), so you need 96 GB or more.
 
 ### Compared with llama.cpp and Strata
 
-FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (b11941) and [Strata](https://github.com/Niko1221/Strata) (0.2.7) run unsloth's [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF. 262k 16-bit KV cache, no MTP, single request.
+FreeToken measured 2026-11-15, llama.cpp and Strata 2026-10-28. FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (b11941) and [Strata](https://github.com/Niko1221/Strata) (0.2.7) run unsloth's [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF. 262k 16-bit KV cache, no MTP, single request.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench/decode-dark.png">
@@ -56,7 +42,7 @@ FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) 
 </picture>
 
 **Settings**
-- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15 -t 7`.
+- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU.
 - **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`.
   - `-ub 2048` with a 20 GB cache decoded about 20% faster but prefilled 37% slower.
   - Without moe-cache-mib, decode was 16 tok/s.
@@ -80,21 +66,29 @@ ft checkpoint --model ~/models/q38-fp4-hf --out ~/models/ftw/q38-fp4   # one-tim
 MODEL=~/models/ftw/q38-fp4 scripts/serve.sh                      # API on :8080, chat page at /
 ```
 
-`serve.sh` uses every GPU it finds, up to two. On one GPU the CPU computes most of the experts missing from VRAM while the GPU runs the rest (`--moe-decode-fetch 0.1`). `scripts/calibrate.sh` measures the best split for your CPU, RAM and PCIe link (~12 min) and prints the flags to pass to `serve.sh`. Two GPUs don't need it: there the CPU doesn't help ([details](scripts/README.md#calibratesh-cpu-assisted-decode-fp4)).
+For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead (169 GB; FP4 is faster).
 
-For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead.
+## Configuration
 
-The default settings should already be optimized, and the context size and expert cache size automatically match your free VRAM.
+The defaults fit most setups. Context and expert cache size themselves to your free VRAM; there is no context-length setting.
 
-- one 16 GB GPU holds about 205k tokens of context: the standing prefill reserve covers 2048-token chunks (`--prefill-batch-min`), and longer prompts take their chunk's extra VRAM from the expert cache only while they prefill. `--prefill-batch-min 1024` after the script name gives a little more
-- you have 128 GB of RAM: `PREFIX_CACHE_RAM_GB=16` keeps older chat sessions in RAM, so going back to an old chat can skip prefilling from scratch
+| To | Do |
+|---|---|
+| Pick GPUs | `GPUS=1 scripts/serve.sh` (default: every GPU, up to two) |
+| Tune CPU-assisted decode (one GPU) | run `scripts/calibrate.sh` once (~12 min) and pass the flags it prints |
+| Keep old chats in RAM (128 GB machines) | `PREFIX_CACHE_RAM_GB=16 scripts/serve.sh` |
+| Get ~9k more context on 16 GB | `scripts/serve.sh --prefill-batch-min 1024` |
+| Trade a little accuracy for +5% decode (one GPU) | `scripts/serve.sh --dense-mxfp8-groups lm_head` (lossy, off by default) |
 
-See [`scripts/README.md`](scripts/README.md) for more details about options.
+Prefill chunks: `--prefill-batch-min` (2048) tokens of activation VRAM are always reserved. Longer prompts borrow what their chunk needs from the expert cache, up to `--prefill-batch-max` (16384) tokens, and give it back before decoding.
+
+Every setting: [`scripts/README.md`](scripts/README.md).
 
 ## What this fork adds
 
 - Experts in pinned host RAM behind a VRAM expert cache that grows and shrinks with the live context
 - Hybrid prefill: chunks up to 4096 tokens (3072 on two GPUs) load only their routed experts, and the CPU computes part of the cache misses while the GPU fetches the rest
+- Prefill takes only the VRAM each prompt needs and keeps decode's experts cached, so agent turns start fast
 - CPU-assisted decode on one GPU: the CPU computes most VRAM-cache misses instead of copying them over PCIe, with a one-time calibration script for the split
 - Prompt-lookup speculative decoding (`--ngram-spec`, on in `serve.sh`): lossless, no draft model; +55-61% decode when the reply repeats its context (code edits), about even on prose
 - Opt-in MXFP8 for more dense layers (`--dense-mxfp8-groups lm_head`): +5% decode on one GPU, KLD within run-to-run noise; off by default because it rounds the weights
