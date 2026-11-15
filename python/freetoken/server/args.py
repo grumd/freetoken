@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+import socket
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -119,10 +120,19 @@ def _apply_env_overrides(kwargs: dict) -> None:
             os.environ[env] = str(value)
 
 
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # The TP ranks' torch.distributed rendezvous: a free port picked once in the launching
+    # process (the workers get a pickled copy), not server_port + 1, which may be taken.
+    distributed_port: int = field(default_factory=_free_local_port)
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -199,7 +209,7 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
+        return f"tcp://127.0.0.1:{self.distributed_port}"
 
 
 def parse_args(
