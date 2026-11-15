@@ -18,7 +18,7 @@ L, E, CAP = 6, 64, 512
 FEATS = [65536, 512, 256, 32768, 512, 256]
 
 
-def _build(active: int):
+def _build(active: int, prefill_overlap: bool = False):
     from freetoken.kernel.vmm import ChunkPool, ElasticTensor
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -33,7 +33,7 @@ def _build(active: int):
         return t.tensor
 
     cache = OffloadMoeCache(
-        num_layers=L, num_experts=E, cache_size=CAP, device=dev, prefill_overlap=False,
+        num_layers=L, num_experts=E, cache_size=CAP, device=dev, prefill_overlap=prefill_overlap,
         quant_format="mxfp4_triton", bank_alloc=alloc, active_slots=active,
     )
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -125,3 +125,67 @@ def test_elastic_cache_cannot_rebuild_or_shrink_below_its_floor():
         cache.rebuild(300)
     with pytest.raises(AssertionError):
         cache.shrink_active(E - 1)
+
+
+def _resident(cache):
+    return {int(g): int(u) for g, u in zip(cache.id_of_slot.tolist(), cache.usage.tolist()) if g >= 0}
+
+
+def _routed_prefill(cache, demote: bool) -> int:
+    """One routed prefill chunk over every layer: each routes to all E experts and fetches half
+    of its misses (the CPU-assisted prefill's capped fetch). Returns the largest per-layer fetch."""
+    most = 0
+    for layer in range(L):
+        ids = torch.arange(E, dtype=torch.int32, device="cuda").view(1, -1)
+        cache.ensure_experts_capped(layer, ids, 0.5)
+        cache.copy_missing()
+        n = int(cache.num_indices[0])
+        most = max(most, n)
+        if demote:
+            cache.demote_fetched(n)
+    torch.cuda.synchronize()
+    return most
+
+
+@CUDA
+@pytest.mark.parametrize("demote", [False, True])
+def test_routed_prefill_fetches_do_not_flush_decode_experts(demote):
+    cache, _, _ = _build(active=200)
+    _decode(cache, 300, seed=5)
+    warm = set(_resident(cache))
+    most = _routed_prefill(cache, demote)
+    kept = warm & set(_resident(cache))
+    _assert_coherent(cache)
+    if demote:
+        # demoted fetches evict each other: the chunk costs decode about one layer's fetches
+        assert len(warm) - len(kept) <= most
+    else:
+        # stamped as recent, the fetches push most of decode's experts out (the regression)
+        assert len(warm) - len(kept) > 2 * most
+    # decode keeps working on top of it
+    _decode(cache, 50, seed=6)
+    _assert_coherent(cache)
+
+
+@CUDA
+def test_streamed_prefill_buffers_evict_the_coldest_experts():
+    active = 300
+    cache, _, _ = _build(active=active, prefill_overlap=True)
+    _decode(cache, 300, seed=7)
+    # decode after a streamed chunk refills the empty buffer slots [0, 2E) first, so they hold
+    # its most recent fetches: invalidate them, as a chunk does, and decode again
+    for b in range(2):
+        cache._invalidate_prefill_buffer(b)
+    _decode(cache, 40, seed=8)
+    before = _resident(cache)
+    assert any(s < 2 * E for s in range(active) if int(cache.id_of_slot[s]) >= 0)
+    cache.begin_prefill()
+    for b in range(2):  # what the chunk's prefetches do to the buffer range
+        cache._invalidate_prefill_buffer(b)
+    torch.cuda.synchronize()
+    after = _resident(cache)
+    assert set(after) <= set(before)
+    survivors = sorted(before.values(), reverse=True)[: active - 2 * E]
+    # the survivors are what an LRU without the buffer range would hold
+    assert sorted(after.values(), reverse=True) == survivors
+    _assert_coherent(cache)

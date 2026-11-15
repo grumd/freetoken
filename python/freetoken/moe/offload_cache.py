@@ -125,6 +125,10 @@ MARLIN_MAX_CACHE_SIZE = 992
 # lanes, and small enough that lru_ensure's packed (usage << slot_bits) | slot key cannot overflow.
 FENCE_USAGE = 1 << 45
 
+# Usage stamp of an expert a prefill chunk fetched (see ``demote_fetched``): above an empty slot's
+# 0, below every decode stamp, so prefill fetches are the next victims after the empty slots.
+PREFILL_USAGE = 1
+
 
 @dataclass
 class OffloadMoeCache:
@@ -707,6 +711,7 @@ class OffloadMoeCache:
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
+        self._evacuate_prefill_buffers()
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         if self.prefill_copy_stream is not None:
@@ -982,6 +987,21 @@ class OffloadMoeCache:
             priority[layer_id].zero_().index_copy_(0, expert_ids.view(-1).long(), counts.view(-1).long())
         ensure_experts_hybrid(self, layer_id, expert_ids, max_fetch, fetch_fraction, priority)
 
+    def demote_fetched(self, n: int | None = None) -> None:
+        """Make the experts the last ``ensure_*`` call fetched the next victims after the empty
+        slots. A prefill chunk routes to nearly every expert of every layer: stamped as recent,
+        its fetches would push decode's whole working set out layer by layer, and decode, which
+        fetches only its ``decode_fetch`` share of the misses, would take hundreds of tokens to
+        win it back. Demoted, they evict each other, so a chunk costs decode about one layer's
+        fetches. ``n``: the fetch count when the caller already has it on the host."""
+        if n is None:
+            n = int(self.num_indices[0])
+        if n:
+            # index_fill_, not ``usage[idx] = PREFILL_USAGE``: a Python-scalar setitem copies the
+            # value from pageable host memory, which blocks the host until the stream drains --
+            # here until the PCIe fetch lands, holding back the CPU half of a hybrid prefill.
+            self.usage.index_fill_(0, self.evict_slots[:n].long(), PREFILL_USAGE)
+
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
@@ -1035,24 +1055,51 @@ class OffloadMoeCache:
             # hot descends and cold ascends, so the profitable pairs are a prefix
             moved = int((hot_use[:k] > cold_use[:k]).sum())
             if moved:
-                src = resident[hot_order[:moved]] + n
-                dst = cold_slot[:moved]
-                for _, cache in self.banks:
-                    rows = cache.view(cache.shape[0], -1).view(torch.uint8)
-                    for i in range(0, moved, 64):  # bound the gather temporary
-                        rows[dst[i : i + 64]] = rows[src[i : i + 64]]
-                dst_old = self.id_of_slot[dst]
-                flat[dst_old[dst_old >= 0].long()] = -1
-                src_ids = self.id_of_slot[src]
-                self.id_of_slot[dst] = src_ids
-                self.usage[dst] = self.usage[src]
-                flat[src_ids.long()] = dst.to(torch.int32)
-                self.id_of_slot[src] = -1
+                self._move_slots(resident[hot_order[:moved]] + n, cold_slot[:moved])
         tail_ids = self.id_of_slot[n:old]
         flat[tail_ids[tail_ids >= 0].long()] = -1
         self.id_of_slot[n:old] = -1
         self.active_slots = n
         self._apply_fence()
+        return moved
+
+    def _move_slots(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Copy the experts in slots ``src`` over slots ``dst`` (disjoint), evicting what ``dst``
+        held and leaving ``src`` empty; usage stamps move with the experts."""
+        flat = self.slot_for_id.view(-1)
+        for _, cache in self.banks:
+            rows = cache.view(cache.shape[0], -1).view(torch.uint8)
+            for i in range(0, src.numel(), 64):  # bound the gather temporary
+                rows[dst[i : i + 64]] = rows[src[i : i + 64]]
+        dst_old = self.id_of_slot[dst]
+        flat[dst_old[dst_old >= 0].long()] = -1
+        src_ids = self.id_of_slot[src]
+        self.id_of_slot[dst] = src_ids
+        self.usage[dst] = self.usage[src]
+        flat[src_ids.long()] = dst.to(torch.int32)
+        self.id_of_slot.index_fill_(0, src, -1)
+        self.usage.index_fill_(0, src, 0)
+
+    def _evacuate_prefill_buffers(self) -> int:
+        """Before a streamed chunk overwrites slots ``[0, 2E)`` with its double buffers: move the
+        experts there that are hotter than the coldest ones above ``2E`` up over those, so the chunk
+        evicts the coldest ``2E`` experts of the cache rather than whatever sits in the buffer
+        range -- after a prefill decode refills the empty buffer slots first, so without this the
+        next chunk would evict exactly decode's most recent fetches. Device to device; returns
+        how many moved."""
+        lo, hi = 2 * self.num_experts, self.active_slots
+        if hi <= lo or not self.banks:
+            return 0
+        resident = (self.id_of_slot[:lo] >= 0).nonzero().squeeze(1)
+        if not resident.numel():
+            return 0
+        k = min(int(resident.numel()), hi - lo)
+        hot_use, hot_order = self.usage[:lo][resident].sort(descending=True)
+        cold_use, cold_slot = self.usage[lo:hi].sort()
+        # hot descends and cold ascends, so the profitable pairs are a prefix
+        moved = int((hot_use[:k] > cold_use[:k]).sum())
+        if moved:
+            self._move_slots(resident[hot_order[:moved]], cold_slot[:moved] + lo)
         return moved
 
     def grow_active(self, n: int) -> None:

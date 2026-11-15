@@ -444,6 +444,7 @@ class OffloadMoELayer(MoELayer):
         slots = routed.to(torch.int32).view(1, -1)
         cache.ensure_experts(self.layer_id, slots)  # expert ids -> slot ids, in place
         cache.copy_missing()
+        cache.demote_fetched()  # a prefill chunk must not flush decode's working set
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -487,6 +488,7 @@ class OffloadMoELayer(MoELayer):
         staged.synchronize()
         resident, n_gpu, n_fetch, n_routed = cpu.meta.tolist()
         cache.copy_missing()
+        cache.demote_fetched(n_fetch)  # a prefill chunk must not flush decode's working set
         gpu_routes = None
         if n_gpu:
             # Called directly, not through the method's apply: that derives the compact routed
