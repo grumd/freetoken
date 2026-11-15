@@ -29,8 +29,9 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
 - **16384 prefill batch:** the 20 GB rows were re-measured with `serve.sh`'s 16384-token chunks, whose standing reserve covers 8192-token chunks and borrows the rest from the expert cache per prompt, so the context limit stays the same. 16k prefill there is the time to first token of the first uncached 16k-token prompt after start (later ones, with a warm expert cache: 2,780 and 3,450 tok/s); the same measurement gave 1,320 and 2,050 tok/s with 8192-token chunks before. The 16 GB rows were not re-measured.
-- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15`, 7 CPU threads); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
-- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15`, 7 CPU threads), against about 25 without CPU help.
+- **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 -t 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
+- **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 -t 7`), against about 25 without CPU help.
+- **Agent turns on one GPU:** prompts up to 4096 new tokens load only their routed experts, with the CPU computing part of the misses (`--moe-routed-prefill-tokens 4096 --moe-prefill-fetch 0.35` in `serve.sh`; 3072 on two GPUs). 4096 new tokens on a cached 16k context: 4.8 -> 3.3 s on one 20 GB card; 8192 still streams faster. Both flags can be tuned for your CPU and PCIe link ([`docs/cli.md`](docs/cli.md)).
 - **Two GPUs** were measured with P2P between them (patched driver); without P2P, expect about 8% less decode.
 - **PCIe 4.0 x8:** all tests done on PCIe 4.0 x8, even single-GPU tests. If you have 4.0 x16 or even PCIe 5.0 x16, you should have much better decode and prefill.
 
@@ -54,7 +55,7 @@ FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) 
 </picture>
 
 **Settings**
-- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15` and 7 CPU threads.
+- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU. On one GPU that includes CPU-assisted decode with the calibrated `--moe-decode-fetch 0.15 -t 7`.
 - **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`.
   - `-ub 2048` with a 20 GB cache decoded about 20% faster but prefilled 37% slower.
   - Without moe-cache-mib, decode was 16 tok/s.
@@ -92,8 +93,10 @@ See [`scripts/README.md`](scripts/README.md) for more details about options.
 ## What this fork adds
 
 - Experts in pinned host RAM behind a VRAM expert cache that grows and shrinks with the live context
-- Hybrid prefill: short chunks load only their routed experts, and the CPU computes cache misses while the GPU fetches the rest
+- Hybrid prefill: chunks up to 4096 tokens (3072 on two GPUs) load only their routed experts, and the CPU computes part of the cache misses while the GPU fetches the rest
 - CPU-assisted decode on one GPU: the CPU computes most VRAM-cache misses instead of copying them over PCIe, with a one-time calibration script for the split
+- Prompt-lookup speculative decoding (`--ngram-spec`, on in `serve.sh`): lossless, no draft model; +55-61% decode when the reply repeats its context (code edits), about even on prose
+- Opt-in MXFP8 for more dense layers (`--dense-mxfp8-groups lm_head`): +5% decode on one GPU, KLD within run-to-run noise; off by default because it rounds the weights
 - W4A16 and NVFP4 kernels tuned for RTX 30-series, and a two-GPU all-reduce over P2P or shared host memory
 - NVIDIA's FP4-Local checkpoint, the vision tower on the CPU, and a chat page at `/`
 - An optional host-RAM tier for old conversations' prefixes
