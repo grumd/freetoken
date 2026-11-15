@@ -13,7 +13,11 @@ L, E = 4, 64
 FEATS = [65536, 512, 256, 32768, 512, 256]
 
 
-def _build(cap_pages=1024, spare_mib=16, boost_mib=0):
+# prefill workspace in test units: 2048 extra tokens per 8 MiB
+PF_MIN, PF_MAX, PF_BPT = 64, 4096, 4096
+
+
+def _build(cap_pages=1024, spare_mib=16, tp_group=None):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.engine.elastic import ElasticVram
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
@@ -24,7 +28,7 @@ def _build(cap_pages=1024, spare_mib=16, boost_mib=0):
         set_tp_info(rank=0, size=1)
     dev = torch.device("cuda", torch.cuda.current_device())
     el = ElasticVram(dev, min_pages=64, step_pages=32, floor_slots=E, cap_slots=L * E, cap_pages=cap_pages,
-                     boost_bytes=boost_mib << 20)
+                     prefill_min_tokens=PF_MIN, prefill_max_tokens=PF_MAX, prefill_bytes_per_token=PF_BPT)
     cache = OffloadMoeCache(
         num_layers=L, num_experts=E, cache_size=L * E, device=dev, prefill_overlap=False,
         quant_format="mxfp4_triton", bank_alloc=el.bank, active_slots=el.slots,
@@ -42,7 +46,7 @@ def _build(cap_pages=1024, spare_mib=16, boost_mib=0):
             index_ratio=4, num_req_slots=2, layer_ids=[1, 3, 5, 7],
         )
     assert kv.elastic
-    el.finalize(spare_mib << 20, 0, 0, None)
+    el.finalize(spare_mib << 20, 0, 0, tp_group)
     return el, cache, kv
 
 
@@ -125,97 +129,198 @@ def test_a_long_decode_borrows_the_prefill_reserve_and_hands_it_back_intact():
     s0, handles0 = el.slots, el.pool.num_handles
     _decode(cache, 50, seed=5)
     _stamp(kv, 64)
-    el.decode_step(prefill_pending=False)
-    el.decode_step(prefill_pending=True)
-    el.decode_step(prefill_pending=True)
+    el.settle(prefill_pending=False, decoding=True)
+    el.decode_step()
+    el.decode_step()
+    el.settle(prefill_pending=True, decoding=True)
     assert el.lent == 0  # a waiting prefill keeps the reserve
-    el.decode_step(prefill_pending=False)
+    el.settle(prefill_pending=False, decoding=False)
+    assert el.lent == 0  # nor is it lent with nothing decoding
+    el.settle(prefill_pending=False, decoding=True)  # before the third decode step
     assert el.lent > 0 and el.slots == L * E and cache.active_slots == el.slots
     _decode(cache, 50, seed=6)
     _coherent(cache)
     _no_leak(el)
 
-    el.reclaim()
+    el.hold_prefill(0)  # before KV growth or a spill: the lend ends
     assert el.lent == 0 and el.slots == s0 and el.pool.num_handles == handles0
     _check_stamp(kv, 64)
     _coherent(cache)
     _decode(cache, 30, seed=7)
     _no_leak(el)
-    el.decode_step(prefill_pending=False)
-    assert el.lent == 0  # the quiet-step count restarts after a reclaim
+    el.settle(prefill_pending=False, decoding=True)
+    assert el.lent == 0  # the decode-step count restarts after a hold
 
 
 @CUDA
 def test_lend_after_zero_never_lends():
     el, cache, kv = _build(spare_mib=8)
     for _ in range(200):
-        el.decode_step(prefill_pending=False)
+        el.decode_step()
+        el.settle(prefill_pending=False, decoding=True)
     assert el.lent == 0
 
 
+def _chunks(el, tokens):
+    return -(-PF_BPT * max(0, tokens - PF_MIN) // el.pool.chunk_bytes)
+
+
 @CUDA
-def test_a_long_prefill_borrows_expert_slots_and_hands_them_back_intact():
-    el, cache, kv = _build(spare_mib=16, boost_mib=4)
-    assert el.boost_chunks * el.pool.chunk_bytes >= 4 << 20
-    assert el.pages <= el.boost_limit_pages < el.limit_pages
+def test_a_short_prompt_takes_nothing_and_a_long_one_only_what_its_chunk_needs():
+    el, cache, kv = _build(spare_mib=16)
     s0, handles0 = el.slots, el.pool.num_handles
     _decode(cache, 50, seed=8)
     _stamp(kv, 64)
 
-    assert el.boost() and el.boosted == el.boost_chunks
-    assert el.pool.num_handles == handles0 - el.boost_chunks  # back with the driver for activations
+    assert el.prefill_tokens(50) == 50 and el.prefill_tokens(PF_MIN) == PF_MIN
+    el.hold_prefill(50)  # the standing reserve covers it
+    assert el.taken == 0 and el.slots == s0 and el.pool.num_handles == handles0
+
+    t = PF_MIN + el.pool.chunk_bytes // PF_BPT  # exactly one chunk beyond the reserve
+    assert el.prefill_tokens(t) == t
+    el.hold_prefill(t)
+    assert el.taken == 1 and el.pool.num_handles == handles0 - 1  # back with the driver for activations
     assert el.slots < s0 and cache.active_slots == el.slots
-    assert el.boost() and el.pool.num_handles == handles0 - el.boost_chunks  # a no-op while boosted
+    one_chunk_slots = s0 - el.slots
+    el.hold_prefill(2000)
+    assert el.taken == _chunks(el, 2000) == 4 and el.pool.num_handles == handles0 - 4
+    el.hold_prefill(t)  # within a prompt the workspace only grows
+    assert el.taken == 4
+    assert one_chunk_slots < s0 - el.slots
     _check_stamp(kv, 64)
     _coherent(cache)
     _no_leak(el)
-    # KV can grow only as far as the boost leaves room for
-    assert el.growable_pages() == el.boost_limit_pages - el.pages
+    # KV can grow only as far as the workspace leaves room for
+    assert el.growable_pages() == el._pages_within(el.room - 4) - el.pages < el.limit_pages - el.pages
     old, new = el.grow(10_000)
-    assert new == el.boost_limit_pages and el.slots >= E
+    assert new == el._pages_within(el.room - 4) and el.slots >= E
     _decode(cache, 30, seed=9)
     _coherent(cache)
     _no_leak(el)
     el.shrink(64)
 
-    el.decode_step(prefill_pending=False)  # the first decode step takes the slots back
-    assert el.boosted == 0 and el.pool.num_handles == handles0 and el.slots == s0
+    el.settle(prefill_pending=True, decoding=True)
+    assert el.taken == 4  # kept while the prompt is still prefilling
+    el.settle(prefill_pending=False, decoding=False)  # given back once it is in
+    assert el.taken == 0 and el.pool.num_handles == handles0 and el.slots == s0
     _check_stamp(kv, 64)
     _coherent(cache)
     _decode(cache, 30, seed=10)
     _no_leak(el)
 
-    # with more KV backed than a boost leaves room for, a long chunk is refused
-    el.grow(el.boost_limit_pages - el.pages + 1)
-    assert el.pages > el.boost_limit_pages
-    assert not el.boost() and el.boosted == 0 and el.pool.num_handles == handles0
-
 
 @CUDA
-def test_an_unboost_short_of_vram_retries_on_one_gpu_and_fails_loudly_under_tp(monkeypatch):
-    el, cache, kv = _build(spare_mib=16, boost_mib=4)
-    assert el.boost_chunks >= 2
-    handles0, create = el.pool.num_handles, el.pool.create
-    made = []
-
-    def flaky(n):
-        if made:
-            raise RuntimeError("CUDA driver VMM call failed: out of memory")
-        made.append(n)
-        create(n)
-
-    assert el.boost()
-    monkeypatch.setattr(el.pool, "create", flaky)
-    el.unboost()  # one GPU: what came back is kept, the rest is retried, KV stays capped meanwhile
-    assert el.boosted == el.boost_chunks - 1 and el.growable_pages() == el.boost_limit_pages - el.pages
-    _no_leak(el)
-    monkeypatch.setattr(el.pool, "create", create)
-    el.unboost()
-    assert el.boosted == 0 and el.pool.num_handles == handles0
+def test_the_first_decode_step_gives_the_workspace_back_and_lends_the_reserve_at_once():
+    el, cache, kv = _build(spare_mib=16)
+    el.lend_after = 1
+    s0 = el.slots
+    el.hold_prefill(2000)
+    assert el.taken == 4
+    transitions = el.transitions
+    el.settle(prefill_pending=False, decoding=True)
+    assert el.taken == 0 and el.lent > 0 and el.slots > s0 and el.transitions == transitions + 1
+    el.release_prefill()  # the idle point ends the lend
+    assert el.lent == 0 and el.slots == s0
     _coherent(cache)
     _no_leak(el)
 
-    # TP: the ranks vote, so they leave boost together or the server stops (never diverges)
+
+@CUDA
+def test_chunks_shrink_with_the_context_and_the_minimum_always_fits():
+    el, cache, kv = _build(spare_mib=24)
+    sizes = []
+    while True:
+        n = el.prefill_tokens(10**6)
+        sizes.append(n)
+        assert PF_MIN <= n <= PF_MAX
+        spare = el.room - el._kv_chunks(el.pages)
+        # the largest chunk that fits: one more token would need a chunk the pool does not have
+        assert _chunks(el, n) <= spare and (n == PF_MAX or _chunks(el, n + 1) > spare)
+        el.hold_prefill(n)
+        assert el.slots >= E and cache.active_slots == el.slots
+        _decode(cache, 5, seed=len(sizes))
+        _coherent(cache)
+        _no_leak(el)
+        el.release_prefill()
+        if el.pages == el.limit_pages:
+            break
+        el.grow(1)
+    assert sizes[0] == PF_MAX and sizes[-1] < PF_MAX and sizes == sorted(sizes, reverse=True)
+    # at the context limit, with the experts at their floor, the minimum chunk takes nothing
+    assert el._max_slots(el.pages, el.base - el._workspace_chunks(sizes[-1])) >= E
+    assert _chunks(el, PF_MIN) == 0
+
+
+@CUDA
+def test_tp_ranks_size_chunks_alike_whatever_their_expert_banks_hold(monkeypatch):
+    """The sizing reads only the page count and the room settled across ranks: a rank with less
+    VRAM for experts sets the room, and both ranks then pick the same chunk at every KV size."""
+    small, _, _ = _build(spare_mib=12)
+    kv = small._kv_chunks(small.cap_pages)
+    peer = torch.tensor([small.room, kv, -kv, small.pool.chunk_bytes, -small.pool.chunk_bytes], dtype=torch.int64)
+
+    def all_reduce(t, op=None, group=None):
+        if t.numel() == 5:
+            t.copy_(torch.minimum(t, peer))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    big, cache, _ = _build(spare_mib=24, tp_group=object())
+    assert big.base > small.base and big.room == small.room and big.limit_pages == small.limit_pages
+    while True:
+        assert big.prefill_tokens(10**6) == small.prefill_tokens(10**6)
+        assert big.prefill_tokens(1000) == small.prefill_tokens(1000)
+        big.hold_prefill(big.prefill_tokens(10**6))
+        small.hold_prefill(small.prefill_tokens(10**6))
+        assert big.taken == small.taken and big.slots > small.slots >= E  # slot counts may differ per rank
+        big.release_prefill()
+        small.release_prefill()
+        if big.pages == big.limit_pages:
+            break
+        big.grow(1)
+        small.grow(1)
+        assert big.pages == small.pages
+
+    peer[1] -= 1  # a rank whose KV maps differently would size differently: refuse to start
+    with pytest.raises(RuntimeError, match="TP ranks differ"):
+        _build(spare_mib=24, tp_group=object())
+
+
+@CUDA
+def test_an_explicit_reserve_fixes_every_chunk_at_the_largest():
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.elastic import ElasticVram
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    el = ElasticVram(dev, min_pages=64, step_pages=32, floor_slots=E, cap_slots=L * E, cap_pages=1024,
+                     prefill_min_tokens=PF_MAX, prefill_max_tokens=PF_MAX, prefill_bytes_per_token=PF_BPT)
+    assert el.prefill_tokens(100) == 100 and el.prefill_tokens(10**6) == PF_MAX
+    assert el._workspace_chunks(PF_MAX) == 0
+
+
+@CUDA
+def test_a_give_back_short_of_vram_retries_on_one_gpu_and_fails_loudly_under_tp(monkeypatch):
+    el, cache, kv = _build(spare_mib=16)
+    handles0, create = el.pool.num_handles, el.pool.create
+
+    def flaky(n):
+        create(n - 1)
+        raise RuntimeError("CUDA driver VMM call failed: out of memory")
+
+    el.hold_prefill(2000)
+    assert el.taken == 4
+    monkeypatch.setattr(el.pool, "create", flaky)
+    el.release_prefill()  # one GPU: what came back is kept, the rest is retried, KV stays capped meanwhile
+    assert el.taken == 1 and el.growable_pages() == el._pages_within(el.room - 1) - el.pages
+    _no_leak(el)
+    monkeypatch.setattr(el.pool, "create", create)
+    el.settle(prefill_pending=False, decoding=False)
+    assert el.taken == 0 and el.pool.num_handles == handles0
+    _coherent(cache)
+    _no_leak(el)
+
+    # TP: the ranks vote, so they give back together or the server stops (never diverges)
     votes = []
 
     def all_reduce(t, op=None, group=None):
@@ -225,13 +330,13 @@ def test_an_unboost_short_of_vram_retries_on_one_gpu_and_fails_loudly_under_tp(m
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(el, "_tp_group", object())
     peer_ok = 1
-    assert el.boost()
-    el.unboost()
-    assert votes == [1] and el.boosted == 0 and el.pool.num_handles == handles0
+    el.hold_prefill(2000)
+    el.release_prefill()
+    assert votes == [1] and el.taken == 0 and el.pool.num_handles == handles0
     peer_ok = 0  # this rank got its chunks back, another did not
-    assert el.boost()
+    el.hold_prefill(2000)
     with pytest.raises(RuntimeError, match="a TP rank could not take"):
-        el.unboost()
+        el.release_prefill()
     assert votes == [1, 1]
 
 
@@ -310,7 +415,8 @@ def _vram_config(pool, strategy="offload", decode_target="gpu", is_moe=True, fla
 
     model_config = SimpleNamespace(is_moe=is_moe, decode_target=decode_target, pool=pool)
     return SimpleNamespace(model_config=model_config, moe_strategy=strategy, static_vram_flags=flags,
-                           elastic_kv=elastic_kv, **{"prefill_reserve_tokens": 0, **settings})
+                           elastic_kv=elastic_kv,
+                           **{"prefill_batch_min": 2048, "prefill_batch_max": 16384, **settings})
 
 
 @pytest.fixture
@@ -378,9 +484,26 @@ def test_elastic_kv_where_unsupported(_pool_from_config, monkeypatch):
 
     warned = []
     monkeypatch.setattr(engine_mod.logger, "warning_rank0", lambda msg: warned.append(msg))
-    engine_mod._check_vram_flags(_vram_config(**unsupported[0], prefill_reserve_tokens=8192))
-    engine_mod._check_vram_flags(_vram_config(QSAKVCache, elastic_kv=False, prefill_reserve_tokens=8192))
-    assert len(warned) == 2 and all("--prefill-reserve-tokens ignored" in w for w in warned)
+    engine_mod._resolve_prefill_batch(_vram_config(**unsupported[0], prefill_batch_min=4096))
+    engine_mod._resolve_prefill_batch(_vram_config(QSAKVCache, elastic_kv=False, prefill_batch_max=8192))
+    engine_mod._resolve_prefill_batch(_vram_config(QSAKVCache, elastic_kv=False))  # defaults: silent
+    assert len(warned) == 2 and all("--prefill-batch-min/-max ignored" in w for w in warned)
+
+
+def test_elastic_vram_prefills_up_to_the_batch_max_and_upstream_keeps_its_chunk(_pool_from_config):
+    from freetoken.engine.engine import _resolve_prefill_batch
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    config = _vram_config(QSAKVCache, max_extend_tokens=8192)
+    _resolve_prefill_batch(config)
+    assert (config.max_extend_tokens, config.prefill_batch_min) == (16384, 2048)
+    config = _vram_config(QSAKVCache, max_extend_tokens=8192, prefill_batch_min=4096, prefill_batch_max=1024)
+    _resolve_prefill_batch(config)  # the LLM() path reaches here unvalidated
+    assert (config.max_extend_tokens, config.prefill_batch_min) == (1024, 1024)
+    config = _vram_config(HybridSWAKVCache, max_extend_tokens=8192)
+    _resolve_prefill_batch(config)
+    assert config.max_extend_tokens == 8192
 
 
 def test_llm_records_its_static_sizing_kwargs(monkeypatch):
@@ -426,3 +549,27 @@ def test_parse_args_records_which_static_sizing_flags_were_given(argv, want):
         assert args.memory_ratio == EngineConfig.memory_ratio
     if not want:
         assert args.moe_cache_size == 0 and args.moe_cache_rate is None
+
+
+@pytest.mark.parametrize(
+    ("argv", "want"),
+    [
+        ([], (8192, 2048, 16384)),
+        (["--prefill-batch-min", "4096", "--prefill-batch-max", "8192"], (8192, 4096, 8192)),
+        (["--max-prefill-length", "4096"], (4096, 2048, 4096)),  # an explicit cap caps elastic's chunks
+        (["--max-prefill-length", "1024"], (1024, 1024, 1024)),
+        (["--max-prefill-length", "32768"], (32768, 2048, 16384)),
+    ],
+)
+def test_parse_args_caps_the_prefill_batch_by_an_explicit_max_prefill_length(argv, want):
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    class _HF:
+        def to_dict(self):
+            return {"architectures": ["Qwen3_5MoeForConditionalGeneration"], "torch_dtype": "bfloat16"}
+
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: _HF()):
+        args = parse_args(["--model", "/models/anon", *argv])[0]
+    assert (args.max_extend_tokens, args.prefill_batch_min, args.prefill_batch_max) == want

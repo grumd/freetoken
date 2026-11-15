@@ -13,7 +13,7 @@ Serves Qwen3.8-Flash-Next from an FTW checkpoint: experts pinned in host RAM beh
 ```bash
 MODEL=~/models/ftw/q38-fp4 scripts/serve.sh                          # every GPU, up to two
 MODEL=~/models/ftw/q38-fp4 GPUS=1 scripts/serve.sh                   # the second GPU only
-MODEL=~/models/ftw/q38-fp4 scripts/serve.sh --max-prefill-length 4096   # any ft serve flag
+MODEL=~/models/ftw/q38-fp4 scripts/serve.sh --prefill-batch-min 1024   # any ft serve flag
 ```
 
 The API is OpenAI/Anthropic-compatible at `http://127.0.0.1:8080/v1`, with a chat page at `/`. The script prints `model loaded` once `/health` reports ok. An FTW loads in about 1 min.
@@ -56,7 +56,6 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 |---|---|
 | `--moe-strategy offload` | experts in host RAM; KV and the expert cache share VRAM at runtime (elastic VRAM, the engine's behaviour for offload MoE), so the cache gets whatever the live context does not need (decode +16%, output identical) and the context shrinks to what fits |
 | `--max-running-requests 1` | batching loses: 3 streams at once decode slower in total than 1 |
-| `--max-prefill-length 16384 --prefill-reserve-tokens 8192` | prefill streams every expert over PCIe once per chunk, so 16384-token chunks halve that traffic: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s; with the PLE read-ahead 6.2 / 4.9 s and 24.4 / 17.5 s). Elastic keeps 256 MiB + 230 KiB per chunk token free for activations; the standing reserve covers 8192-token chunks and a longer prompt borrows the other 1.8 GiB from the expert cache while it prefills, so the context limit stays that of 8192 (a fixed 16384 reserve would cap one RTX 3080 at 238k). Near the limit the chunks stay at 8192. `--max-prefill-length 4096` gives one 16 GB GPU 186k instead of 147k context, at about half the long-prompt prefill speed |
 | `--moe-routed-prefill-tokens 4096` (one GPU), `3072` (two) | chunks up to this size load only their routed experts, the CPU computing 65% of the misses (`--moe-prefill-fetch`), instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). One RTX 3080, FP4, an agent turn on a cached 16k prefix: 4k new tokens 4.78 -> 3.26 s, while an 8k chunk is faster streamed (4.83 s against 5.79 routed). Two GPUs each stream half of every expert, so streaming wins from a smaller chunk. Re-tune on another link or CPU; about `1280` with `--moe-prefill-fetch 1` |
 | `--moe-prefill-hit-d2d` | longer chunks copy VRAM-cached experts device-side and stream only the misses (pp16384 -14%, output identical) |
 | `--vision-on-cpu --vision-threads 8` | the ViT would take 0.84 GiB of VRAM on every GPU; 16 threads encode a full-size image in 3.5 s, 4 in 6.8 s |
@@ -64,6 +63,8 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--ngram-spec` | Prompt-lookup drafts verified in one window, no draft model. FP4, a code edit that copies a 351-line file back: one RTX 3080 52.5 -> 84.6 tok/s, two 81.9 -> 126.7. Prose +2% on one GPU, -2% on two (its verify graphs take ~170 expert slots per GPU); agent turns even. Lossless (verified tokens only); `--no-ngram-spec` turns it off. Not measured with parallel requests yet |
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
 | `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
+
+Prefill chunks (`ft serve` defaults, so `serve.sh` passes nothing): a chunk needs 256 MiB + 230 KiB per token of VRAM for its activations. The standing reserve covers `--prefill-batch-min` (2048) tokens at any context length, and it alone bounds the context (one 16 GB GPU: about 205k tokens). A longer prompt takes what its chunk needs beyond that from the expert cache, coldest experts first, up to `--prefill-batch-max` (16384) tokens or whatever the KV cache leaves room for, and gives it back as empty slots before its first decode step. So a 5k-token agent turn retires about 290 expert slots instead of the 1040 a fixed 16384-token borrow took. Long chunks matter because a chunk past `--moe-routed-prefill-tokens` streams every expert over PCIe once: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080 with 16384- instead of 8192-token chunks, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s). An explicit `--max-prefill-length` caps both.
 
 Other useful flags: `--moe-prefill-fetch` (the share of a routed prefill chunk's cache misses fetched over PCIe, the rest computed on the CPU; default 0.35 wherever the CPU kernel runs, `1` = no CPU; here 0.2 is faster for 1k-token turns but slower from 2k up), `-t`/`--threads` (CPU threads for CPU expert work, split across the GPUs; default all physical cores), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-mxfp8-groups lm_head` (recommended for FP4: +5% decode on one GPU, rounds the lm_head to MXFP8 with no measurable KLD change; off by default because it is lossy), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
 
@@ -81,7 +82,7 @@ For bit-reproducible A/B runs use `--moe-prefill-fetch 1` and `--moe-decode-fetc
 ### Requirements
 
 - **OS / toolchain:** Linux x86_64, NVIDIA driver r580+ (CUDA 13), CUDA 13 toolkit with `nvcc` on PATH (kernels JIT-compile on first use), `g++` (the CPU prefill extension builds with `-march=native`).
-- **GPU:** one or two with 16 GB or more. One 16 GB GPU holds 147k tokens of context, 20 GB the full 262k. Dense weights take 8.2 GiB unsplit (5.5 GiB per GPU at TP=2), KV 25 KiB/token (6.4 GiB at 262k), the expert cache the rest.
+- **GPU:** one or two with 16 GB or more. One 16 GB GPU holds about 205k tokens of context, 20 GB the full 262k. Dense weights take 8.2 GiB unsplit (5.5 GiB per GPU at TP=2), KV 25 KiB/token (6.4 GiB at 262k), the expert cache the rest.
 - **RAM:** 96 GB class.
 - **CPU:** AVX-512 BF16 (Zen 4/5, Sapphire Rapids or newer) for CPU prefill and for INT4's CPU-assisted decode. CPU-assisted decode follows RAM bandwidth (~50 GB/s of expert reads on dual-channel DDR5).
 - **Disk:** NVMe. PLE rows are read on every token.
@@ -116,7 +117,7 @@ FTW conversion notes:
 ### Troubleshooting
 
 - **`REFUSING TO START`:** free RAM first.
-- **CUDA OOM on the first decode after a long prompt:** raise `--prefill-reserve-gb` or `--vram-keep-free-mb`.
+- **CUDA OOM during or right after a long prompt:** raise `--vram-keep-free-mb`, or fix the workspace with `--prefill-reserve-gb` (every chunk is then `--prefill-batch-max` tokens).
 - **Load peak too high:** `FREETOKEN_FTW_READ_CONCURRENCY=1` (about -5 GiB).
 - **Per-prefill CPU/GPU split timing:** `FREETOKEN_WNA16_CPU_PREFILL_STATS=1`.
 

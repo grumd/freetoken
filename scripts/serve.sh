@@ -33,10 +33,6 @@ args=(
   --gpu "$GPUS" --tp-size "$tp"
   --moe-strategy offload
   --max-running-requests 1
-  # prefill streams every expert over PCIe once per chunk: 16384-token chunks halve that traffic.
-  # The standing reserve covers 8192-token chunks (a 16384 one would cap one GPU's context below
-  # 262k); a long prompt borrows the rest from the expert cache while KV leaves room for it.
-  --max-prefill-length 16384 --prefill-reserve-tokens 8192
   --moe-prefill-hit-d2d
   # the ViT would otherwise take 0.84 GiB of VRAM on every GPU
   --vision-on-cpu --vision-threads 8

@@ -880,12 +880,10 @@ class Engine:
         cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         fixed += state_pool_bytes(config)
         self._elastic_page_tokens = page_tokens
-        long_tokens = config.max_extend_tokens
-        base_tokens = config.prefill_reserve_tokens if 0 < config.prefill_reserve_tokens < long_tokens else long_tokens
-        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, base_tokens)
-        boost_bytes = PREFILL_BYTES_PER_TOKEN * (long_tokens - base_tokens)
+        lo, hi = config.prefill_batch_min, config.max_extend_tokens
         if config.prefill_reserve_gb is not None:
-            boost_bytes = 0  # an explicit reserve is the whole budget; chunks stay at its size
+            lo = hi  # an explicit reserve is the whole workspace: every chunk is the largest
+        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, lo)
         self._elastic_keep_free = config.vram_keep_free_mb << 20
         free = self._sync_get_memory()[0]
         min_pages = div_ceil(config.elastic_kv_min_tokens, page_tokens)
@@ -909,7 +907,9 @@ class Engine:
             cap_slots=cap_slots,
             cap_pages=cap_pages,
             lend_after=config.elastic_lend_after,
-            boost_bytes=boost_bytes,
+            prefill_min_tokens=lo,
+            prefill_max_tokens=hi,
+            prefill_bytes_per_token=PREFILL_BYTES_PER_TOKEN,
         )
         object.__setattr__(config, "moe_cache_size", cap_slots)
         object.__setattr__(config, "num_page_override", cap_pages)
@@ -1999,8 +1999,20 @@ def _check_vram_flags(config: EngineConfig) -> None:
             f"{', '.join(flags)}: these flags size VRAM statically; elastic VRAM is on by default for "
             "this setup; pass --no-elastic-kv to use them"
         )
-    if getattr(config, "prefill_reserve_tokens", 0) and not _elastic_vram(config):
-        logger.warning_rank0("--prefill-reserve-tokens ignored: it sizes elastic VRAM's prefill reserve")
+
+
+def _resolve_prefill_batch(config: EngineConfig) -> None:
+    """Under elastic VRAM the prefill chunk cap is --prefill-batch-max (the CLI already capped it
+    by an explicit --max-prefill-length); elsewhere --max-prefill-length alone, as upstream."""
+    defaults = (EngineConfig.prefill_batch_min, EngineConfig.prefill_batch_max)
+    lo, hi = (getattr(config, "prefill_batch_min", defaults[0]), getattr(config, "prefill_batch_max", defaults[1]))
+    if not _elastic_vram(config):
+        if (lo, hi) != defaults:
+            logger.warning_rank0("--prefill-batch-min/-max ignored: they size elastic VRAM's prefill chunks")
+        return
+    # max_extend_tokens is the largest prefill forward, which sizes the communication buffers too
+    object.__setattr__(config, "max_extend_tokens", hi)
+    object.__setattr__(config, "prefill_batch_min", min(lo, hi))
 
 
 def _decode_target(config: EngineConfig) -> str:
@@ -2463,6 +2475,7 @@ def _adjust_config(config: EngineConfig):
         override("num_page_override", config.num_token_override // config.page_size)
 
     _check_vram_flags(config)
+    _resolve_prefill_batch(config)
 
     # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.

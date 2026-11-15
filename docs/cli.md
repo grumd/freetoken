@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
-| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens; under elastic VRAM, if given, it caps `--prefill-batch-min`/`--prefill-batch-max` instead |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 | `--gpu-stats`, `--no-gpu-stats` | on | Append the per-GPU telemetry segment (TP count, VRAM, utilization, temperature, power) to the status lines; omitted when NVML and `nvidia-smi` are both unavailable |
@@ -119,7 +119,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 ### Elastic VRAM
 
-With `--moe-strategy offload` (the default for MoE models), GPU decode and an MHA or QSA KV pool, KV pages and MoE expert slots share one pool of VRAM at runtime instead of being split once at startup: experts take whatever the live context does not need, and give slots back (coldest first) when the context grows. Output is identical to the static split. It is on by default there. The static sizing flags (`--memory-ratio`, `--gpu-memory-ratio`, `--kv-reserve-tokens`, `--moe-cache-size`/`-rate`/`-auto`, `--num-pages`/`--num-tokens`) need `--no-elastic-kv` on such a setup: without it the server refuses to start, before loading the model. `--no-elastic-kv` alone gives upstream's static defaults (`--moe-cache-auto`). Every other setup (`--moe-strategy cpu`/`hybrid`/`fused`, `--moe-cpu-layers`, SWA/MLA/DSA/DSV4/BSA KV pools, dense models) uses the static split and its flags as upstream does; `--elastic-kv` there is an error, and the flags below have no effect (`--prefill-reserve-tokens` logs that it is ignored). `LLM(...)` follows the same rules (`elastic_kv=False`). `--max-seq-len-override` still caps one request; the total over parallel requests is limited only by VRAM.
+With `--moe-strategy offload` (the default for MoE models), GPU decode and an MHA or QSA KV pool, KV pages and MoE expert slots share one pool of VRAM at runtime instead of being split once at startup: experts take whatever the live context does not need, and give slots back (coldest first) when the context grows. Output is identical to the static split. It is on by default there. The static sizing flags (`--memory-ratio`, `--gpu-memory-ratio`, `--kv-reserve-tokens`, `--moe-cache-size`/`-rate`/`-auto`, `--num-pages`/`--num-tokens`) need `--no-elastic-kv` on such a setup: without it the server refuses to start, before loading the model. `--no-elastic-kv` alone gives upstream's static defaults (`--moe-cache-auto`). Every other setup (`--moe-strategy cpu`/`hybrid`/`fused`, `--moe-cpu-layers`, SWA/MLA/DSA/DSV4/BSA KV pools, dense models) uses the static split and its flags as upstream does; `--elastic-kv` there is an error, and the flags below have no effect (`--prefill-batch-min`/`-max` log that they are ignored). `LLM(...)` follows the same rules (`elastic_kv=False`). `--max-seq-len-override` still caps one request; the total over parallel requests is limited only by VRAM.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -129,9 +129,10 @@ With `--moe-strategy offload` (the default for MoE models), GPU decode and an MH
 | `--elastic-kv-min-tokens` | 16384 | KV tokens that always stay backed |
 | `--elastic-kv-step-tokens` | 16384 | KV grows and shrinks in steps of this many tokens |
 | `--elastic-keep-requests` | auto | Cached prefixes untouched by this many admissions are dropped (or spilled to the RAM tier) before KV takes expert slots; auto = max(4, 2 x max running requests), max(2, ...) with `--cache-ram-gb` |
-| `--prefill-reserve-gb` | auto | VRAM per GPU kept back for prefill activations; auto = 256 MiB + 230 KiB per token of `--max-prefill-length` (2.0 GiB at 8192, 1.2 at 4096, 0.7 at 2048) |
-| `--prefill-reserve-tokens` | 0 | Size the standing prefill reserve for chunks of this many tokens instead of `--max-prefill-length`. A prompt that needs longer chunks borrows the difference (230 KiB per token) from the expert cache until it is prefilled, while the KV pages backed at that point leave room for it; otherwise its chunks stay at this size, as they always do with an explicit `--prefill-reserve-gb`. Keeps the context of a short reserve with the speed of long chunks. 0 = off |
-| `--elastic-lend-after` | 1 | Decode steps with no prefill waiting after which the idle prefill reserve is lent to the expert cache until the next prefill; one ~80 ms gap per turn. 0 never lends |
+| `--prefill-batch-min` | 2048 | Prefill chunk the standing reserve covers at any context length: 256 MiB + 230 KiB per token kept back (0.7 GiB at 2048, 1.2 at 4096, 2.0 at 8192), which bounds the context. Prompts this short take nothing from the expert cache |
+| `--prefill-batch-max` | 16384 | Largest prefill chunk. A longer prompt's chunk is min(remaining tokens, what fits beside the KV pages backed now, this); before it runs, the coldest expert slots are retired for exactly the activation VRAM it needs beyond the reserve, and they come back empty once no prefill is waiting. Same size on every TP rank. Also the largest prefill forward (`--max-prefill-length` under elastic VRAM) |
+| `--prefill-reserve-gb` | auto | Fix the prefill workspace at this much VRAM per GPU instead (auto = from `--prefill-batch-min`): every chunk is then `--prefill-batch-max` tokens and nothing is taken from the expert cache per prompt |
+| `--elastic-lend-after` | 1 | Lend the idle standing reserve to the expert cache from this decode step of a turn on (1 = with the first, in the same transition that gives the prefill workspace back), until the next prefill; one 20-50 ms gap per turn. 0 never lends |
 | `--cache-ram-gb` | 0 | Pinned host RAM (GiB, total over all GPUs) that evicted prompt prefixes and their GDN snapshots spill to; a later request with that prefix reloads them instead of prefilling again. Hybrid GDN models; preallocated at startup |
 
 ### PLE — Qwen3.8-Flash-Next n-gram table

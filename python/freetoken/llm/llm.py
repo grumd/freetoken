@@ -29,9 +29,14 @@ class RequestStatus:
 
 class LLM(Scheduler):
     def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
-        from freetoken.engine.config import STATIC_VRAM_FIELDS
+        from freetoken.engine.config import STATIC_VRAM_FIELDS, EngineConfig
 
         kwargs.setdefault("static_vram_flags", tuple(k for k in STATIC_VRAM_FIELDS if k in kwargs))
+        if "max_extend_tokens" in kwargs:
+            # as on the CLI: an explicit chunk cap caps elastic VRAM's prefill chunks too
+            cap = kwargs["max_extend_tokens"]
+            kwargs["prefill_batch_max"] = min(kwargs.get("prefill_batch_max", EngineConfig.prefill_batch_max), cap)
+            kwargs["prefill_batch_min"] = min(kwargs.get("prefill_batch_min", EngineConfig.prefill_batch_min), cap)
         config = SchedulerConfig(
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),

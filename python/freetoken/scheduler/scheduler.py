@@ -287,32 +287,32 @@ class Scheduler(SchedulerIOMixin):
             self.sync_all_ranks()
 
     def _set_prefill_budget(self) -> None:
-        """Prefill chunk size: --max-prefill-length, capped by the cache manager's window budget.
-        With elastic VRAM the standing chunk is --prefill-reserve-tokens, and a long prompt grows it
-        back to --max-prefill-length when the expert cache can lend the VRAM (never with an explicit
-        --prefill-reserve-gb, which sizes no boost)."""
+        """Prefill chunk cap: --max-prefill-length (--prefill-batch-max under elastic VRAM), capped
+        by the cache manager's window budget. Elastic VRAM sizes every chunk below it."""
         cfg = self.config
         cap = self.cache_manager.prefill_chunk_budget
-        full = min(cfg.max_extend_tokens, cap) if cap else cfg.max_extend_tokens
+        self.prefill_budget = min(cfg.max_extend_tokens, cap) if cap else cfg.max_extend_tokens
         elastic = getattr(self.engine, "elastic", None)
-        base = getattr(cfg, "prefill_reserve_tokens", 0)
-        if elastic is not None and 0 < base < full:
-            self.prefill_budget = base
-            self._boost_tokens = full - base if elastic.boost_chunks else 0
-        else:
-            self.prefill_budget, self._boost_tokens = full, 0
-        self.prefill_manager.grow_budget = self._grow_prefill_budget if self._boost_tokens else None
+        self.prefill_manager.size_chunk = self._size_prefill_chunk if elastic is not None else None
 
-    def _grow_prefill_budget(self) -> int:
-        """PrefillAdder hook: the extra chunk tokens a boost buys, or 0 if KV leaves no room."""
-        return self._boost_tokens if self.engine.elastic.boost() else 0
+    def _size_prefill_chunk(self, remaining: int) -> int:
+        """PrefillAdder hook: the batch's token budget for a first request with ``remaining``
+        tokens, with the VRAM for its activations taken from the expert cache. Shorter prompts
+        batched after it share the standing reserve."""
+        elastic = self.engine.elastic
+        tokens = elastic.prefill_tokens(remaining)
+        elastic.hold_prefill(tokens)
+        return max(tokens, elastic.prefill_min_tokens)
 
-    def _settle_elastic_boost(self) -> None:
-        """Hand a long prompt's borrowed VRAM back to the experts once no prefill is waiting,
-        before any decode, verify round or idle-time page work can need the pool."""
+    def _settle_prefill_workspace(self) -> None:
+        """Give the prefill workspace back to the experts once no prefill is waiting, before any
+        decode, verify round or idle-time page work can need the pool (and lend them the idle
+        reserve while decoding)."""
         elastic = getattr(getattr(self, "engine", None), "elastic", None)
-        if elastic is not None and elastic.boosted and not self.prefill_manager.runnable:
-            elastic.unboost()
+        if elastic is not None:
+            elastic.settle(
+                prefill_pending=self.prefill_manager.runnable, decoding=self.decode_manager.runnable
+            )
 
     def _launch(self, forward_input: ForwardInput) -> ForwardData:
         """Run ``forward_input`` on the engine stream (restoring hybrid snapshots first) and
@@ -354,7 +354,7 @@ class Scheduler(SchedulerIOMixin):
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
-        self._settle_elastic_boost()
+        self._settle_prefill_workspace()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -364,7 +364,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
-        self._settle_elastic_boost()  # an abort may have dropped the boosted prompt
+        self._settle_prefill_workspace()  # an abort may have dropped the prompt in flight
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -507,7 +507,7 @@ class Scheduler(SchedulerIOMixin):
         return _NOOP_MTP
 
     def normal_loop(self) -> None:
-        self._settle_elastic_boost()
+        self._settle_prefill_workspace()
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -516,7 +516,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
-        self._settle_elastic_boost()  # an abort may have dropped the boosted prompt
+        self._settle_prefill_workspace()  # an abort may have dropped the prompt in flight
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -1330,11 +1330,11 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         elastic = getattr(getattr(self, "engine", None), "elastic", None)
-        if elastic is not None and self.prefill_manager.runnable:
-            # a prefill needs its activation workspace back, and admission may reload from RAM
-            elastic.reclaim()
-            if elastic.boosted and self.prefill_manager.pending_list[0].chunked_req is None:
-                elastic.unboost()  # a new admission sizes its KV against the whole pool
+        pm = self.prefill_manager
+        if elastic is not None and pm.runnable and pm.pending_list[0].chunked_req is None:
+            # a new prompt: admission may allocate through torch (RAM-tier reloads) and sizes its KV
+            # against the whole pool, so end a lend and drop a workspace an earlier prompt left
+            elastic.release_prefill()
         # TODO: support other policies: e.g. DECODE first
         batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         failed = getattr(self.prefill_manager, "failed", None)
@@ -1348,7 +1348,7 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             return None
         if elastic is not None and not batch.is_prefill:
-            elastic.decode_step(prefill_pending=self.prefill_manager.runnable)
+            elastic.decode_step()
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
         if getattr(batch, "is_decode", False) and mtp._deferred:
             # MTP rounds deferred this iteration (prefill priority): keep their

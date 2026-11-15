@@ -292,7 +292,7 @@ class DiskRowTable:
             self._wait_seq = self._seq
         prompt = getattr(req, "prompt_ids", None)
         if prompt is not None and req.device_len < len(prompt):
-            # the next chunk is this one's size (a boost lasts the whole prompt); 1024 covers rounding
+            # the next chunk is this one's size (a prompt's chunks differ only in the last); 1024 covers rounding
             chunk = -(-(req.device_len - req.cached_len) // 1024) * 1024
             start = req.device_len
             end = min(len(prompt), start + min(chunk, self._eager_tokens))

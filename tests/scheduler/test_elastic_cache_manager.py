@@ -19,14 +19,16 @@ class _Elastic:
     def __init__(self, pages, limit, step, min_pages):
         self.pages, self.limit_pages, self.step_pages, self.min_pages = pages, limit, step, min_pages
         self.calls = []
-        self.reclaims = 0  # the lent prefill reserve handed back
-        self.unboosts = 0  # a long prompt's borrowed slots handed back
+        self.holds = 0  # lend ended, the prefill workspace kept (before KV growth or a spill)
+        self.releases = 0  # lend ended and the prefill workspace handed back (between turns)
 
-    def reclaim(self):
-        self.reclaims += 1
+    def hold_prefill(self, tokens):
+        assert tokens == 0
+        self.holds += 1
 
-    def unboost(self):
-        self.unboosts += 1
+    def release_prefill(self, lend=False):
+        assert not lend
+        self.releases += 1
 
     def growable_pages(self):
         return self.limit_pages - self.pages
@@ -71,10 +73,10 @@ def test_pages_come_lowest_first_and_a_shortfall_grows_the_pool():
     cm._free(a[1:3].flip(0))
     assert cm.free_slots.tolist() == [1, 2, 5, 6, 7]  # sorted, not FIFO
     assert cm._allocate(2).tolist() == [1, 2]
-    assert el.reclaims == 0  # served from free pages: a lent reserve stays lent
+    assert el.holds == 0  # served from free pages: a lent reserve stays lent
     got = cm._allocate(10)  # 3 free, so grow by whole steps
     assert el.calls == [("grow", 8, 16)]
-    assert el.reclaims == 1  # growth and spills allocate, so the reserve comes back first
+    assert el.holds == 1  # growth and spills allocate, so the reserve comes back first
     assert got.tolist() == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     assert cm.free_slots.tolist() == [15]
 
@@ -83,7 +85,7 @@ def test_idle_shrink_returns_free_tail_but_never_a_cached_page():
     cm, el = _cm(pages=40, min_pages=8)
     held = cm._allocate(3)  # pages 0..2 stay in use
     cm.elastic_idle()
-    assert el.reclaims == 1 and el.unboosts == 1  # between turns, before any page moves
+    assert el.releases == 1 and el.holds == 0  # between turns, before any page moves
     assert el.calls == [("shrink", 40, 16)]  # used 3 + one step of slack, rounded to a step
     assert cm.free_slots.tolist() == list(range(3, 16))
     cm._free(held)
@@ -155,18 +157,24 @@ def test_idle_compaction_moves_cached_pages_down_so_the_pool_can_shrink():
 
 
 @pytest.mark.parametrize("loop, ngram, want", [
-    ("normal_loop", False, ["unboost", "round", "schedule"]),
-    ("overlap_loop", False, ["unboost", "schedule"]),
-    ("overlap_loop", True, ["unboost", "ngram"]),
+    ("normal_loop", False, ["settle", "round", "schedule"]),
+    ("overlap_loop", False, ["settle", "schedule"]),
+    ("overlap_loop", True, ["settle", "ngram"]),
 ])
-def test_an_aborted_long_prompt_hands_its_boost_back_before_anything_else_runs(loop, ngram, want):
-    """The abort lands in the message loop: the boost is settled right after it, before a
+def test_an_aborted_long_prompt_hands_its_workspace_back_before_anything_else_runs(loop, ngram, want):
+    """The abort lands in the message loop: the workspace is settled right after it, before a
     rebuild, a speculative round or the next schedule can need the expert slots."""
     from freetoken.scheduler.scheduler import Scheduler
 
     events = []
-    el = SimpleNamespace(boosted=4)
-    el.unboost = lambda: (events.append("unboost"), setattr(el, "boosted", 0))
+    el = SimpleNamespace(taken=4)
+
+    def settle(*, prefill_pending, decoding):
+        if not prefill_pending and el.taken:
+            events.append("settle")
+            el.taken = 0
+
+    el.settle = settle
     sched = Scheduler.__new__(Scheduler)
     sched.engine = SimpleNamespace(elastic=el, stream=None)
     sched.stream = SimpleNamespace(wait_stream=lambda s: None)
@@ -184,4 +192,4 @@ def test_an_aborted_long_prompt_hands_its_boost_back_before_anything_else_runs(l
         Scheduler.normal_loop(sched)
     else:
         Scheduler.overlap_loop(sched, None)
-    assert events == want and el.boosted == 0
+    assert events == want and el.taken == 0

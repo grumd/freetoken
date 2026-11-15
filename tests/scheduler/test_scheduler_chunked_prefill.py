@@ -77,33 +77,50 @@ def _drive_chunked_prefill(cm, tm, pm, n_chunks):
     tm.free(final_req.table_idx)
 
 
-def test_a_long_prompt_grows_the_chunk_once_per_batch():
-    """An elastic boost: a prompt longer than the budget asks once for extra tokens; a refused
-    boost (0) keeps the standing chunk, and a prompt that fits never asks."""
+def test_elastic_vram_sizes_each_batch_once_from_its_first_request():
+    """The size_chunk hook: asked once per batch with the first request's remaining tokens
+    (capped by the batch budget), after its admission; its answer is the batch's budget."""
     from freetoken.core import SamplingParams
     from freetoken.scheduler.utils import PendingReq
 
     cm, tm, dm, pm = _build_managers(num_pages=MAX_RUNNING * WIDTH)
     asks = []
 
-    def grant(extra):
-        def grow():
-            asks.append(extra)
-            return extra
-        return grow
+    def offer(tokens):
+        def size(remaining):
+            asks.append(remaining)
+            return min(remaining, tokens)
+        return size
 
     sizes = []
     pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(30, dtype=torch.int32),
                                   sampling_params=SamplingParams(max_tokens=4))]
-    for extra in (CHUNK, 0, CHUNK):
-        pm.grow_budget = grant(extra)
-        batch = pm.schedule_next_batch(CHUNK)
+    for tokens in (2 * CHUNK, CHUNK, 4 * CHUNK):
+        pm.size_chunk = offer(tokens)
+        batch = pm.schedule_next_batch(4 * CHUNK)
         sizes.append(sum(r.extend_len for r in batch.reqs))
         cm.allocate_paged(batch.reqs)
         for r in batch.reqs:
             r.complete_one()
-    assert sizes == [2 * CHUNK, CHUNK, 30 - 3 * CHUNK] and asks == [CHUNK, 0]
+    assert sizes == [2 * CHUNK, CHUNK, 30 - 3 * CHUNK] and asks == [30, 30 - 2 * CHUNK, 30 - 3 * CHUNK]
     assert not pm.runnable
+
+
+def test_the_batch_budget_takes_the_first_chunk_and_never_less_than_the_standing_reserve():
+    """Scheduler._size_prefill_chunk: the chunk elastic VRAM sizes for the first request gets its
+    workspace; prompts batched after a short one share the reserve's prefill_batch_min tokens."""
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    held = []
+    el = SimpleNamespace(prefill_min_tokens=2048, prefill_tokens=lambda r: min(r, 9000), hold_prefill=held.append)
+    sched = Scheduler.__new__(Scheduler)
+    sched.engine = SimpleNamespace(elastic=el)
+    assert Scheduler._size_prefill_chunk(sched, 300) == 2048
+    assert Scheduler._size_prefill_chunk(sched, 5000) == 5000
+    assert Scheduler._size_prefill_chunk(sched, 20000) == 9000
+    assert held == [300, 5000, 9000]
 
 
 def test_multichunk_overlap_no_double_free():

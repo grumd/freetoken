@@ -28,6 +28,7 @@ FP4 with default settings: RTX 3080s on PCIe 4.0 x8, 96 GB of DDR5. For 16GB tes
 | 2x 20 GB | 16384 (8192 reserve) | 93 tok/s | 3,270 tok/s | 262k |
 
 - **RAM:** the experts stay pinned in host RAM: 64 GiB for FP4, 59 GiB for INT4. You will need 96 GB or more RAM to use this.
+- **Prefill batch** in the tables is the setting they were measured with, before the per-chunk prefill workspace: now `ft serve` keeps a reserve for 2048-token chunks and takes up to 16384-token chunks' VRAM from the expert cache per prompt (`--prefill-batch-min`/`--prefill-batch-max`), so the context limit is that of the 2048 row. The tables were not re-measured.
 - **16384 prefill batch:** the 20 GB rows were re-measured with `serve.sh`'s 16384-token chunks, whose standing reserve covers 8192-token chunks and borrows the rest from the expert cache per prompt, so the context limit stays the same. 16k prefill there is the time to first token of the first uncached 16k-token prompt after start (later ones, with a warm expert cache: 2,780 and 3,450 tok/s); the same measurement gave 1,320 and 2,050 tok/s with 8192-token chunks before. The 16 GB rows were not re-measured.
 - **One GPU** decode is CPU-assisted: the CPU computes most of the experts missing from VRAM. These rows use this PC's calibrated split (`--moe-decode-fetch 0.15 -t 7`); the 16 GB rows reuse the 20 GB card's calibration. With `--moe-decode-fetch 1` (no CPU help) one GPU decodes at 34 tok/s (20 GB) and 27 tok/s (16 GB).
 - **INT4** downloads 169 GB instead of 96 GB. It decodes about 11% slower on two GPUs. On one GPU its CPU-assisted decode needs an AVX-512 BF16 CPU: 44 tok/s at 4k context and 42 at 100k here (`--moe-decode-fetch 0.15 -t 7`), against about 25 without CPU help.
@@ -85,7 +86,7 @@ For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead.
 
 The default settings should already be optimized, and the context size and expert cache size automatically match your free VRAM.
 
-- you need more than 147k tokens on one 16 GB GPU: pass `--max-prefill-length 4096` (or 2048) after the script name (see benchmarks above)
+- one 16 GB GPU holds about 205k tokens of context: the standing prefill reserve covers 2048-token chunks (`--prefill-batch-min`), and longer prompts take their chunk's extra VRAM from the expert cache only while they prefill. `--prefill-batch-min 1024` after the script name gives a little more
 - you have 128 GB of RAM: `PREFIX_CACHE_RAM_GB=16` keeps older chat sessions in RAM, so going back to an old chat can skip prefilling from scratch
 
 See [`scripts/README.md`](scripts/README.md) for more details about options.

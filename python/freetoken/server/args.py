@@ -512,7 +512,10 @@ def parse_args(
         type=int,
         dest="max_extend_tokens",
         default=ServerArgs.max_extend_tokens,
-        help="Chunk Prefill maximum chunk size in tokens.",
+        help=(
+            "Chunk Prefill maximum chunk size in tokens. Under elastic VRAM the chunk size comes "
+            "from --prefill-batch-min/--prefill-batch-max, and this flag, if given, caps both."
+        ),
     )
     parser.add_argument(
         "--swa-full-tokens-ratio",
@@ -1038,20 +1041,29 @@ def parse_args(
         type=float,
         default=ServerArgs.prefill_reserve_gb,
         help=(
-            "VRAM per GPU kept back for prefill activations at their peak "
-            "(default: auto from the prefill chunk size)."
+            "VRAM per GPU kept back for prefill activations at their peak, instead of the "
+            "estimate from --prefill-batch-min; every chunk is then --prefill-batch-max tokens "
+            "and nothing is taken from the expert cache per prompt."
         ),
     )
-    parser.add_argument(
-        "--prefill-reserve-tokens",
+    elastic_group.add_argument(
+        "--prefill-batch-min",
         type=int,
-        default=ServerArgs.prefill_reserve_tokens,
+        default=ServerArgs.prefill_batch_min,
         help=(
-            "Elastic VRAM only (ignored elsewhere): size the standing prefill reserve for chunks of this many tokens "
-            "(0 = --max-prefill-length). Longer chunks, up to --max-prefill-length, borrow the "
-            "extra activation VRAM from the expert cache for one prompt while the KV cache "
-            "leaves room for it; near the context limit, or with an explicit "
-            "--prefill-reserve-gb, they stay at this size."
+            "Prefill chunk size the standing reserve covers at any context length: the VRAM kept "
+            "back for it (256 MiB + 230 KiB per token) bounds the context. Shorter prompts take "
+            "nothing from the expert cache."
+        ),
+    )
+    elastic_group.add_argument(
+        "--prefill-batch-max",
+        type=int,
+        default=ServerArgs.prefill_batch_max,
+        help=(
+            "Largest prefill chunk. A longer prompt takes the extra activation VRAM its chunk "
+            "needs from the expert cache (coldest experts first) while the KV cache leaves room, "
+            "and gives it back when the prompt is in; an explicit --max-prefill-length caps it."
         ),
     )
 
@@ -1241,7 +1253,7 @@ def parse_args(
     # (where elastic VRAM is on they need --no-elastic-kv: engine._check_vram_flags).
     static_dests = (*STATIC_VRAM_FIELDS, "gpu_memory_ratio")
     unset = object()
-    parser.set_defaults(**dict.fromkeys(static_dests, unset))
+    parser.set_defaults(**dict.fromkeys((*static_dests, "max_extend_tokens"), unset))
     kwargs = parser.parse_args(args).__dict__.copy()
     kwargs["static_vram_flags"] = tuple(
         next(a.option_strings[0] for a in parser._actions if a.dest == d)
@@ -1290,8 +1302,14 @@ def parse_args(
         parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
     if kwargs["elastic_lend_after"] < 0:
         parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
-    if kwargs["prefill_reserve_tokens"] < 0:
-        parser.error("--prefill-reserve-tokens must be >= 0")
+    if not 0 < kwargs["prefill_batch_min"] <= kwargs["prefill_batch_max"]:
+        parser.error("--prefill-batch-min must be > 0 and <= --prefill-batch-max")
+    if kwargs["max_extend_tokens"] is unset:
+        kwargs["max_extend_tokens"] = ServerArgs.max_extend_tokens
+    else:
+        # elastic VRAM sizes chunks by --prefill-batch-max; an explicit --max-prefill-length caps it
+        kwargs["prefill_batch_max"] = min(kwargs["prefill_batch_max"], kwargs["max_extend_tokens"])
+        kwargs["prefill_batch_min"] = min(kwargs["prefill_batch_min"], kwargs["prefill_batch_max"])
     if kwargs["cpu_threads"] < 0:
         parser.error("--threads must be >= 0 (0 = all physical cores)")
     if not 0.0 <= kwargs["moe_prefill_fetch"] <= 1.0:

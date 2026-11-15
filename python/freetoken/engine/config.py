@@ -76,7 +76,7 @@ class EngineConfig:
     # splitting it once at startup. elastic_kv: None = on where supported, False = upstream's
     # static split (required to give a STATIC_VRAM_FIELDS setting there), True = on or fail.
     # The pool is all VRAM left after the weights, the fixed pools,
-    # the CUDA graphs, the prefill workspace (prefill_reserve_gb, None = auto) and
+    # the CUDA graphs, the standing prefill reserve (prefill_reserve_gb, None = auto) and
     # vram_keep_free_mb. Experts never drop below expert_cache_min_slots; KV never drops below
     # elastic_kv_min_tokens and moves in elastic_kv_step_tokens steps. Prefix-cache leaves not
     # touched by the last elastic_keep_requests admissions are dropped before KV takes slots
@@ -93,10 +93,13 @@ class EngineConfig:
     # the STATIC_VRAM_FIELDS settings given explicitly (filled by the CLI and LLM())
     static_vram_flags: tuple[str, ...] = ()
     prefill_reserve_gb: float | None = None
-    # Size the standing prefill reserve for chunks of this many tokens (0 = --max-prefill-length);
-    # longer chunks borrow the extra activation VRAM from the expert cache per prompt while the
-    # KV pages leave room, else they stay at this size (engine/elastic.py boost).
-    prefill_reserve_tokens: int = 0
+    # Prefill chunk sizes under elastic VRAM (engine/elastic.py prefill workspace): the standing
+    # reserve covers prefill_batch_min-token chunks at any context length; a longer prompt takes
+    # its chunk's extra activation VRAM from the expert cache, up to prefill_batch_max tokens
+    # (which also becomes max_extend_tokens there). An explicit prefill_reserve_gb fixes the
+    # workspace instead: every chunk is prefill_batch_max tokens.
+    prefill_batch_min: int = 2048
+    prefill_batch_max: int = 16384
     # Prefix RAM tier (hybrid GDN models): pinned host RAM, total across TP ranks, that evicted
     # prefixes and their GDN snapshots spill to instead of being dropped; 0 disables it.
     cache_ram_gb: float = 0.0

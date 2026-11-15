@@ -744,7 +744,7 @@ class CacheManager:
 
     def _elastic_make_room(self, needed_pages: int) -> None:
         # spills and KV growth allocate through torch and count on the pool's own handles
-        self.elastic.reclaim()
+        self.elastic.hold_prefill(0)
         self._evict_cold()
         short = needed_pages - len(self.free_slots)
         if short > 0 and self.elastic.growable_pages() > 0:
@@ -758,9 +758,8 @@ class CacheManager:
         what the cache still holds, plus one step of slack, back to the experts."""
         if self.elastic is None:
             return
-        # between turns: the reclaim stays off the next prompt's time to first token
-        self.elastic.unboost()
-        self.elastic.reclaim()
+        # between turns: ending the lend here keeps it off the next prompt's time to first token
+        self.elastic.release_prefill()
         parked = self.prefix_cache.spilled_tokens if self.host_pool is not None else 0
         self._evict_cold()
         if self.host_pool is not None and self.prefix_cache.spilled_tokens > parked:
