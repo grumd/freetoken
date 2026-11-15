@@ -22,6 +22,19 @@ FP4, `scripts/serve.sh` defaults, measured 2026-11-15.
 - **16k prefill:** a 16,003-token prompt. "First" is the first prompt after start; "warm" is a later one.
 - **RAM:** the experts stay pinned in host RAM (64 GiB for FP4), so you need 96 GB or more.
 
+### MTP speculative decoding
+
+The checkpoint's MTP head drafts tokens and the model checks them in one pass. It's off by default; add these flags to `scripts/serve.sh` to turn it on:
+
+| Setup | Flags | Plain | MTP, temp 1.0 | MTP, greedy |
+|---|---|---|---|---|
+| 1x 20 GB | `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 2` | 54 tok/s | 64 tok/s (+17%) | 65 tok/s (+21%) |
+| 2x 20 GB | `--mtp on --mtp-experts-fp4 --moe-decode-fetch 0.5` | 89 tok/s | 110 tok/s (+24%) | 116 tok/s (+30%) |
+
+- **`--mtp-experts-fp4`:** stores the draft head's experts in NVFP4, reduces VRAM usage, leaving more VRAM for MoE expert cache.
+- **`--moe-decode-fetch 0.5`:** Share of expert-cache misses the CPU computes. On one GPU, my best setting was 0.1 (default); 0.5 gives better results on 2x 3080 20GB. The best value will depend on your system.
+- **`--mtp-draft-tokens`:** draft length, 3 by default. On one GPU, 2 is faster.
+
 ### Compared with llama.cpp and Strata
 
 FreeToken measured 2026-11-15, llama.cpp and Strata 2026-10-28. FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (b11941) and [Strata](https://github.com/Niko1221/Strata) (0.2.7) run unsloth's [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF. 262k 16-bit KV cache, no MTP, single request.
@@ -75,6 +88,7 @@ The defaults fit most setups. Context and expert cache size themselves to your f
 | To | Do |
 |---|---|
 | Pick GPUs | `GPUS=1 scripts/serve.sh` (default: every GPU, up to two) |
+| Decode 17-30% faster with MTP | add the flags for your setup from [MTP speculative decoding](#mtp-speculative-decoding) |
 | Tune CPU-assisted decode (one GPU) | run `scripts/calibrate.sh` once (~12 min) and pass the flags it prints |
 | Keep old chats in RAM (128 GB machines) | `PREFIX_CACHE_RAM_GB=16 scripts/serve.sh` |
 | Get ~9k more context on 16 GB | `scripts/serve.sh --prefill-batch-min 1024` |
@@ -90,6 +104,7 @@ Every setting: [`scripts/README.md`](scripts/README.md).
 - Hybrid prefill: chunks up to 4096 tokens (3072 on two GPUs) load only their routed experts, and the CPU computes part of the cache misses while the GPU fetches the rest
 - Prefill takes only the VRAM each prompt needs and keeps decode's experts cached, so agent turns start fast
 - CPU-assisted decode on one GPU: the CPU computes most VRAM-cache misses instead of copying them over PCIe, with a one-time calibration script for the split
+- MTP speculative decoding with the checkpoint's own head (opt-in, `--mtp on`): sampled drafts, CUDA-graphed draft/verify/commit, lossless; +17-24% decode at temperature 1.0
 - Prompt-lookup speculative decoding (`--ngram-spec`, on in `serve.sh`): lossless, no draft model; +55-61% decode when the reply repeats its context (code edits), about even on prose
 - Opt-in MXFP8 for more dense layers (`--dense-mxfp8-groups lm_head`): +5% decode on one GPU, KLD within run-to-run noise; off by default because it rounds the weights
 - W4A16 and NVFP4 kernels tuned for RTX 30-series, and a two-GPU all-reduce over P2P or shared host memory
