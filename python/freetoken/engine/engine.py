@@ -1147,9 +1147,11 @@ class Engine:
         )
 
     def _maybe_init_wna16_cpu_prefill(self, cache, layers) -> None:
-        """FREETOKEN_WNA16_CPU_PREFILL=1: routed prefill chunks compute part of their W4A16
-        expert misses on this rank's share of the CPU cores (moe/wna16_cpu_prefill.py)."""
-        if os.environ.get("FREETOKEN_WNA16_CPU_PREFILL", "") != "1":
+        """--moe-prefill-fetch < 1 (default 0.35): routed prefill chunks fetch that share of their
+        W4A16 / NVFP4 expert-cache misses over PCIe and compute the rest on this rank's share of
+        the CPU cores (moe/wna16_cpu_prefill.py)."""
+        fetch = self.config.moe_prefill_fetch
+        if fetch >= 1.0:
             return
         from freetoken.layers.moe import _ROUTED_PREFILL_TOKENS
         from freetoken.models.wna16_banks import wna16_down_k_off
@@ -1160,21 +1162,25 @@ class Engine:
         roles = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
         sources = {canonical_role(k): v for k, v in cache.bank_sources.items()}
         nvfp4 = set(sources) == set(wcp.Nvfp4CpuPrefill.BANK_ROLES)
+        sample = layers[0]
         reason = None
         if set(sources) != set(roles) and not nvfp4:
             reason = f"expert banks {sorted(cache.bank_sources)} are neither W4A16 nor NVFP4"
         elif cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
             reason = "it needs the plain GPU decode target"
+        elif (sample.activation != "silu" or sample.apply_router_weight_on_input or sample.interleaved
+              or sample.has_bias):
+            reason = "the CPU kernel computes silu(gate) * up of concatenated, bias-free gate/up rows"
         elif not wcp.cpu_supported():
             reason = "the CPU lacks AVX-512 BF16"
         if reason:
-            logger.warning_rank0(f"FREETOKEN_WNA16_CPU_PREFILL ignored: {reason}")
+            logger.info_rank0(f"CPU prefill off: {reason}")
             return
         tp = self.config.tp_info
         threads = _rank_cpu_threads(self.config)
         common = dict(
-            num_experts=cache.num_experts, top_k=layers[0].top_k,
-            max_tokens=max(_ROUTED_PREFILL_TOKENS, layers[0].num_experts // layers[0].top_k + 1),
+            num_experts=cache.num_experts, top_k=sample.top_k,
+            max_tokens=max(_ROUTED_PREFILL_TOKENS, sample.num_experts // sample.top_k + 1),
             threads=threads, cpus=wcp.rank_cpus(threads, tp.rank, tp.size),
         )
         try:
@@ -1191,14 +1197,12 @@ class Engine:
                     k_off=wna16_down_k_off(inter), **common,
                 )
         except Exception as exc:  # the JIT build needs a host C++ toolchain
-            logger.warning(f"FREETOKEN_WNA16_CPU_PREFILL disabled: {exc}")
+            logger.warning(f"CPU prefill off: {exc}")
             return
         for layer_id in range(cache.num_layers):
             executor.set_layer(layer_id, {r: sources[r][layer_id] for r in roles})
         cache.cpu_prefill = executor
-        fetch = os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_FETCH", "")
-        if fetch.strip():
-            cache.cpu_prefill_fetch = float(fetch)
+        cache.cpu_prefill_fetch = fetch
 
     def _maybe_init_cpu_decode(self, config: EngineConfig, cache, layers) -> None:
         """FREETOKEN_MOE_DECODE_FETCH (--moe-decode-fetch) < 1: decode fetches that share of its

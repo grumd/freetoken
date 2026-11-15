@@ -104,7 +104,7 @@ Each change with its commit and measured effect: [`docs/fork-changes.md`](docs/f
 
 - Read [`AGENTS.md`](AGENTS.md) first; its "Caveats to revisit for new models" lists what the CPU prefill kernels hardcode.
 - Tests: `uv run pytest tests/ -m "not slow"`. About 19 tests (DeepSeek-V4/Engram, rotary, GLM, QSA chunked prefill, scheduler accounting) already failed before the FP4 commits, and some are order-dependent, so compare whole-suite runs.
-- A/B with `FREETOKEN_WNA16_CPU_PREFILL=0` and `--moe-decode-fetch 1`: CPU prefill and CPU-assisted decode are not bit-reproducible.
+- A/B with `--moe-prefill-fetch 1` and `--moe-decode-fetch 1`: CPU prefill and CPU-assisted decode are not bit-reproducible.
 - After editing `kernel/csrc/`, run `python setup.py build_ext --inplace`. Re-run `ft checkpoint` after changing a quant format.
 
 ## Citation & Acknowledgment

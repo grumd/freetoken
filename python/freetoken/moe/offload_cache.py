@@ -175,7 +175,7 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
-    # Hybrid routed prefill (W4A16, FREETOKEN_WNA16_CPU_PREFILL=1): the CPU executor that
+    # Hybrid routed prefill (W4A16 / NVFP4, --moe-prefill-fetch < 1): the CPU executor that
     # computes the misses a prefill chunk does not fetch, and the share of misses fetched
     # over PCIe instead (see OffloadMoELayer._prefill_cpu_hybrid).
     cpu_prefill: object | None = None

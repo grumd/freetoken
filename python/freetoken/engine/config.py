@@ -113,6 +113,9 @@ class EngineConfig:
     # -t/--threads: CPU threads for the fork's CPU expert work (CPU-assisted decode and the hybrid
     # prefill), split evenly across the TP ranks. 0 = every physical core.
     cpu_threads: int = 0
+    # --moe-prefill-fetch: routed prefill chunks fetch this share of their expert-cache misses over
+    # PCIe and compute the rest on the CPU (W4A16 / NVFP4 offload, AVX-512 BF16). 1 = no CPU.
+    moe_prefill_fetch: float = 0.35
     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a

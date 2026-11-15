@@ -4,7 +4,7 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 
 **Prefill**
 - **Routed-only prefill:** chunks up to `--moe-routed-prefill-tokens` load only their routed experts instead of streaming all 24,576 (`e88b3ff`).
-- **Hybrid CPU prefill:** AVX-512 BF16 kernels compute VRAM-cache misses straight from the pinned host banks while the GPU fetches the most-routed ones. Works for W4A16 and NVFP4. `FREETOKEN_WNA16_CPU_PREFILL`, `..._FETCH`, `..._THREADS` (`9017dfd`, `c19c6b5`).
+- **Hybrid CPU prefill:** AVX-512 BF16 kernels compute VRAM-cache misses straight from the pinned host banks while the GPU fetches the most-routed ones. Works for W4A16 and NVFP4. On by default wherever the CPU kernel runs (its fp32 partial joins the GPU routes before the one rounding, so it counts as lossless); `--moe-prefill-fetch` sets the share of the misses fetched over PCIe (default 0.35, `1` = no CPU), `-t`/`--threads` the CPU threads (`9017dfd`, `c19c6b5`).
 - **W4A16 tile-dequant prefill kernel:** exact-dequant mode with fp32 gate/up, `FREETOKEN_WNA16_PREFILL_PRECISE` (`17c97b7`, `82026cf`).
 - **NVFP4 kernels:** tile-dequant prefill and fused-epilogue decode, tuned for sm_86; the inline-dequant kernels stay as the fallback for other shapes (`8c40fb0`).
 - **Decode-time GDN state snapshots:** taken every 64 tokens, so an agent's next turn reuses the previous reply. `FREETOKEN_DECODE_SNAPSHOT_INTERVAL` (`9017dfd`).
@@ -52,14 +52,12 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 
 The fork's rules: one code path for every supported setup; behavior from measured hardware or a cost model rather than fixed thresholds; no switch for a lossless change; lossy options as documented `ft serve` flags, off by default. Environment variables are left for debugging, diagnostics and builds.
 
-**`ft serve` flags the fork adds** ([`docs/cli.md`](cli.md)): `--[no-]elastic-kv` (default on where supported) and its tuning (`--vram-keep-free-mb`, `--expert-cache-min-slots`, `--elastic-kv-min-tokens`, `--elastic-kv-step-tokens`, `--elastic-keep-requests`, `--elastic-lend-after`, `--prefill-reserve-gb`, `--prefill-reserve-tokens`), `--cache-ram-gb`, `--moe-routed-prefill-tokens`, `--moe-decode-fetch`, `-t`/`--threads`, `--ngram-spec` (with `--ngram-spec-max-draft`, `--ngram-spec-min-match`, `--ngram-spec-policy`), `--vision-on-cpu`, `--vision-threads`. Lossy, off by default: `--dense-mxfp8-groups` (and upstream's `--dense-fp8`).
+**`ft serve` flags the fork adds** ([`docs/cli.md`](cli.md)): `--[no-]elastic-kv` (default on where supported) and its tuning (`--vram-keep-free-mb`, `--expert-cache-min-slots`, `--elastic-kv-min-tokens`, `--elastic-kv-step-tokens`, `--elastic-keep-requests`, `--elastic-lend-after`, `--prefill-reserve-gb`, `--prefill-reserve-tokens`), `--cache-ram-gb`, `--moe-routed-prefill-tokens`, `--moe-prefill-fetch`, `--moe-decode-fetch`, `-t`/`--threads`, `--ngram-spec` (with `--ngram-spec-max-draft`, `--ngram-spec-min-match`, `--ngram-spec-policy`), `--vision-on-cpu`, `--vision-threads`. Lossy, off by default: `--dense-mxfp8-groups` (and upstream's `--dense-fp8`).
 
 **Engine switches still read from the environment** (set by `serve.sh`, pending a decision on whether they become defaults or flags):
 
 | Var | `serve.sh` | Meaning |
 |---|---|---|
-| `FREETOKEN_WNA16_CPU_PREFILL` | `1` | hybrid CPU prefill, W4A16 and NVFP4 despite the name; not bit-reproducible |
-| `FREETOKEN_WNA16_CPU_PREFILL_FETCH` | `0.35` | share of the CPU prefill's misses fetched over PCIe instead |
 | `FREETOKEN_WNA16_PREFILL_PRECISE` | `1` | INT4: exact-dequant tile prefill, fp32 gate/up |
 | `FREETOKEN_WNA16_BALANCED_TP` | `1` | INT4 at TP=2: 320/320 expert split |
 
@@ -68,6 +66,8 @@ The fork's rules: one code path for every supported setup; behavior from measure
 **Diagnostics:** `FREETOKEN_DUMP_PREFILL_LOGITS`, `FREETOKEN_DUMP_DECODE_LOGITS` (logit dumps for KLD), `FREETOKEN_CPU_DECODE_PREFILL=1` (prefill chunks as small as a decode step take CPU-assisted decode, for teacher-forced dumps), `FREETOKEN_ROUTE_LOG`, `FREETOKEN_PROFILE_PREFILL_DIR` / `_MIN`, `FREETOKEN_PROFILE_DECODE_DIR` / `_SKIP` / `_STEPS`, `FREETOKEN_PREFIX_DEBUG`, `FREETOKEN_WNA16_CPU_PREFILL_STATS`, `FREETOKEN_NGRAM_SPEC_DEBUG`, `FREETOKEN_NGRAM_SPEC_MODE_FILE`, `FREETOKEN_NGRAM_SPEC_OFF_FILE`, `FREETOKEN_CPU_DECODE_TUNABLE` (calibration only).
 
 **Removed in the 2026-11-14 cleanup** (they only turned off a default path, picked a superseded kernel, or retuned a measured constant): `FREETOKEN_MXFP8_PAD_SLICES`, `FREETOKEN_PLE_ASYNC_PREFILL`, `FREETOKEN_HC_FUSE`, `FREETOKEN_HC_SHARD`, `FREETOKEN_COPY_OVERLAP`, `FREETOKEN_EARLY_ROUTER`, `FREETOKEN_DECODE_FRONT_FUSE`, `FREETOKEN_TRITON_GEMV`, `FREETOKEN_EMBED_ON_HOST`, `FREETOKEN_NGRAM_SPEC_GRAPH`, `FREETOKEN_NVFP4_TILE`, `FREETOKEN_NVFP4_NK_TILE`, `FREETOKEN_NVFP4_GEMV_V2`, `FREETOKEN_WNA16_DECODE_V2`, `FREETOKEN_WNA16_PREFILL_LEGACY`, `FREETOKEN_DENSE_MXFP8`, `FREETOKEN_CPU_MOE_SPIN_US`, `FREETOKEN_PLE_QUEUE_DEPTH`, and `--moe-cpu-decode-act` (int8 was no faster and 3.6x less accurate). `--moe-cpu-decode-threads` (`FREETOKEN_CPU_DECODE_THREADS`) and `FREETOKEN_WNA16_CPU_PREFILL_THREADS` became one `-t`/`--threads` for all CPU expert work, default every physical core (CPU-assisted decode on one GPU used to leave one core free: 7 instead of 8 threads here, which calibration measured as a tie).
+
+**Replaced on 2026-11-15:** `FREETOKEN_WNA16_CPU_PREFILL` and `FREETOKEN_WNA16_CPU_PREFILL_FETCH` became `--moe-prefill-fetch` (default 0.35, `1` = off): the hybrid CPU prefill is now on by default where the CPU kernel runs, not only under `serve.sh`.
 
 ## Inherited from anon761/freetoken
 

@@ -55,18 +55,20 @@ def _snap(tmp_path, fmt="nvfp4"):
     return snap
 
 
-def _serve(tmp_path, gpus, fmt="nvfp4", flags=()):
-    """Run serve.sh against a stub ``ft``; return its decode flags (the last one wins, as in argparse)."""
+def _serve(tmp_path, gpus, fmt="nvfp4", flags=(), keys=("--moe-decode-fetch", "--threads")):
+    """Run serve.sh against a stub ``ft``; return the ``keys`` flags it passes (the last one wins, as in
+    argparse). serve.sh no longer exports the CPU prefill env switches (now --moe-prefill-fetch)."""
     out = tmp_path / "ft-args.txt"
     stub = tmp_path / "ft"
-    stub.write_text(f"#!/bin/bash\nprintf '%s\\n' \"$@\" > {out}\n")
+    stub.write_text(f"#!/bin/bash\nprintf '%s\\n' \"$@\" > {out}\nenv > {out}.env\n")
     stub.chmod(0o755)
-    env = dict(os.environ, MODEL=str(_snap(tmp_path, fmt)), FT_BIN=str(stub), GPUS=gpus, REQUIRED_FREE_RAM_GB="0",
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FREETOKEN_WNA16_CPU_PREFILL")}
+    env.update(MODEL=str(_snap(tmp_path, fmt)), FT_BIN=str(stub), GPUS=gpus, REQUIRED_FREE_RAM_GB="0",
                MIN_FREE_RAM_GB="0", PORT="1")
     subprocess.run(["bash", str(SCRIPTS / "serve.sh"), *flags], env=env, capture_output=True, timeout=60)
     args = out.read_text().splitlines()
-    decode = ("--moe-decode-fetch", "--threads")
-    return {a: args[i + 1] for i, a in enumerate(args) if a in decode}
+    assert "FREETOKEN_WNA16_CPU_PREFILL" not in out.with_suffix(".txt.env").read_text()
+    return {a: args[i + 1] for i, a in enumerate(args) if a in keys}
 
 
 @pytest.mark.parametrize("gpus,fmt,want", [("0", "nvfp4", {"--moe-decode-fetch": "0.1"}),

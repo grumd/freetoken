@@ -56,8 +56,6 @@ if [ "$tp" = 1 ] && grep -q -E '"quant_format": *"(nvfp4|w4a16)"' "$MODEL/freeto
 fi
 
 # engine switches without a CLI flag; set them in the environment for A/B runs
-export FREETOKEN_WNA16_CPU_PREFILL=${FREETOKEN_WNA16_CPU_PREFILL:-1}
-export FREETOKEN_WNA16_CPU_PREFILL_FETCH=${FREETOKEN_WNA16_CPU_PREFILL_FETCH:-0.35}
 export FREETOKEN_WNA16_PREFILL_PRECISE=${FREETOKEN_WNA16_PREFILL_PRECISE:-1}
 export FREETOKEN_WNA16_BALANCED_TP=${FREETOKEN_WNA16_BALANCED_TP:-1}
 

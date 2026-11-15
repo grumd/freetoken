@@ -130,3 +130,13 @@ def test_threads_is_a_plain_config_field():
     assert _parse(["--threads", "3"]).cpu_threads == 3
     with pytest.raises(SystemExit):
         _parse(["--threads", "-1"])
+
+
+def test_moe_prefill_fetch_is_a_plain_config_field():
+    assert _parse([]).moe_prefill_fetch == 0.35  # CPU prefill on by default where the kernel runs
+    assert _parse(["--moe-prefill-fetch", "1"]).moe_prefill_fetch == 1.0  # off
+    assert _parse(["--moe-prefill-fetch", "0.2"]).moe_prefill_fetch == 0.2
+    assert not any(k.startswith("FREETOKEN_WNA16_CPU_PREFILL") for k in os.environ)
+    for bad in ("-0.1", "1.5"):
+        with pytest.raises(SystemExit):
+            _parse(["--moe-prefill-fetch", bad])

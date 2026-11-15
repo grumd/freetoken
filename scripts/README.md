@@ -57,7 +57,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--moe-strategy offload` | experts in host RAM; KV and the expert cache share VRAM at runtime (elastic VRAM, the engine's behaviour for offload MoE), so the cache gets whatever the live context does not need (decode +16%, output identical) and the context shrinks to what fits |
 | `--max-running-requests 1` | batching loses: 3 streams at once decode slower in total than 1 |
 | `--max-prefill-length 16384 --prefill-reserve-tokens 8192` | prefill streams every expert over PCIe once per chunk, so 16384-token chunks halve that traffic: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s; with the PLE read-ahead 6.2 / 4.9 s and 24.4 / 17.5 s). Elastic keeps 256 MiB + 230 KiB per chunk token free for activations; the standing reserve covers 8192-token chunks and a longer prompt borrows the other 1.8 GiB from the expert cache while it prefills, so the context limit stays that of 8192 (a fixed 16384 reserve would cap one RTX 3080 at 238k). Near the limit the chunks stay at 8192. `--max-prefill-length 4096` gives one 16 GB GPU 186k instead of 147k context, at about half the long-prompt prefill speed |
-| `--moe-routed-prefill-tokens 3072` | chunks up to this size load only their routed experts instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). Re-tune on a faster link; `1280` with `FREETOKEN_WNA16_CPU_PREFILL=0` |
+| `--moe-routed-prefill-tokens 3072` | chunks up to this size load only their routed experts instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). Re-tune on a faster link; `1280` with `--moe-prefill-fetch 1` |
 | `--moe-prefill-hit-d2d` | longer chunks copy VRAM-cached experts device-side and stream only the misses (pp16384 -14%, output identical) |
 | `--vision-on-cpu --vision-threads 8` | the ViT would take 0.84 GiB of VRAM on every GPU; 16 threads encode a full-size image in 3.5 s, 4 in 6.8 s |
 | `--mtp off` | MTP is 10-24% slower decode here in every config |
@@ -65,7 +65,7 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
 | `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
 
-Other useful flags: `-t`/`--threads` (CPU threads for CPU expert work, split across the GPUs; default all physical cores), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-mxfp8-groups lm_head` (recommended for FP4: +5% decode on one GPU, rounds the lm_head to MXFP8 with no measurable KLD change; off by default because it is lossy), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
+Other useful flags: `--moe-prefill-fetch` (the share of a routed prefill chunk's cache misses fetched over PCIe, the rest computed on the CPU; default 0.35 wherever the CPU kernel runs, `1` = no CPU; here 0.2 is faster for 1k-token turns but slower from 2k up), `-t`/`--threads` (CPU threads for CPU expert work, split across the GPUs; default all physical cores), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-mxfp8-groups lm_head` (recommended for FP4: +5% decode on one GPU, rounds the lm_head to MXFP8 with no measurable KLD change; off by default because it is lossy), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
 
 ### Engine switches
 
@@ -73,12 +73,10 @@ These have no `ft serve` flag. The script sets them unless they are already in t
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FREETOKEN_WNA16_CPU_PREFILL` | `1` | routed prefill computes about 65% of its cache misses on the CPU (AVX-512 BF16; without it the server logs `FREETOKEN_WNA16_CPU_PREFILL ignored`). `0` = GPU only |
-| `FREETOKEN_WNA16_CPU_PREFILL_FETCH` | `0.35` | share of those misses fetched over PCIe instead |
 | `FREETOKEN_WNA16_PREFILL_PRECISE` | `1` | INT4: exact-dequant prefill, no speed cost |
 | `FREETOKEN_WNA16_BALANCED_TP` | `1` | INT4 at TP=2: even 320/320 expert split |
 
-For bit-reproducible A/B runs use `FREETOKEN_WNA16_CPU_PREFILL=0` and `--moe-decode-fetch 1`: which misses the CPU computes depends on the cache state.
+For bit-reproducible A/B runs use `--moe-prefill-fetch 1` and `--moe-decode-fetch 1`: which misses the CPU computes depends on the cache state.
 
 ### Requirements
 

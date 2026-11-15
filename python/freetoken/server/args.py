@@ -1152,10 +1152,27 @@ def parse_args(
         dest="moe_routed_prefill_tokens",
         help=(
             "Offload prefill chunks of at most this many tokens load only their routed "
-            "experts through the GPU expert cache instead of streaming every expert of "
-            "every layer over PCIe. Cuts the fixed per-chunk stream on PCIe-bound boxes; "
-            "past ~1-1.5k tokens nearly every expert is routed and the overlapped stream "
-            "wins again. Default 0 (only extends under tokens * top_k < num_experts)."
+            "experts through the GPU expert cache (the CPU computing part of the misses, see "
+            "--moe-prefill-fetch) instead of streaming every expert of every layer over PCIe. "
+            "Cuts the fixed per-chunk stream on PCIe-bound boxes; past the cutoff the overlapped "
+            "stream wins again. The best cutoff depends on the PCIe link, the CPU and the GPU "
+            "count: on RTX 3080s at PCIe 4.0 x8 with a Ryzen 7 9800X3D it is 4096 on one GPU and "
+            "3072 on two (about 1280 with --moe-prefill-fetch 1); time your prompt sizes to tune "
+            "it. Default 0 (only extends under tokens * top_k < num_experts)."
+        ),
+    )
+    parser.add_argument(
+        "--moe-prefill-fetch",
+        type=float,
+        default=ServerArgs.moe_prefill_fetch,
+        dest="moe_prefill_fetch",
+        help=(
+            "With --moe-strategy offload, NVFP4 or W4A16 experts and an AVX-512 BF16 CPU: the share "
+            "(0-1) of a routed prefill chunk's expert-cache misses fetched over PCIe (the most-routed "
+            "ones); the CPU computes the rest from the pinned banks while the GPU runs the hits. "
+            "1 = every miss over PCIe (no CPU). The best share depends on the CPU and the PCIe link: "
+            "on RTX 3080s at PCIe 4.0 x8 with a Ryzen 7 9800X3D, 0.35 is best for 2k-4k-token "
+            "chunks and 0.2 only helps 1k ones; time your prompt sizes to tune it. Default 0.35."
         ),
     )
 
@@ -1267,6 +1284,8 @@ def parse_args(
         parser.error("--prefill-reserve-tokens must be >= 0")
     if kwargs["cpu_threads"] < 0:
         parser.error("--threads must be >= 0 (0 = all physical cores)")
+    if not 0.0 <= kwargs["moe_prefill_fetch"] <= 1.0:
+        parser.error("--moe-prefill-fetch must be in [0, 1] (1 = no CPU)")
 
     # --memory-ratio takes a single float or a per-GPU list; a list is the same
     # override set as --gpu-memory-ratio (combining both is ambiguous).
