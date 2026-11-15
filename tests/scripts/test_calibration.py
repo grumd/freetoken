@@ -77,6 +77,11 @@ def test_cpu_assisted_decode_default(tmp_path, gpus, fmt, want):
     assert _serve(tmp_path, gpus, fmt) == want
 
 
+@pytest.mark.parametrize("gpus,want", [("0", "4096"), ("0,1", "3072")])
+def test_routed_prefill_cutoff_per_gpu_count(tmp_path, gpus, want):
+    assert _serve(tmp_path, gpus, keys=("--moe-routed-prefill-tokens",)) == {"--moe-routed-prefill-tokens": want}
+
+
 def test_flags_override_the_default(tmp_path):
     got = _serve(tmp_path, "0", flags=["--moe-decode-fetch", "0.15", "--threads", "7"])
     assert got == {"--moe-decode-fetch": "0.15", "--threads": "7"}

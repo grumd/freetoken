@@ -37,8 +37,6 @@ args=(
   # The standing reserve covers 8192-token chunks (a 16384 one would cap one GPU's context below
   # 262k); a long prompt borrows the rest from the expert cache while KV leaves room for it.
   --max-prefill-length 16384 --prefill-reserve-tokens 8192
-  # shorter chunks load only their routed experts instead of streaming all of them over PCIe
-  --moe-routed-prefill-tokens 3072
   --moe-prefill-hit-d2d
   # the ViT would otherwise take 0.84 GiB of VRAM on every GPU
   --vision-on-cpu --vision-threads 8
@@ -49,6 +47,13 @@ args=(
   --enable-cache-report
 )
 [ "$PREFIX_CACHE_RAM_GB" != 0 ] && args+=(--cache-ram-gb "$PREFIX_CACHE_RAM_GB")
+# Shorter chunks load only their routed experts (the CPU computes 65% of the misses) instead of
+# streaming all of them over PCIe; the best cutoff was measured on RTX 3080s at PCIe 4.0 x8.
+if [ "$tp" = 1 ]; then
+  args+=(--moe-routed-prefill-tokens 4096)  # one GPU: a 4096-token chunk 4.8 -> 3.3 s; 8192 streams faster
+else
+  args+=(--moe-routed-prefill-tokens 3072)  # two GPUs: each streams half of every expert, so streaming wins sooner
+fi
 # One GPU: the CPU computes 90% of decode's expert-cache misses (FP4 28 -> 53 tok/s at 4k; INT4 needs
 # AVX-512 BF16). Two GPUs miss too rarely for it to pay. calibrate.sh measures the best share here.
 if [ "$tp" = 1 ] && grep -q -E '"quant_format": *"(nvfp4|w4a16)"' "$MODEL/freetoken_weight.json" 2>/dev/null; then
