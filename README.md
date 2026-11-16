@@ -1,6 +1,6 @@
 # FreeToken fork for Qwen3.8-Flash-Next on 1-2 GPUs
 
-Optimized for **Qwen3.8-Flash-Next** if you have 96GB+ RAM and 1-2 GPUs.
+Optimized for **Qwen3.8-Flash-Next** if you have 96GB+ RAM and one or two RTX 3080 20 GB-class GPUs.
 
 Recommended to use with Nvidia's [QAD FP4 quant](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local). But it also supports Intel's [INT4 W4A16](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
 
@@ -8,40 +8,38 @@ MoE experts are pinned to host RAM. There's no setting for context length. As a 
 
 ## Benchmarks
 
-FP4, `scripts/serve.sh` defaults, measured 2026-11-15.
+Nvidia FP4, `scripts/serve.sh` defaults.
 
-| Setup | Decode | 16k prefill (first / warm) | Max context |
-|---|---|---|---|
-| 1x 16 GB | 49 tok/s | 2,450 / 2,720 tok/s | 208k |
-| 1x 20 GB | 54 tok/s | 2,590 / 2,720 tok/s | 262k |
-| 2x 16 GB | 75 tok/s | 3,230 / 3,450 tok/s | 262k |
-| 2x 20 GB | 89 tok/s | 3,240 / 3,470 tok/s | 262k |
+| Setup | Decode | + MTP | 16k prefill (first / warm) | Max context |
+|---|---|---|---|---|
+| 1x RTX 3080 20 GB | 55 tok/s | 60 tok/s | 2,660 / 2,720 tok/s | 262k |
+| 2x RTX 3080 20 GB | 91 tok/s | 102 tok/s | 3,390 / 3,500 tok/s | 262k |
 
-- **Hardware:** RTX 3080 20 GB cards, each on PCIe 4.0 x8, with P2P between them; Ryzen 7 9800X3D; 96 GB DDR5. A "16 GB" GPU is a 20 GB card with 4 GB held. A x16 or PCIe 5.0 link should be faster.
-- **Decode:** a 1024-token reply to a prose prompt. On one GPU the CPU computes most experts missing from VRAM (`--moe-decode-fetch 0.1`).
-- **16k prefill:** a 16,003-token prompt. "First" is the first prompt after start; "warm" is a later one.
+- **Hardware:** each card on PCIe 4.0 x8, with P2P enabled; Ryzen 7 9800X3D; 96 GB DDR5. A x16 or PCIe 5.0 link should be faster.
+- **Decode:** a 1024-token reply to a prose prompt at temperature 1.0, mean of 3. On one GPU the CPU computes most experts missing from VRAM (`--moe-decode-fetch 0.1`). MTP uses temp 1.0.
 - **RAM:** the experts stay pinned in host RAM (64 GiB for FP4), so you need 96 GB or more.
 
 ### MTP speculative decoding
 
-The checkpoint's MTP head drafts tokens and the model checks them in one pass. It's off by default; add these flags to `scripts/serve.sh` to turn it on:
+The checkpoint's MTP head drafts tokens and the model checks them in one pass; the output is unchanged (lossless). It's off by default; add these flags to `scripts/serve.sh` to turn it on:
 
-| Setup | Flags | Plain | MTP, temp 1.0 | MTP, greedy |
-|---|---|---|---|---|
-| 1x 20 GB | `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 2` | 54 tok/s | 64 tok/s (+17%) | 65 tok/s (+21%) |
-| 2x 20 GB | `--mtp on --mtp-experts-fp4 --moe-decode-fetch 0.5` | 89 tok/s | 110 tok/s (+24%) | 116 tok/s (+30%) |
+| Setup | Flags |
+|---|---|
+| 1x 20 GB | `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 2` |
+| 2x 20 GB | `--mtp on --mtp-experts-fp4 --moe-decode-fetch 0.5` |
 
 - **`--mtp-experts-fp4`:** stores the draft head's experts in NVFP4, reduces VRAM usage, leaving more VRAM for MoE expert cache.
 - **`--moe-decode-fetch 0.5`:** Share of expert-cache misses the CPU computes. On one GPU, my best setting was 0.1 (default); 0.5 gives better results on 2x 3080 20GB. The best value will depend on your system.
 - **`--mtp-draft-tokens`:** draft length, 3 by default. On one GPU, 2 is faster.
+- **One GPU prefill on long prompts:** the MTP head takes VRAM, so past ~160k of context a 16k-token prompt chunk prefills slower than without MTP (907 vs 1,603 tok/s at 261k). Two GPUs lose under 10%.
 
 ### Compared with llama.cpp and Strata
 
-FreeToken measured 2026-11-15, llama.cpp and Strata 2026-10-28. FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (b11941) and [Strata](https://github.com/Niko1221/Strata) (0.2.7) run unsloth's [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF. 262k 16-bit KV cache, no MTP, single request.
+Single request, 262k context with a 16-bit KV cache. FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (build 12428) and [Strata](https://github.com/Niko1221/Strata) (0.2.9) run unsloth's [UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench/decode-dark.png">
-  <img src="assets/bench/decode.png" alt="Decode speed vs context depth for FreeToken, llama.cpp and Strata on two and one RTX 3080">
+  <img src="assets/bench/decode.png" alt="Decode speed vs context depth for FreeToken and Strata with and without MTP, and llama.cpp, on two and one RTX 3080">
 </picture>
 
 <picture>
@@ -50,20 +48,30 @@ FreeToken measured 2026-11-15, llama.cpp and Strata 2026-10-28. FreeToken runs N
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/bench/roundtrip-dark.png">
-  <img src="assets/bench/roundtrip.png" alt="Time to first token after a 128, 512 or 1024-token tool result at 32k and 131k context">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench/agent-dark.png">
+  <img src="assets/bench/agent.png" alt="Prefill speed of agent turns by new prompt tokens for FreeToken, llama.cpp and Strata on two and one RTX 3080">
 </picture>
 
+**Quality:** KL divergence from the BF16 model's logits ([jyohukuchan/qwen38-flash-next-bf16-logits](https://huggingface.co/datasets/jyohukuchan/qwen38-flash-next-bf16-logits)).
+
+| Engine · quant | KLD | Same top token |
+|---|---|---|
+| Strata · UD-Q4_K_XL | 0.078 | 92.6% |
+| FreeToken · NVIDIA FP4 + BF16 PLE table (benchmarked above) | 0.096 | 91.4% |
+| llama.cpp · UD-Q4_K_XL | 0.100 | 91.9% |
+| FreeToken · NVIDIA FP4 + included PLE table | 0.109 | 91.0% |
+| Strata · UD-Q3_K_XL | 0.116 | 90.1% |
+| Strata · UD-IQ4_XS | 0.118 | 90.3% |
+
+- FreeToken with MTP scores the same as without (0.095).
+- The PLE table is a per-layer token embedding read from disk; NVIDIA's checkpoint stores it in NVFP4, the benchmarks above swap in the BF16 table from Intel's checkpoint.
+
 **Settings**
-- **FreeToken:** `scripts/serve.sh` defaults, with `GPUS=0` for one GPU.
-- **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`.
-  - `-ub 2048` with a 20 GB cache decoded about 20% faster but prefilled 37% slower.
-  - Without moe-cache-mib, decode was 16 tok/s.
-- **llama.cpp on 1 GPU:** `-cmoe -ub 4096 -b 4096 -fa on -lm none`, with no MoE cache. A 4 GB cache made decode slower (13.5 vs 22 tok/s).
-- **Strata:** setup's config for UD-Q4_K_XL, with every expert in RAM and KV beyond 32k streamed from RAM.
-  - MTP off, `STRATA_ROUTE_TAIL_SKIP=0` and `STRATA_ROUTE_PRIOR=0` - these options improve speed but reduce model quality.
-  - `--spec 2 --suffix-draft 0`: native packs need a 2-token verify window, and it made no drafts.
-  - The dashed line is Strata with its MTP draft layer (setup's `--spec 4 --spec-min-p 0.5`), for reference.
+- **FreeToken:** `scripts/serve.sh` defaults, `GPUS=1` for one GPU; MTP with the flags above.
+- **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 --moe-cache-cpu-share 0.9 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`. Without `--moe-cache-cpu-share` it decoded at 42 instead of 52-54 tok/s.
+- **llama.cpp on 1 GPU:** `-cmoe --moe-cache-mib 5000 --moe-cache-cpu-share 0.9 -ub 2048 -b 2048 -fa on -lm none`.
+- **Strata:** setup's config for the unsloth files: every expert in RAM, KV beyond 32k streamed from RAM, `--spec 4` with its prompt-lookup drafts (FreeToken's `--ngram-spec` is on too), `STRATA_ROUTE_TAIL_SKIP=0` (the default skips some experts: faster, lower quality).
+  - MTP: setup's draft layer (`--mtp <draft layer> --spec 4 --spec-min-p 0.5`).
 
 ## Quick start
 
@@ -88,10 +96,9 @@ The defaults fit most setups. Context and expert cache size themselves to your f
 | To | Do |
 |---|---|
 | Pick GPUs | `GPUS=1 scripts/serve.sh` (default: every GPU, up to two) |
-| Decode 17-30% faster with MTP | add the flags for your setup from [MTP speculative decoding](#mtp-speculative-decoding) |
+| Decode faster with MTP | add the flags for your setup from [MTP speculative decoding](#mtp-speculative-decoding) |
 | Tune CPU-assisted decode (one GPU) | run `scripts/calibrate.sh` once (~12 min) and pass the flags it prints |
 | Keep old chats in RAM (128 GB machines) | `PREFIX_CACHE_RAM_GB=16 scripts/serve.sh` |
-| Get ~9k more context on 16 GB | `scripts/serve.sh --prefill-batch-min 1024` |
 | Trade a little accuracy for +5% decode (one GPU) | `scripts/serve.sh --dense-mxfp8-groups lm_head` (lossy, off by default) |
 
 Prefill chunks: `--prefill-batch-min` (2048) tokens of activation VRAM are always reserved. Longer prompts borrow what their chunk needs from the expert cache, up to `--prefill-batch-max` (16384) tokens, and give it back before decoding.
